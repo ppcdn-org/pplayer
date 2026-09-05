@@ -7,6 +7,11 @@ class ABREngine {
         this.isAutoMode = true;
         this.abrCooldown = 0;
         this.currentTrackId = null;
+        // Layer the user asked for but the server hasn't confirmed yet (see
+        // notifyManualSwitch). currentTrackId deliberately stays on the old
+        // layer until LAYER_SWITCHED arrives, so this is what the quality
+        // selector should display in the meantime.
+        this.pendingTrackId = null;
         
         this.audioTrackId = null;
         this.videoTrackIds = []; 
@@ -46,6 +51,12 @@ class ABREngine {
         // ==========================================
         // 初始化当前 Track ID 的智能判定
         // ==========================================
+        // Note that setTracks runs on every TRACKS_INFO, not just the first:
+        // mmx resends it whenever track metadata changes (e.g. once it parses
+        // each layer's real SPS, see SetTrackDimensions in
+        // track_selector.go). activeId is always the layer actually playing,
+        // so adopting it here stays correct even mid manual switch - the
+        // user's not-yet-confirmed pick lives in pendingTrackId instead.
         if (activeId !== undefined && activeId !== null) {
             this.currentTrackId = activeId;
         } else if (this.currentTrackId === null && this.videoTrackIds.length > 0) {
@@ -85,12 +96,23 @@ class ABREngine {
         // trackId === currentTrackId and treat it as a no-op "redundant"
         // switch, silently dropping the actual controlClient.selectLayer
         // call - manual quality selection never took effect.
+        //
+        // Record it as pending instead, so the UI can keep showing the
+        // user's choice while the switch is in flight.
+        this.pendingTrackId = trackId;
         this._resetCounters();
         console.log(`[ABR] Manual switch detected. Auto Mode OFF.`);
     }
 
+    // The layer the selector should display: the user's pending pick if one
+    // is outstanding, otherwise whatever is actually playing.
+    selectedTrackId() {
+        return (this.pendingTrackId !== null) ? this.pendingTrackId : this.currentTrackId;
+    }
+
     notifyLayerSwitched(trackId) {
         this._updateCurrentTrack(trackId);
+        this.pendingTrackId = null;
         this.ignoreUpdates = 3; 
         this.avgFps = 0;
         this._resetCounters();
@@ -108,6 +130,8 @@ class ABREngine {
 
     setAutoMode(enabled) {
         this.isAutoMode = enabled;
+        // Going back to auto abandons any outstanding manual pick.
+        if (enabled) this.pendingTrackId = null;
         this._resetCounters();
         console.log(`[ABR] Auto Mode: ${enabled}`);
     }

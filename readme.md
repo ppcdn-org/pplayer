@@ -1,10 +1,11 @@
 # MediaMTX Player SDK v1.0 开发文档
 
 ## 1. 简介
-本 SDK 是一套轻量级的前端解决方案，专为配合 MediaMTX 服务的 WebRTC WHEP 接口和 Simulcast 功能设计。它包含两个核心组件：
+本 SDK 是一套轻量级的前端解决方案，专为配合 MediaMTX 服务的 WebRTC WHEP 接口和 Simulcast 功能设计。它包含以下核心组件：
 1.  **`MediaMTXWebRTCReader`**: 负责 WHEP 协议交互、WebRTC 连接建立、RTP 接收和 SDP 协商。
 2.  **`ABREngine`**: 自适应码率（ABR）控制引擎，负责监控网络状态并自动切换视频层级。
 3.  **`MMXControlClient`** (内部): 负责 WebSocket 信令通道，与服务端进行层级切换通信。
+4.  **`TimeSync`**: 向 ppcenter 做应用层时钟校准，供端到端延迟（P2P Delay）计算使用。可选组件，不影响播放。
 
 ---
 
@@ -15,6 +16,8 @@
 ```html
 <script src="mmxplayer-v1.0.0.js"></script>
 <script src="abr-engine.js"></script>
+<script src="sei-timestamp.js"></script>  <!-- 可选：SEI 时间戳解析（Chromium） -->
+<script src="time-sync.js"></script>      <!-- 可选：时钟校准，见 §6 -->
 ```
 
 ### 2.2 基础示例 (Main.js)
@@ -189,6 +192,62 @@ setInterval(async () => {
 
 3.  **起播保护**:
     *   引擎初始化后的前 **5秒** 内不执行降级操作，以等待缓冲区填充和解码器稳定。
+
+---
+
+## 6. 时钟校准与端到端延迟 (TimeSync)
+
+### 6.1 为什么需要
+
+端到端延迟的算法是 `本地当前时间 - 推流端在该帧内嵌的时间戳`。内嵌时间戳来自 ppobs 经 NTP 校准的 UTC 时钟，因此**只有当播放端的时钟也对齐 UTC 时，这个减法才有意义**。
+
+浏览器无法访问系统级 NTP（拿不到 UDP 123），直接用未校正的 `Date.now()` 会得到荒谬的结果：本地时钟走快就是负值，走慢就是超大正值（实测出现过 145 秒）。
+
+解法是让播放端向 **ppcenter**（后端服务，自身运行 NTP）做一次应用层时钟偏移估算，用的是 NTP 内部的四时间戳算法：
+
+```
+offset = ((T2 - T1) + (T3 - T4)) / 2   ≈ ppcenter 时钟 - 本地时钟
+校正后时间 = Date.now() + offset        // 是加不是减
+```
+
+每轮采样 6 次取 RTT 最小的一次（RTT 越小说明受排队抖动干扰越小），默认每 45 秒重新校准一次。
+
+### 6.2 集成方式
+
+ppcenter 地址与 WHEP URL 一样由手工输入，默认 `http://127.0.0.1:18000`。也支持 URL 参数：
+
+```
+index.html?url=<WHEP URL>&ppcenter=http://10.0.0.5:18000
+```
+
+代码中的用法：
+
+```javascript
+const timeSync = new TimeSync({ ppcenter: 'http://127.0.0.1:18000' });
+timeSync.start().catch(e => console.warn('校准不可用:', e.message));
+
+// 校准完成后才能算延迟
+const now = timeSync.now();          // 未完成校准时返回 null
+if (now !== null) {
+    const delayMs = now - embeddedTimestamp;
+}
+```
+
+**关键约定**：`now()` 在首次校准完成前返回 `null`，调用方必须把它当作"还不能算延迟"，**不要退化成裸的 `Date.now()`**——那正是本机制要消除的错误来源。
+
+### 6.3 API
+
+| 方法/属性 | 说明 |
+| :--- | :--- |
+| `new TimeSync({ppcenter, resyncIntervalMs, sampleCount, onStateChange})` | `ppcenter` 为基础 URL；其余可选。 |
+| `start()` | 连接并执行首轮校准，返回 Promise&lt;Boolean&gt;。 |
+| `now()` | 校正后的 UTC 毫秒；未校准时为 `null`。 |
+| `isReady()` | 是否已完成至少一次校准。 |
+| `reportLatency(path, delayMs)` | 上报延迟，`path` 取 `'edge'` 或 `'p2p'`。 |
+| `stop()` | 停止校准并断开连接。 |
+| `offsetMs` / `lastSyncRttMs` | 当前生效的偏移量与所取样本的 RTT，用于判断可信度。 |
+
+未加载 `time-sync.js`、或 ppcenter 不可达时，播放不受影响，只是 P2P Delay 退回基于 RTT/jitter buffer 的估算值（显示为 `~N ms (est.)`）。
 
 ---
 

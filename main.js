@@ -7,6 +7,11 @@ const video = document.getElementById('player-container-id') || document.getElem
 const statsContainer = document.querySelector('#local-video .stat ul') || document.getElementById('stats');
 const layerSelect = document.getElementById('quality-select') || document.getElementById('layerSelect');
 const wsStatusDot = document.getElementById('wsStatus');
+// ppcenter base URL, entered by hand like the WHEP URL. Used only for clock
+// calibration (see time-sync.js); playback works without it, just without a
+// trustworthy P2P Delay reading.
+const PPCENTER_DEFAULT_URL = 'http://127.0.0.1:18000';
+const ppcenterInput = document.getElementById('ppcenterInput');
 (() => {
     if (!wsStatusDot) {
         const dot = document.createElement('span');
@@ -23,6 +28,11 @@ const wsStatusDot = document.getElementById('wsStatus');
         document.body.appendChild(inp);
     }
 })();
+
+function ppcenterUrl() {
+    const v = ppcenterInput && ppcenterInput.value ? ppcenterInput.value.trim() : '';
+    return v || PPCENTER_DEFAULT_URL;
+}
 
 let reader = null;
 let readerGeneration = 0;
@@ -57,19 +67,27 @@ let lastP2PDelayMs = null;
 let lastP2PDelayAt = 0;
 let lastP2PDelaySource = null; // 'sei' | 'datachannel'
 const P2P_DELAY_STALE_MS = 5000;
-// Measured delay is a floor (clock skew / rounding always trend it low,
-// never high) - pad it so displayed numbers don't read as falsely great.
+// Measured delay is a floor (rounding always trends it low, never high) -
+// pad it so displayed numbers don't read as falsely great.
 const P2P_DELAY_ERROR_MARGIN_MS = 50;
-// The SEI/DataChannel measurement is `Date.now() - timestamp`, i.e. it's
-// only valid if the player's local clock is reasonably close to the OBS
-// publisher's NTP-calibrated clock. A player whose OS clock isn't NTP
-// synced can be off by hundreds of ms to seconds, producing measured
-// values that read as near-zero or negative (real p2p delay is never
-// under ~100ms in practice - encode+network+jitter buffer alone exceed
-// that). Below this floor, the measurement is clock skew, not delay, so
-// fall back to the RTT/jitter-buffer-based estimate instead of showing
-// a nonsensical number.
+// Both ends of the subtraction must share a clock base: the timestamp comes
+// from ppobs's NTP-disciplined clock, so the local side has to be corrected
+// by the ppcenter offset (see time-sync.js) before subtracting. Until that
+// first calibration lands we don't compute a delay at all rather than
+// publishing a number built on an unknown clock skew.
+let timeSync = null;
+// Even with calibration, a badly wrong clock (or a stale offset after
+// ppcenter has been unreachable for a while) can still produce impossible
+// values. Real p2p delay is never under ~100ms - encode, network and jitter
+// buffer alone exceed that - and never anywhere near 60s, since no WebRTC
+// jitter buffer holds minutes of media. Anything outside this band is a
+// clock artifact, not a delay, so fall back to the RTT/jitter-buffer
+// estimate rather than showing a nonsensical number. The upper bound
+// matters: without it, positive skew (e.g. the ~145s seen when ppobs
+// anchored its timestamps to a drifting monotonic clock) got printed
+// verbatim while negative skew was correctly caught.
 const P2P_DELAY_CLOCK_SUSPECT_MS = 100;
+const P2P_DELAY_MAX_PLAUSIBLE_MS = 60000;
 
 function reportP2PDelay(timestampMs, source) {
     // SEI is strictly more accurate (in-band, cascade-safe, no rid
@@ -78,9 +96,21 @@ function reportP2PDelay(timestampMs, source) {
         (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS) {
         return;
     }
-    lastP2PDelayMs = Date.now() - Number(timestampMs) + P2P_DELAY_ERROR_MARGIN_MS;
+    // No calibrated clock yet => no delay. Deliberately not falling back to
+    // a raw Date.now(): that's what produced the bogus readings this whole
+    // mechanism exists to fix.
+    const correctedNow = timeSync ? timeSync.now() : null;
+    if (correctedNow === null) return;
+
+    lastP2PDelayMs = correctedNow - Number(timestampMs) + P2P_DELAY_ERROR_MARGIN_MS;
     lastP2PDelayAt = Date.now();
     lastP2PDelaySource = source;
+
+    // Only report plausible values upstream; see the bounds above.
+    if (timeSync && lastP2PDelayMs >= P2P_DELAY_CLOCK_SUSPECT_MS &&
+        lastP2PDelayMs <= P2P_DELAY_MAX_PLAUSIBLE_MS) {
+        timeSync.reportLatency('edge', lastP2PDelayMs);
+    }
 }
 
 async function loadStatConfig() {
@@ -253,7 +283,8 @@ if (!videoPauseBtn) {
     videoPauseBtn = document.createElement("a");
     videoPauseBtn.id = "videoPauseBtn";
     videoPauseBtn.className = "waves-effect waves-light btn-small orange";
-    videoPauseBtn.textContent = "Pause Video";
+    videoPauseBtn.textContent = "⏸";
+    videoPauseBtn.title = "Pause Video";
     const stopBtn = document.getElementById("stopPlay");
     if (stopBtn && stopBtn.parentNode) stopBtn.parentNode.insertBefore(videoPauseBtn, stopBtn);
 }
@@ -262,12 +293,35 @@ if (!audioPauseBtn) {
     audioPauseBtn = document.createElement("a");
     audioPauseBtn.id = "audioPauseBtn";
     audioPauseBtn.className = "waves-effect waves-light btn-small orange";
-    audioPauseBtn.textContent = "Pause Audio";
+    audioPauseBtn.textContent = "⏸";
+    audioPauseBtn.title = "Pause Audio";
     const stopBtn = document.getElementById("stopPlay");
     if (stopBtn && stopBtn.parentNode) stopBtn.parentNode.insertBefore(audioPauseBtn, stopBtn);
 }
+let muteBtn = document.getElementById("muteBtn");
+if (!muteBtn) {
+    muteBtn = document.createElement("a");
+    muteBtn.id = "muteBtn";
+    muteBtn.className = "waves-effect waves-light btn-small orange";
+    const stopBtn = document.getElementById("stopPlay");
+    if (stopBtn && stopBtn.parentNode) stopBtn.parentNode.insertBefore(muteBtn, stopBtn);
+}
 videoPauseBtn.onclick = () => setMediaPaused('video', !videoPaused);
 audioPauseBtn.onclick = () => setMediaPaused('audio', !audioPaused);
+// Client-side mute: toggles local playback volume only, independent of
+// audioPauseBtn (which pauses the audio track server-side to save
+// bandwidth). video starts with the `muted` attribute (autoplay policy),
+// so sync the label to actual state rather than assuming unmuted.
+function updateMuteBtnLabel() {
+    muteBtn.innerText = video.muted ? '\u{1F507}' : '\u{1F50A}';
+    muteBtn.title = video.muted ? 'Unmute' : 'Mute';
+}
+muteBtn.onclick = () => {
+    video.muted = !video.muted;
+    updateMuteBtnLabel();
+};
+video.addEventListener('volumechange', updateMuteBtnLabel);
+updateMuteBtnLabel();
 document.getElementById("fullscreenBtn").onclick = function() {
   var el = document.getElementById("video") || document.getElementById("player-container-id");
   if (el && el.requestFullscreen) { el.requestFullscreen(); }
@@ -322,6 +376,19 @@ function startStream() {
     lastP2PDelayAt = 0;
     lastP2PDelaySource = null;
     seiReaderAttached = false;
+
+    // Start calibrating against ppcenter in parallel with the WHEP handshake.
+    // Failure is non-fatal: playback continues, P2P Delay just falls back to
+    // the RTT/jitter-buffer estimate rather than showing an uncalibrated
+    // (and therefore meaningless) subtraction.
+    if (typeof window.TimeSync === 'function') {
+        timeSync = new window.TimeSync({ ppcenter: ppcenterUrl() });
+        timeSync.start().catch((e) => {
+            console.warn('[TimeSync] calibration unavailable:', e && e.message);
+        });
+    } else {
+        console.warn('[TimeSync] time-sync.js not loaded; P2P delay will use the RTT estimate');
+    }
 
     reader = new MediaMTXWebRTCReader({
         url: url,
@@ -530,18 +597,45 @@ function updateLayerSelectUI(tracks, activeId) {
         layerSelect.appendChild(option);
     }
 
-    if (activeId !== undefined && activeId !== null) {
-        if (!abrEngine.isAutoMode) {
-            layerSelect.value = activeId;
+    // Restore the selection that was showing before the rebuild. mmx resends
+    // TRACKS_INFO whenever track metadata changes - notably once it parses
+    // each layer's real SPS and replaces the placeholder dimensions/labels
+    // (SetTrackDimensions -> onTracksChanged in track_selector.go). That
+    // arrives a second or two after playback starts, i.e. right after a user
+    // has picked a quality, and rebuilding the <select> unconditionally reset
+    // it to "Auto (ABR)": the manual choice appeared to be ignored even
+    // though the layer switch itself had gone through.
+    //
+    // In manual mode the user's pick wins over whatever the server reports as
+    // active (a switch may still be in flight). Only auto mode follows the
+    // server.
+    if (!abrEngine.isAutoMode) {
+        // selectedTrackId() prefers a pending manual pick over the layer
+        // that's currently playing, so a switch still in flight keeps showing
+        // what the user asked for.
+        const selected = abrEngine.selectedTrackId();
+        const desired = (selected !== null && selected !== undefined) ? selected : activeId;
+        // Fall back to auto only if that track no longer exists (e.g. the
+        // publisher dropped a simulcast layer), otherwise the select would
+        // silently show a value it doesn't have an option for.
+        if (desired !== undefined && desired !== null &&
+            tracks.some(t => String(t.id) === String(desired))) {
+            layerSelect.value = desired;
         } else {
             layerSelect.value = 'auto';
         }
+    } else {
+        layerSelect.value = 'auto';
     }
 }
 
 function stopStream() {
     statPlayEnded();
     statLagStartedAt = 0;
+    if (timeSync) {
+        timeSync.stop();
+        timeSync = null;
+    }
     if (controlClient) {
         controlClient.close();
         controlClient = null;
@@ -591,6 +685,12 @@ async function updateStats() {
             if (report.type === 'codec') {
                 codecs.set(report.id, report.mimeType); // e.g. "video/H264"
             }
+            // Chromium only publishes a "codec" report for a track once media
+            // has actually arrived on it. Audio gets paused server-side by the
+            // ABR engine (SET_MEDIA_STATE), so its codecId can point at an
+            // entry that isn't in the map, leaving the display stuck on N/A
+            // even though Opus was negotiated. inbound-rtp carries mimeType
+            // directly in newer Chromium, so keep it as a fallback below.
         });
 
         // --- 计算实时指标 ---
@@ -641,11 +741,9 @@ async function updateStats() {
             const displayH = video.videoHeight || videoStats.frameHeight || 0;
             
             // [新增] 获取 Video Codec 名称
-            let vCodec = 'N/A';
-            if (videoStats.codecId && codecs.has(videoStats.codecId)) {
-                // mimeType 格式通常为 "video/H264"，我们只取后半部分
-                vCodec = codecs.get(videoStats.codecId).split('/')[1] || 'Unknown';
-            }
+            // mimeType 格式通常是 "video/H264"，我们只取后半部分
+            const vMime = (videoStats.codecId && codecs.get(videoStats.codecId)) || videoStats.mimeType;
+            const vCodec = vMime ? (vMime.split('/')[1] || 'Unknown') : 'N/A';
 
             html += renderStatGroup('Video', {
                 'Codec': vCodec, // [显示]
@@ -658,10 +756,8 @@ async function updateStats() {
 
         if (audioStats) {
             // [新增] 获取 Audio Codec 名称
-            let aCodec = 'N/A';
-            if (audioStats.codecId && codecs.has(audioStats.codecId)) {
-                aCodec = codecs.get(audioStats.codecId).split('/')[1] || 'Unknown';
-            }
+            const aMime = (audioStats.codecId && codecs.get(audioStats.codecId)) || audioStats.mimeType;
+            const aCodec = aMime ? (aMime.split('/')[1] || 'Unknown') : 'N/A';
 
             html += renderStatGroup('Audio', {
                 'Codec': aCodec, // [显示]
@@ -681,23 +777,30 @@ async function updateStats() {
             if (abrEngine && abrEngine.abrCooldown > 0) abrStatus += ` (Cool ${abrEngine.abrCooldown})`;
 
             const p2pFresh = lastP2PDelayMs !== null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS;
-            // A fresh measurement under P2P_DELAY_CLOCK_SUSPECT_MS almost
-            // certainly means the player's local clock isn't NTP-synced
-            // (see const comment above) rather than a real sub-100ms delay
-            // - fall back to the RTT/jitter-buffer estimate instead of
-            // showing a misleadingly tiny or negative number.
+            // A fresh measurement outside [SUSPECT, MAX_PLAUSIBLE] is a clock
+            // artifact rather than a real delay (see the const comments
+            // above) - fall back to the RTT/jitter-buffer estimate instead of
+            // showing a misleadingly tiny, negative, or absurdly large number.
+            const p2pImplausible = p2pFresh &&
+                (lastP2PDelayMs < P2P_DELAY_CLOCK_SUSPECT_MS || lastP2PDelayMs > P2P_DELAY_MAX_PLAUSIBLE_MS);
             const p2pLabel = !p2pFresh
-                ? 'N/A'
-                : lastP2PDelayMs < P2P_DELAY_CLOCK_SUSPECT_MS
+                ? (timeSync && !timeSync.isReady() ? 'syncing clock...' : 'N/A')
+                : p2pImplausible
                     ? `~${estimatedP2PDelayMs.toFixed(0)} ms (est.)`
                     : `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`;
 
-            html += renderStatGroup('Network', {
+            const netRows = {
                 'RTT': `${(networkStats.currentRoundTripTime * 1000).toFixed(1)} ms`,
                 'Est. Bandwidth': bw,
                 'ABR State': abrStatus,
                 'P2P Delay': p2pLabel
-            });
+            };
+            // Surface the calibration itself: a large offset or RTT is the
+            // first thing to look at when a delay reading looks wrong.
+            if (timeSync && timeSync.isReady()) {
+                netRows['Clock Offset'] = `${timeSync.offsetMs.toFixed(0)} ms (rtt ${timeSync.lastSyncRttMs.toFixed(0)})`;
+            }
+            html += renderStatGroup('Network', netRows);
         }
 
         if (html) statsContainer.innerHTML = html;
@@ -743,8 +846,10 @@ function setMediaPaused(kind, paused) {
 function updateMediaState(state) {
     videoPaused = state.video === 'paused';
     audioPaused = state.audio === 'paused';
-    videoPauseBtn.innerText = videoPaused ? 'Resume Video' : 'Pause Video';
-    audioPauseBtn.innerText = audioPaused ? 'Resume Audio' : 'Pause Audio';
+    videoPauseBtn.innerText = videoPaused ? '▶' : '⏸';
+    videoPauseBtn.title = videoPaused ? 'Resume Video' : 'Pause Video';
+    audioPauseBtn.innerText = audioPaused ? '▶' : '⏸';
+    audioPauseBtn.title = audioPaused ? 'Resume Audio' : 'Pause Audio';
     video.style.opacity = videoPaused ? '0.5' : '1';
     if (videoPaused && abrEngine.audioTrackId !== null) {
         if (abrEngine.videoTrackIds.includes(abrEngine.currentTrackId)) lastVideoTrackId = abrEngine.currentTrackId;

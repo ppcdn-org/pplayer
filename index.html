@@ -13,13 +13,15 @@
         select { padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; min-width: 150px; }
         select:disabled { opacity: 0.5; cursor: not-allowed; }
 
-        button { padding: 8px 20px; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        button { padding: 8px 14px; min-width: 40px; border: none; border-radius: 4px; font-weight: bold; font-size: 16px; line-height: 1; cursor: pointer; transition: 0.2s; }
         #startBtn { background: #28a745; color: white; }
         #startBtn:hover { background: #218838; }
         #exitBtn { background: #dc3545; color: white; }
         #exitBtn:hover { background: #c82333; }
         #videoPauseBtn, #audioPauseBtn { background: #5253aa; color: white; }
         #videoPauseBtn:hover, #audioPauseBtn:hover { background: #6465bd; }
+        #muteBtn { background: #00838f; color: white; }
+        #muteBtn:hover { background: #00a5b5; }
         #fullscreenBtn { background: #555; color: white; }
         #fullscreenBtn:hover { background: #777; }
 
@@ -52,6 +54,9 @@
 <div id="controls">
     <label for="urlInput">WHEP URL:</label>
     <input type="text" id="urlInput" value="http://localhost:8889/live/table-view/whep" placeholder="Enter Edge WHEP URL (http://edge:8890/live/whep)">
+
+    <label for="ppcenterInput">ppcenter:</label>
+    <input type="text" id="ppcenterInput" value="http://127.0.0.1:18000" placeholder="ppcenter base URL (clock sync)" style="flex:0 0 200px;" title="Used to calibrate the local clock so P2P Delay is meaningful">
     
     <div style="display: flex; align-items: center; gap: 5px; margin-left: 10px;">
         <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
@@ -61,10 +66,11 @@
         </select>
     </div>
 
-    <button id="startBtn">Start</button>
-    <button id="exitBtn">Exit</button>
-    <button id="videoPauseBtn">Pause Video</button>
-    <button id="audioPauseBtn">Pause Audio</button>
+    <button id="startBtn" title="Start">&#x25B6;</button>
+    <button id="exitBtn" title="Exit">&#x23F9;</button>
+    <button id="videoPauseBtn" title="Pause Video">&#x23F8;</button>
+    <button id="audioPauseBtn" title="Pause Audio">&#x23F8;</button>
+    <button id="muteBtn" title="Unmute">&#x1F507;</button>
     <button id="fullscreenBtn" title="Fullscreen">&#x26F6;</button>
 </div>
 
@@ -85,6 +91,9 @@
   var input = document.getElementById('urlInput');
   if (url) input.value = url;
   else if (host) input.value = 'http://' + host + '/live/table-view/whep';
+
+  var ppcenter = params.get('ppcenter');
+  if (ppcenter) document.getElementById('ppcenterInput').value = ppcenter;
 })();
 </script>
 
@@ -92,6 +101,7 @@
 <script src="mmxplayer.js?v=20260722-multilayer1"></script>
 <script src="abr-engine.js?v=20260722-multilayer1"></script>
 <script src="sei-timestamp.js?v=20260811-1"></script>
+<script src="time-sync.js?v=20260905-1"></script>
 <script src="main.js?v=20260722-multilayer1"></script>
 
 </body>
