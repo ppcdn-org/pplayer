@@ -48,6 +48,43 @@ let statRound = 70000;
 let statLagStartedAt = 0;
 let lastLagReportAt = 0;
 
+// Codec names taken straight off the negotiated transceivers. getStats() only
+// emits a "codec" report for a track once media has actually been received on
+// it, and mmx pauses the audio track server-side whenever the ABR engine drops
+// to a video-only layer (SET_MEDIA_STATE), so audio can sit with no codec
+// report for long stretches - which is what left the Audio panel stuck on
+// "N/A". The negotiated parameters are known from the moment the answer is
+// applied and don't depend on packets flowing, so they're the reliable source;
+// the live stats are still preferred when present, since they name the codec
+// actually in use rather than merely negotiated.
+let negotiatedCodecs = { audio: null, video: null };
+
+// Reads the codec each receiver negotiated, e.g. "audio/opus" -> "opus".
+function readNegotiatedCodecs(pc) {
+    const out = { audio: null, video: null };
+    if (!pc || typeof pc.getReceivers !== 'function') return out;
+    for (const r of pc.getReceivers()) {
+        const kind = r.track && r.track.kind;
+        if (kind !== 'audio' && kind !== 'video') continue;
+        // getParameters() on a receiver isn't available in every browser.
+        let codecs = null;
+        try {
+            codecs = r.getParameters && r.getParameters().codecs;
+        } catch (e) { /* not supported here */ }
+        if (!codecs || !codecs.length) continue;
+        // Skip the auxiliary payload types (retransmission, forward error
+        // correction, DTMF); they're negotiated alongside the real codec but
+        // aren't what's carrying the media.
+        const main = codecs.find(c => {
+            const sub = String(c.mimeType || '').split('/')[1] || '';
+            return !/^(rtx|red|ulpfec|flexfec|CN|telephone-event)$/i.test(sub);
+        }) || codecs[0];
+        const sub = String(main.mimeType || '').split('/')[1];
+        if (sub) out[kind] = sub;
+    }
+    return out;
+}
+
 // p2p delay: local render time minus the timestamp the OBS publisher
 // embedded when it sent the frame (see docs/obs-abs-timestamp-protocol.md
 // in the OBS repo). Two independent sources feed the same displayed value:
@@ -376,6 +413,7 @@ function startStream() {
     lastP2PDelayAt = 0;
     lastP2PDelaySource = null;
     seiReaderAttached = false;
+    negotiatedCodecs = { audio: null, video: null };
 
     // Start calibrating against ppcenter in parallel with the WHEP handshake.
     // Failure is non-fatal: playback continues, P2P Delay just falls back to
@@ -666,6 +704,10 @@ async function updateStats() {
     if (pc.connectionState !== 'connected' && pc.connectionState !== 'checking') return;
 
     try {
+        // Cheap, and the transceivers can change (renegotiation, a track
+        // arriving late), so refresh rather than reading once at connect.
+        negotiatedCodecs = readNegotiatedCodecs(pc);
+
         const stats = await pc.getStats();
         const now = Date.now();
         const deltaTime = (now - lastStats.timestamp) / 1000;
@@ -682,15 +724,11 @@ async function updateStats() {
             if (report.type === 'inbound-rtp' && report.kind === 'audio') audioStats = report;
             if (report.type === 'candidate-pair' && report.state === 'succeeded') networkStats = report;
             // [新增] 收集 codec 信息
+            // Only present once media has flowed on that track; see
+            // negotiatedCodecs above for why that isn't enough on its own.
             if (report.type === 'codec') {
                 codecs.set(report.id, report.mimeType); // e.g. "video/H264"
             }
-            // Chromium only publishes a "codec" report for a track once media
-            // has actually arrived on it. Audio gets paused server-side by the
-            // ABR engine (SET_MEDIA_STATE), so its codecId can point at an
-            // entry that isn't in the map, leaving the display stuck on N/A
-            // even though Opus was negotiated. inbound-rtp carries mimeType
-            // directly in newer Chromium, so keep it as a fallback below.
         });
 
         // --- 计算实时指标 ---
@@ -742,8 +780,8 @@ async function updateStats() {
             
             // [新增] 获取 Video Codec 名称
             // mimeType 格式通常是 "video/H264"，我们只取后半部分
-            const vMime = (videoStats.codecId && codecs.get(videoStats.codecId)) || videoStats.mimeType;
-            const vCodec = vMime ? (vMime.split('/')[1] || 'Unknown') : 'N/A';
+            const vMime = videoStats.codecId && codecs.get(videoStats.codecId);
+            const vCodec = (vMime && vMime.split('/')[1]) || negotiatedCodecs.video || 'N/A';
 
             html += renderStatGroup('Video', {
                 'Codec': vCodec, // [显示]
@@ -756,8 +794,8 @@ async function updateStats() {
 
         if (audioStats) {
             // [新增] 获取 Audio Codec 名称
-            const aMime = (audioStats.codecId && codecs.get(audioStats.codecId)) || audioStats.mimeType;
-            const aCodec = aMime ? (aMime.split('/')[1] || 'Unknown') : 'N/A';
+            const aMime = audioStats.codecId && codecs.get(audioStats.codecId);
+            const aCodec = (aMime && aMime.split('/')[1]) || negotiatedCodecs.audio || 'N/A';
 
             html += renderStatGroup('Audio', {
                 'Codec': aCodec, // [显示]
