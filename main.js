@@ -42,11 +42,6 @@ let statsInterval = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
 let previousTrackType = null; // Track if we were in audio-only mode
 let lastVideoTrackId = null;
-let statConfig = null;
-let statStartTime = 0;
-let statRound = 70000;
-let statLagStartedAt = 0;
-let lastLagReportAt = 0;
 
 // Codec names taken straight off the negotiated transceivers. getStats() only
 // emits a "codec" report for a track once media has actually been received on
@@ -150,73 +145,6 @@ function reportP2PDelay(timestampMs, source) {
     }
 }
 
-async function loadStatConfig() {
-    if (statConfig) return statConfig;
-    try {
-        const response = await fetch('/api/settings/app-env', { cache: 'no-store' });
-        const data = await response.json();
-        statConfig = data && data.data ? data.data.baseUrl : '';
-        console.log(`[StatAPI] configured: ${statConfig || 'disabled'}`);
-    } catch (e) {
-        statConfig = '';
-        console.warn('[StatAPI] config failed:', e.message);
-    }
-    return statConfig;
-}
-
-function statURL(path) {
-    return `${String(statConfig || '').replace(/\/+$/, '')}${path}`;
-}
-
-function statPayload(extra) {
-    const url = urlInput && urlInput.value ? urlInput.value : '';
-    const stream = (url.match(/\/live\/([^?]+)/) || [])[1] || '';
-    const host = (() => { try { return new URL(url).host; } catch (e) { return ''; } })();
-    return Object.assign({
-        gameTypeId: 'pick2win10001', gameUserId: 'TEST1000',
-        gameRound: `Round2025120${statRound}`, streamName: `live/${stream}`,
-        cdnName: host, protocol: 'webrtc', userAgent: navigator.userAgent
-    }, extra || {});
-}
-
-async function postStat(path, payload) {
-    if (!statConfig) await loadStatConfig();
-    if (!statConfig) {
-        console.warn(`[StatAPI] skipped ${path}: no base URL`);
-        return;
-    }
-    const target = statURL(path);
-    console.log(`[StatAPI] POST ${target}`);
-    try {
-        const response = await fetch(target, { method: 'POST', headers: {'Content-Type':'application/json','Authorization':'Bearer 123@VideoStat'}, body: JSON.stringify(payload) });
-        console.log(`[StatAPI] ${path} -> HTTP ${response.status}`);
-    } catch (e) { console.warn('[StatAPI]', path, e.message); }
-}
-
-function statPlayStarted() {
-    if (statStartTime) return;
-    statStartTime = Date.now();
-    statRound++;
-    loadStatConfig().then(() => postStat('/play/start', statPayload({ isSucceed: true, reason: 'ok', waitMiliTime: 0, quality: 'simulcast' })));
-}
-
-function statPlayEnded() {
-    if (!statStartTime) return;
-    const playDuration = Date.now() - statStartTime;
-    console.log(`[StatAPI] play/end duration=${playDuration}ms`);
-    postStat('/play/end', statPayload({ playDuration }));
-    statStartTime = 0;
-}
-
-function reportPlaybackLag(duration, source) {
-    if (!statStartTime || duration < 1000) return;
-    const now = Date.now();
-    if (now - lastLagReportAt < 3000) return;
-    lastLagReportAt = now;
-    console.log(`[StatAPI] lag duration=${duration}ms source=${source}`);
-    postStat('/lag', statPayload({ lagDuration: duration }));
-}
-
 // 实例化 ABR 引擎
 const abrEngine = new ABREngine({
     onSwitchLayer: (trackId, reason) => {
@@ -224,8 +152,7 @@ const abrEngine = new ABREngine({
             console.log(`[Main] ABR Triggered Switch: ${trackId} (${reason})`);
             switchMediaTrack(trackId, reason);
         }
-    },
-    onLag: (duration) => reportPlaybackLag(duration, 'abr')
+    }
 });
 
 function switchMediaTrack(trackId, reason) {
@@ -282,16 +209,10 @@ video.addEventListener('loadedmetadata', () => {
 // ✅ NEW: Monitor video state for debugging
 video.addEventListener('waiting', () => {
     console.log('[Video] State: WAITING (buffering)');
-    if (!statLagStartedAt) statLagStartedAt = Date.now();
 });
 
 video.addEventListener('playing', () => {
     console.log('[Video] State: PLAYING');
-    statPlayStarted();
-    if (statLagStartedAt) {
-        reportPlaybackLag(Date.now() - statLagStartedAt, 'media-waiting');
-        statLagStartedAt = 0;
-    }
 });
 
 video.addEventListener('pause', () => {
@@ -405,8 +326,6 @@ function startStream() {
         return;
     }
 
-    loadStatConfig().then(() => console.log('[StatAPI] ready for playback statistics'));
-
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
     previousTrackType = null;
     lastP2PDelayMs = null;
@@ -449,11 +368,6 @@ function startStream() {
         onError: (err) => {
             if (generation !== readerGeneration) return;
             console.error("Reader Error:", err);
-            // A broken peer connection ends the current playback period.
-            // A successful automatic reconnect will emit playing and start a
-            // new period through statPlayStarted().
-            statPlayEnded();
-            statLagStartedAt = 0;
             statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${err}</div>`;
             // Force audio-only on connection failure to save bandwidth
             if (abrEngine && abrEngine.audioTrackId && abrEngine.currentTrackId !== abrEngine.audioTrackId) {
@@ -668,8 +582,6 @@ function updateLayerSelectUI(tracks, activeId) {
 }
 
 function stopStream() {
-    statPlayEnded();
-    statLagStartedAt = 0;
     if (timeSync) {
         timeSync.stop();
         timeSync = null;
