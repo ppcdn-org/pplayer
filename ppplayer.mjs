@@ -1,4 +1,3 @@
-'use strict';
 // Polyfill for crypto.randomUUID on non-HTTPS origins
 if (typeof crypto !== "undefined" && !crypto.randomUUID) {
     crypto.randomUUID = function() {
@@ -522,4 +521,5 @@ class MediaMTXWebRTCReader {
     if (this.conf.onTrack !== undefined) this.conf.onTrack(evt);
   }
 }
-window.MediaMTXWebRTCReader = MediaMTXWebRTCReader;
+
+export { MMXControlClient, MediaMTXWebRTCReader };

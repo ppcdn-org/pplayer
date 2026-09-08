@@ -1,4 +1,3 @@
-'use strict';
 
 // Reads the OBS abs-timestamp SEI (see docs/obs-abs-timestamp-protocol.md
 // in the OBS repo) directly out of the received H.264/H.265 bitstream via
@@ -182,4 +181,4 @@ function attachSeiTimestampReader(receiver, onTimestamp, codec) {
     return true;
 }
 
-window.attachSeiTimestampReader = attachSeiTimestampReader;
+export { attachSeiTimestampReader, findObsAbsTimestamp };

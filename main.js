@@ -2,6 +2,17 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
+import { MMXControlClient, MediaMTXWebRTCReader } from './ppplayer.mjs';
+import { ABREngine } from './abr-engine.mjs';
+import { attachSeiTimestampReader } from './sei-timestamp.mjs';
+import { selectPlaybackCodec } from './codec-capability.mjs';
+import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs';
+import { parsePlayRequest, requestPlayDecision } from './play-request.mjs';
+import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs';
+import { probeNATAndSubmit } from './nat-probe.mjs';
+import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs';
+
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
 const statsContainer = document.querySelector('#local-video .stat ul') || document.getElementById('stats');
@@ -32,6 +43,45 @@ const ppcenterInput = document.getElementById('ppcenterInput');
 function ppcenterUrl() {
     const v = ppcenterInput && ppcenterInput.value ? ppcenterInput.value.trim() : '';
     return v || PPCENTER_DEFAULT_URL;
+}
+
+// Playout buffer length: how much media the jitter buffer holds before
+// rendering, trading latency against resilience to jitter. Purely local -
+// nothing is negotiated with the server. A "bufferMs" query parameter wins
+// over the default so a deployment can pin a value without touching the UI;
+// the slider then starts from whatever is in effect and can override it live.
+const bufferRange = document.getElementById('bufferRange');
+const bufferValue = document.getElementById('bufferValue');
+const bufferControl = document.getElementById('bufferControl');
+let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs')) ?? DEFAULT_BUFFER_MS;
+
+(() => {
+    if (!bufferRange) return;
+    bufferRange.value = String(bufferMs);
+    if (bufferValue) bufferValue.textContent = `${bufferMs} ms`;
+    bufferRange.addEventListener('input', () => {
+        bufferMs = Number(bufferRange.value);
+        if (bufferValue) bufferValue.textContent = `${bufferMs} ms`;
+        // Re-apply live so the effect can be felt without restarting the
+        // stream; on a browser that supports neither API this reports null
+        // and the control greys itself out.
+        markBufferSupport(applyPlayoutBuffer(activePlaybackPath?.pc, bufferMs));
+    });
+})();
+
+// Called once a track has actually arrived: before that there are no
+// receivers and applyPlayoutBuffer legitimately reports null, which would
+// otherwise look like "unsupported".
+function markBufferSupport(applied) {
+    if (!bufferControl) return;
+    if (applied) {
+        bufferControl.classList.remove('unsupported');
+        bufferControl.title = `Playout buffer via ${applied}. Higher = smoother under jitter, more latency.`;
+    } else {
+        bufferControl.classList.add('unsupported');
+        bufferControl.title = 'This browser does not expose a playout buffer control ' +
+            '(no jitterBufferTarget / playoutDelayHint); its own adaptive buffer stays in charge.';
+    }
 }
 
 // HEVC/H264 multitrack simulcast (see
@@ -85,6 +135,13 @@ let readerGeneration = 0;
 let seiReaderAttached = false;
 let controlClient = null;
 let statsInterval = null;
+// Set once a playback path is actually carrying media. In direct mode this
+// is the reader; in raced mode it's whichever leg won. All three expose
+// .pc, so one accessor covers every mode.
+let activePlaybackPath = null;
+let activePlaybackPathName = 'edge'; // 'edge' | 'p2p', for latency reporting
+let playbackRace = null;
+let playRequestAbortController = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
 let previousTrackType = null; // Track if we were in audio-only mode
 let lastVideoTrackId = null;
@@ -193,10 +250,11 @@ function reportP2PDelay(timestampMs, source) {
     lastP2PDelayAt = Date.now();
     lastP2PDelaySource = source;
 
-    // Only report plausible values upstream; see the bounds above.
+    // Only report plausible values upstream; see the bounds above. The path
+    // dimension lets ppcenter compare Edge against P2P (PLY-011).
     if (timeSync && lastP2PDelayMs >= P2P_DELAY_CLOCK_SUSPECT_MS &&
         lastP2PDelayMs <= P2P_DELAY_MAX_PLAUSIBLE_MS) {
-        timeSync.reportLatency('edge', lastP2PDelayMs);
+        timeSync.reportLatency({ path: activePlaybackPathName, delayMs: lastP2PDelayMs });
     }
 }
 
@@ -496,14 +554,10 @@ async function resolveWhepUrlAndCodec(rawUrl) {
         return { url: rawUrl, codecType: explicitMatch[1] };
     }
     let codecType = 'h264';
-    if (typeof window.selectPlaybackCodec === 'function') {
-        try {
-            codecType = await window.selectPlaybackCodec();
-        } catch (e) {
-            console.warn('[Main] Codec capability detection failed, defaulting to h264:', e && e.message);
-        }
-    } else {
-        console.warn('[Main] codec-capability.js not loaded; defaulting to h264');
+    try {
+        codecType = await selectPlaybackCodec();
+    } catch (e) {
+        console.warn('[Main] Codec capability detection failed, defaulting to h264:', e && e.message);
     }
     return { url: insertCodecTypeSegment(rawUrl, codecType), codecType };
 }
@@ -527,9 +581,8 @@ function negotiateAndConnect(generation, url, codecType) {
                     video.srcObject = evt.streams[0];
                 }
             }
-            if (evt.track.kind === 'video' && !seiReaderAttached && evt.receiver &&
-                typeof window.attachSeiTimestampReader === 'function') {
-                seiReaderAttached = window.attachSeiTimestampReader(evt.receiver, (ts) => {
+            if (evt.track.kind === 'video' && !seiReaderAttached && evt.receiver) {
+                seiReaderAttached = attachSeiTimestampReader(evt.receiver, (ts) => {
                     reportP2PDelay(ts, 'sei');
                 }, activePlaybackCodec);
                 if (seiReaderAttached) console.log('[SEI] abs-timestamp reader attached');
@@ -564,6 +617,9 @@ function negotiateAndConnect(generation, url, codecType) {
         },
         onConnected: () => {
             if (generation !== readerGeneration || !reader) return;
+            activePlaybackPath = reader;
+            activePlaybackPathName = 'edge';
+            markBufferSupport(applyPlayoutBuffer(reader.pc, bufferMs));
             const sessionId = reader.sessionId;
             console.log(`[Glue] WHEP Connected. SessionID: ${sessionId}`);
             if (window.parent) window.parent.postMessage('mmxplayer-connected', '*');
@@ -574,13 +630,105 @@ function negotiateAndConnect(generation, url, codecType) {
     });
 }
 
+function resetSessionState() {
+    previousTrackType = null;
+    lastP2PDelayMs = null;
+    lastP2PDelayAt = 0;
+    lastP2PDelaySource = null;
+    seiReaderAttached = false;
+    negotiatedCodecs = { audio: null, video: null };
+    hevcFallbackUsed = false;
+}
+
+// Two ways in, deliberately kept side by side:
+//
+//  - With the five ppcenter parameters in the query string (PLY-001), the
+//    player asks ppcenter where to play from and honours the decision it
+//    gets back: "edge-only" is a plain WHEP URL, "p2p-connect" additionally
+//    races a direct connection to ppobs against that URL.
+//  - Without them, the WHEP URL in the input box is used directly. This is
+//    the integration path for a customer who already knows their edge URL,
+//    and the debugging path here; no ppcenter involvement at all.
+//
+// parsePlayRequest enforces all-or-nothing on the five parameters, so a
+// half-filled query string is a hard error rather than a silent fallback to
+// the input box.
 async function startStream() {
     stopStream();
     const generation = ++readerGeneration;
 
+    let playConfig;
+    try {
+        playConfig = parsePlayRequest(window.location.search);
+    } catch (error) {
+        alert(error.message);
+        return;
+    }
+
+    resetSessionState();
+    startTimeSync(playConfig ? playConfig.ppcenter : ppcenterUrl());
+
+    if (playConfig) {
+        await startFromPpcenter(playConfig, generation);
+        return;
+    }
+
     const rawUrl = urlInput.value.trim();
     if (!rawUrl) return alert('Please enter a WHEP URL');
+    await startDirectStream(rawUrl, generation);
+}
 
+// Clock calibration runs for every playback mode: the delay figures are
+// meaningless without it (see reportP2PDelay). Failure is non-fatal -
+// playback continues and P2P Delay falls back to the RTT estimate.
+function startTimeSync(ppcenter) {
+    timeSync = new TimeSync({ ppcenter });
+    timeSync.start().catch((e) => {
+        console.warn('[TimeSync] calibration unavailable:', e && e.message);
+    });
+}
+
+async function startFromPpcenter(playConfig, generation) {
+    statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Requesting playback route...</div>';
+
+    // PLY-002: report the NAT observation so ppcenter can judge whether a
+    // direct connection is even worth attempting. Non-fatal - a failed probe
+    // just means ppcenter decides without it and most likely says edge-only.
+    let natProbeId = null;
+    try {
+        const probe = await probeNATAndSubmit({
+            ppcenter: playConfig.ppcenter,
+            appId: playConfig.appId,
+            txTime: playConfig.txTime,
+            txSecret: playConfig.txSecret,
+            clientId: playConfig.clientId,
+            streamName: playConfig.streamName,
+        });
+        if (probe && probe.probeId) natProbeId = probe.probeId;
+    } catch (e) { /* probe failure is non-fatal */ }
+    if (generation !== readerGeneration) return;
+
+    const abortController = new AbortController();
+    playRequestAbortController = abortController;
+    try {
+        const decision = await requestPlayDecision(playConfig, {
+            signal: abortController.signal,
+            natProbeId,
+        });
+        if (playRequestAbortController !== abortController || generation !== readerGeneration) return;
+        playRequestAbortController = null;
+        startPlaybackFromDecision(decision, {
+            startDirectStream: (url) => startDirectStream(url, generation),
+            startRacedPlayback: (d) => startRacedPlayback(d, generation),
+        });
+    } catch (error) {
+        if (error.name === 'AbortError' || generation !== readerGeneration) return;
+        console.error('Play request failed:', error);
+        statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${error.message}</div>`;
+    }
+}
+
+async function startDirectStream(rawUrl, generation) {
     // Publish (WHIP) and read (WHEP) URLs differ by one letter and are easy
     // to swap by mistake. Sending a WHIP URL here silently registers this
     // recvonly connection as a publish session: no error is returned, but
@@ -594,26 +742,6 @@ async function startStream() {
     }
 
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
-    previousTrackType = null;
-    lastP2PDelayMs = null;
-    lastP2PDelayAt = 0;
-    lastP2PDelaySource = null;
-    seiReaderAttached = false;
-    negotiatedCodecs = { audio: null, video: null };
-    hevcFallbackUsed = false;
-
-    // Start calibrating against ppcenter in parallel with the WHEP handshake.
-    // Failure is non-fatal: playback continues, P2P Delay just falls back to
-    // the RTT/jitter-buffer estimate rather than showing an uncalibrated
-    // (and therefore meaningless) subtraction.
-    if (typeof window.TimeSync === 'function') {
-        timeSync = new window.TimeSync({ ppcenter: ppcenterUrl() });
-        timeSync.start().catch((e) => {
-            console.warn('[TimeSync] calibration unavailable:', e && e.message);
-        });
-    } else {
-        console.warn('[TimeSync] time-sync.js not loaded; P2P delay will use the RTT estimate');
-    }
 
     const { url, codecType } = await resolveWhepUrlAndCodec(rawUrl);
     if (generation !== readerGeneration) return; // superseded while awaiting codec detection
@@ -621,6 +749,50 @@ async function startStream() {
 
     lastStats.timestamp = Date.now();
     statsInterval = setInterval(updateStats, 1000);
+}
+
+// PLY-005/006: race a direct P2P connection to ppobs against the Edge WHEP
+// URL and keep whichever produces a decodable frame first. NAT traversal has
+// no success guarantee on the public internet, so the point of the race is
+// that a failed direct attempt costs the viewer nothing - the Edge leg was
+// already connecting in parallel (see the architecture doc §6.3).
+function startRacedPlayback(decision, generation) {
+    statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting P2P and Edge...</div>';
+    lastStats.timestamp = Date.now();
+    statsInterval = setInterval(updateStats, 1000);
+
+    const playback = createPlaybackRace(decision, {
+        bufferMs,
+        ReaderClass: MediaMTXWebRTCReader,
+        onSelected: ({ path }) => {
+            if (generation !== readerGeneration) return;
+            const selected = path === 'p2p' ? playback.p2pPath : playback.edgePath;
+            activePlaybackPath = selected;
+            activePlaybackPathName = path;
+            if (selected.stream) video.srcObject = selected.stream;
+            // The path already applied the buffer on its own track event;
+            // this call only reports which API took it now that a winner
+            // exists.
+            markBufferSupport(applyPlayoutBuffer(selected.pc, bufferMs));
+            // ABR layer control only exists on the Edge leg: the first-phase
+            // P2P link carries a single video layer (PLY-009).
+            if (path === 'edge' && selected.sessionId) {
+                initControlClient(decision.playUrl, selected.sessionId);
+            } else {
+                layerSelect.disabled = true;
+            }
+            statsContainer.innerHTML =
+                `<div style="color: #00bcd4; text-align: center;">Playing via ${path.toUpperCase()}</div>`;
+        },
+        onFailed: (error) => {
+            if (generation !== readerGeneration) return;
+            console.error('Playback race failed:', error);
+            statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${error.message}</div>`;
+        },
+        onTelemetry: (event) => console.debug('[PlaybackRace]', event),
+    });
+    playbackRace = playback.controller;
+    playbackRace.start();
 }
 
 function initControlClient(whepUrl, sessionId) {
@@ -817,6 +989,10 @@ function stopStream() {
     if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
     }
+    if (playRequestAbortController) {
+        playRequestAbortController.abort();
+        playRequestAbortController = null;
+    }
     if (timeSync) {
         timeSync.stop();
         timeSync = null;
@@ -825,10 +1001,18 @@ function stopStream() {
         controlClient.close();
         controlClient = null;
     }
-    if (reader) {
+    // A race owns both of its legs, including the reader inside the Edge
+    // leg, so stopping it must not be followed by closing that reader again.
+    const race = playbackRace;
+    playbackRace = null;
+    if (race) {
+        race.stop();
+    } else if (reader) {
         reader.close();
-        reader = null;
     }
+    reader = null;
+    activePlaybackPath = null;
+    activePlaybackPathName = 'edge';
     if (statsInterval) {
         clearInterval(statsInterval);
         statsInterval = null;
@@ -847,8 +1031,10 @@ function stopStream() {
 }
 
 async function updateStats() {
-    if (!reader || !reader.pc) return;
-    const pc = reader.pc;
+    // In raced mode the winning leg owns the PeerConnection; in direct mode
+    // it's the reader. activePlaybackPath covers both once media is flowing.
+    const pc = (activePlaybackPath && activePlaybackPath.pc) || (reader && reader.pc);
+    if (!pc) return;
     if (pc.connectionState !== 'connected' && pc.connectionState !== 'checking') return;
 
     try {

@@ -1,7 +1,6 @@
-'use strict';
 
 // Application-layer NTP-style clock offset calibration against ppcenter's
-// /ws/play endpoint (PLY-014 / CTR-020; see docs/tech/P2P时延测量方案.md).
+// /ws/play endpoint (PLY-014 / CTR-020; see docs/tech/P2P?�延测�??��?.md).
 //
 // Why this exists: p2p delay is computed as `now - <timestamp ppobs embedded
 // when it sent the frame>`. That subtraction is only meaningful if both
@@ -47,6 +46,11 @@ class TimeSync {
         this.resyncIntervalMs = opts.resyncIntervalMs || DEFAULT_RESYNC_INTERVAL_MS;
         this.sampleCount = opts.sampleCount || DEFAULT_SAMPLE_COUNT;
         this.onStateChange = opts.onStateChange || null;
+        // Injectable so tests can drive the socket deterministically; falls
+        // back to the browser global in normal use.
+        this.WebSocketImpl = opts.WebSocketImpl ||
+            (typeof WebSocket !== 'undefined' ? WebSocket : undefined);
+        if (!this.WebSocketImpl) throw new Error('TimeSync requires a WebSocket implementation');
 
         this.ws = null;
         this.offsetMs = null;
@@ -124,14 +128,14 @@ class TimeSync {
     }
 
     _ensureConnected() {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
+        if (this.ws && this.ws.readyState === this.WebSocketImpl.OPEN) return Promise.resolve();
         if (this.closed) return Promise.reject(new Error('time sync stopped'));
 
         return new Promise((resolve, reject) => {
             let settled = false;
             let ws;
             try {
-                ws = new WebSocket(this._wsUrl());
+                ws = new this.WebSocketImpl(this._wsUrl());
             } catch (e) {
                 reject(e);
                 return;
@@ -204,7 +208,7 @@ class TimeSync {
 
     _probeOnce() {
         return new Promise((resolve, reject) => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            if (!this.ws || this.ws.readyState !== this.WebSocketImpl.OPEN) {
                 reject(new Error('time sync not connected'));
                 return;
             }
@@ -280,8 +284,8 @@ class TimeSync {
     // Fire-and-forget telemetry; drops the report when the socket isn't open
     // rather than buffering, since losing an occasional sample doesn't move a
     // P50/P95/P99 aggregate.
-    reportLatency(path, delayMs) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    reportLatency({ path, delayMs } = {}) {
+        if (!this.ws || this.ws.readyState !== this.WebSocketImpl.OPEN) return false;
         if (path !== 'edge' && path !== 'p2p') return false;
         if (!Number.isFinite(delayMs)) return false;
         this.ws.send(JSON.stringify({ type: 'LATENCY_REPORT', path, delayMs: Math.round(delayMs) }));
@@ -289,4 +293,4 @@ class TimeSync {
     }
 }
 
-window.TimeSync = TimeSync;
+export { TimeSync, DEFAULT_PPCENTER_URL };

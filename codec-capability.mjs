@@ -1,4 +1,3 @@
-'use strict';
 
 // Browser HEVC playback capability detection - see
 // docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md §4.4.
@@ -92,5 +91,4 @@ async function selectPlaybackCodec() {
     return (await isHevcPlaybackSupported()) ? 'hevc' : 'h264';
 }
 
-window.isHevcPlaybackSupported = isHevcPlaybackSupported;
-window.selectPlaybackCodec = selectPlaybackCodec;
+export { isHevcPlaybackSupported, selectPlaybackCodec };

@@ -13,14 +13,41 @@
 ## 2. 快速集成
 
 ### 2.1 引入文件
-请在 HTML 中按顺序引入脚本：
+
+本 SDK 使用 **ES module**。`main.js` 是入口，其余模块由它 `import`，HTML 里只需引入这一个：
+
 ```html
-<script src="mmxplayer-v1.0.0.js"></script>
-<script src="abr-engine.js"></script>
-<script src="sei-timestamp.js"></script>       <!-- 可选：SEI 时间戳解析（Chromium），支持 H264/HEVC -->
-<script src="time-sync.js"></script>           <!-- 可选：时钟校准，见 §6 -->
-<script src="codec-capability.js"></script>    <!-- 可选：HEVC/H264 多轨同播能力检测，见 §7 -->
+<script type="module" src="main.js"></script>
 ```
+
+> 注意：ES module 必须经 HTTP(S) 提供，直接双击打开 `file://` 会被浏览器的 CORS 策略拒绝。
+
+若只需要某个组件而不用整个页面，按需 import 即可：
+
+```javascript
+import { MediaMTXWebRTCReader, MMXControlClient } from './ppplayer.mjs';
+import { ABREngine } from './abr-engine.mjs';
+```
+
+**文件清单**
+
+| 文件 | 作用 |
+| :--- | :--- |
+| `main.js` | 入口：UI 绑定、播放流程编排 |
+| `ppplayer.mjs` | `MediaMTXWebRTCReader` + `MMXControlClient` |
+| `abr-engine.mjs` | ABR 引擎 |
+| `time-sync.mjs` | 时钟校准（§6） |
+| `obs-timestamp.mjs` | 端到端延迟计算（§6） |
+| `sei-timestamp.mjs` | 码流内 SEI 时间戳解析（Chromium） |
+| `codec-capability.mjs` | HEVC/H264 能力检测（§7） |
+| `buffer-config.mjs` | 播放缓冲时长（§9） |
+| `play-request.mjs` | 向 ppcenter 请求播放决策（§10） |
+| `nat-probe.mjs` | NAT 类型探测（§10） |
+| `playback-paths.mjs` | Edge / P2P 两条播放路径（§10） |
+| `playback-race-controller.mjs` | 竞速状态机（§10） |
+| `play-decision-runner.mjs` | 按决策组装竞速（§10） |
+
+**测试**：`npm test`（`node --test test/*.test.mjs`，共 59 个用例）。
 
 ### 2.2 基础示例 (Main.js)
 ```javascript
@@ -361,3 +388,73 @@ Playback codec: h264
 - 停止播放（`stopStream()`，即点击 Exit）会重置为 Auto 模式，因此也会连带停止一次进行中的录像。
 
 依赖浏览器的 `HTMLMediaElement.captureStream()` 和 `MediaRecorder`；不支持这两个 API 的浏览器上，点击录像按钮不会有效果（`console.warn` 提示，不影响播放）。
+
+---
+
+## 9. 播放缓冲时长 (buffer-config.mjs)
+
+播放缓冲（jitter buffer）决定浏览器在渲染前先缓存多少毫秒的媒体：**调大更抗抖动但延迟增加，调小延迟低但容易卡顿**。这是纯本地的播放端参数，不与服务端协商。
+
+- 默认 200ms，可用范围 100~1000ms。
+- URL 参数 `?bufferMs=300` 可预设，界面上的滑块可以实时覆盖（无需重启播放）。
+- 底层优先用标准的 `RTCRtpReceiver.jitterBufferTarget`（毫秒），不支持时退回 Chrome 的 `playoutDelayHint`（秒）。两者都没有的浏览器保持自身的自适应缓冲，此时界面上的滑块会变灰。
+
+```javascript
+import { applyPlayoutBuffer, parseBufferMs, DEFAULT_BUFFER_MS } from './buffer-config.mjs';
+
+// 返回实际生效的 API 名称，或 null（该浏览器不支持）
+const applied = applyPlayoutBuffer(pc, 300);
+```
+
+---
+
+## 10. P2P 加速与竞速 (§PLY-005/006)
+
+启用后，播放器会**同时**发起两条连接并采用先出帧的那条：
+
+- **Edge 路**：常规 WHEP，连到边缘节点。
+- **P2P 路**：经 ppcenter 中转信令，直连推流端 ppobs。
+
+### 10.1 为什么要竞速
+
+NAT 穿透在公网上没有成功保证——对称型 NAT、运营商级 CGNAT 都会让直连失败。若串行地"先试 P2P、失败再连 Edge"，每一次穿透误判都要让观众多等几秒黑屏。竞速把这个代价降为 0：P2P 失败时 Edge 早已在并行建连。
+
+判定以**首个可解码视频帧**为准（轮询 `inbound-rtp.framesDecoded > 0`），不是 ICE connected。
+
+| 情况 | 行为 |
+| :--- | :--- |
+| P2P 先出帧 | 用 P2P，关闭尚未完成的 WHEP |
+| Edge 先出帧 | 用 Edge，P2P 转入后台继续建连（默认至 2s 超时） |
+| 后台 P2P 后来成功 | 仅在可平滑切换时才切（`canSwitchToP2P` 回调裁决），否则关闭 P2P |
+| 选中路径中途失败 | 切到另一条；若 Edge 已被关闭则重新拉起 |
+| 两条都失败 | 报错 |
+
+### 10.2 启用方式
+
+需要在 URL 上带齐五个参数（缺一不可，少给会直接报错而不是静默降级）：
+
+```
+index.html?ppcenter=http://center:18000&appId=xxx&streamName=live/s1&txTime=<hex>&txSecret=<hmac>
+```
+
+流程：播放器先做 NAT 探测并上报，再向 ppcenter `POST /v1/play/requests` 请求决策；ppcenter 返回 `edge-only`（只给 WHEP URL）或 `p2p-connect`（额外给 P2P 会话参数）。是否走 P2P 完全由服务端判定。
+
+**不带这些参数时**，播放器直接使用输入框里的 WHEP URL，整套 P2P 代码不会执行——这是只做边缘播放的集成方式。
+
+### 10.3 单独使用竞速控制器
+
+`PlaybackRaceController` 不依赖 ppcenter，两条路径和时钟都可注入，可以独立使用：
+
+```javascript
+import { PlaybackRaceController } from './playback-race-controller.mjs';
+
+const controller = new PlaybackRaceController({
+    edgePath, p2pPath,          // 需实现 start({onFirstFrame,onFailed}) / stop()
+    raceWindowMs: 500,
+    connectTimeoutMs: 2000,
+    onSelected: ({ path }) => console.log('选中', path),
+    onFailed: (err) => console.error(err),
+    onTelemetry: (e) => console.debug(e),
+});
+controller.start();
+```

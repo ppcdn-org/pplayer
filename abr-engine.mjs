@@ -1,4 +1,3 @@
-'use strict';
 
 class ABREngine {
     constructor(callbacks) {
@@ -278,3 +277,5 @@ class ABREngine {
         if (duration >= 1000 && this.callbacks.onLag) this.callbacks.onLag(duration);
     }
 }
+
+export { ABREngine };
