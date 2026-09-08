@@ -523,23 +523,15 @@ layerSelect.addEventListener('change', (e) => {
     updateActionButtonsState();
 });
 
+// Tracks which codec path (see insertCodecTypeSegment above) the active
+// session is using - attachSeiTimestampReader needs it to pick the right NAL
+// framing (see sei-timestamp.js). No longer surfaced in the UI: with a
+// single-codec deployment (see mmx logs - ppobs never publishes a /hevc or
+// /h264 sub-path) the badge just repeated "Playback codec: h264" on every
+// play click with no useful information behind it.
 function updatePlaybackCodecStatus(codecType) {
     activePlaybackCodec = codecType;
     console.log(`[Main] Playback codec: ${codecType}`);
-    // Prefer the label index.html declares inline in #controls; fall back
-    // to a floating badge for any HTML shell that doesn't have it (see the
-    // #wsStatus auto-creation above for the same pattern).
-    let label = document.getElementById('playbackCodecLabel');
-    if (!label) {
-        label = document.createElement('span');
-        label.id = 'playbackCodecLabel';
-        label.style.cssText = 'position:fixed;top:10px;right:30px;padding:2px 8px;border-radius:4px;' +
-            'font-size:12px;font-weight:bold;color:#fff;z-index:9999;';
-        document.body.appendChild(label);
-    }
-    label.textContent = `Playback codec: ${codecType}`;
-    label.style.color = '#fff';
-    label.style.background = codecType === 'hevc' ? '#6f42c1' : '#007bff';
 }
 
 // Determines which codec to request, given the raw WHEP URL the user (or

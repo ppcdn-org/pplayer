@@ -7,7 +7,8 @@
     <style>
         body { background: #1a1a1a; color: #fff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
         
-        #controls { background: #333; padding: 15px; display: flex; gap: 10px; align-items: center; border-bottom: 1px solid #444; }
+        #controls { background: #333; padding: 15px; display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid #444; }
+        .controls-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
         input[type="text"] { flex: 1; padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; }
         
         select { padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; min-width: 150px; }
@@ -66,40 +67,41 @@
 <body>
 
 <div id="controls">
-    <label for="urlInput">WHEP URL:</label>
-    <input type="text" id="urlInput" value="http://localhost:8889/live/table-view/whep" placeholder="Enter Edge WHEP URL (http://edge:8890/live/whep)">
+    <!-- Row 1: endpoints - authCenter first, then the webrtc (WHEP) URL. -->
+    <div class="controls-row">
+        <label for="ppcenterInput">authCenter:</label>
+        <input type="text" id="ppcenterInput" value="http://127.0.0.1:18000" placeholder="Authentication Center base URL (clock sync)" style="flex:0 0 240px;" title="Used to calibrate the local clock so P2P Delay is meaningful">
 
-    <label for="ppcenterInput">ppcenter:</label>
-    <input type="text" id="ppcenterInput" value="http://127.0.0.1:18000" placeholder="ppcenter base URL (clock sync)" style="flex:0 0 200px;" title="Used to calibrate the local clock so P2P Delay is meaningful">
-    
-    <div style="display: flex; align-items: center; gap: 5px; margin-left: 10px;">
-        <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
-        <label for="layerSelect">Quality:</label>
-        <select id="layerSelect" disabled>
-            <option value="-1">Auto (Waiting WS...)</option>
-        </select>
+        <label for="urlInput">webrtc:</label>
+        <input type="text" id="urlInput" value="http://localhost:8889/live/table-view/whep" placeholder="Enter Edge WebRTC URL (http://edge:8890/live/whep)">
     </div>
 
-    <div id="bufferControl" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
-         title="Playout buffer: how much media the jitter buffer holds before rendering. Higher = smoother under jitter, more latency.">
-        <label for="bufferRange">Buffer:</label>
-        <input type="range" id="bufferRange" min="100" max="1000" step="50" value="200">
-        <span id="bufferValue">200 ms</span>
+    <!-- Row 2: playback controls. -->
+    <div class="controls-row">
+        <div style="display: flex; align-items: center; gap: 5px;">
+            <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
+            <label for="layerSelect">Quality:</label>
+            <select id="layerSelect" disabled>
+                <option value="-1">Auto (Waiting WS...)</option>
+            </select>
+        </div>
+
+        <div id="bufferControl" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
+             title="Playout buffer: how much media the jitter buffer holds before rendering. Higher = smoother under jitter, more latency.">
+            <label for="bufferRange">Buffer:</label>
+            <input type="range" id="bufferRange" min="100" max="1000" step="50" value="200">
+            <span id="bufferValue">200 ms</span>
+        </div>
+
+        <button id="startBtn" title="Start">&#x25B6;</button>
+        <button id="exitBtn" title="Exit">&#x23F9;</button>
+        <button id="videoPauseBtn" title="Pause Video">&#x23F8;</button>
+        <button id="audioPauseBtn" title="Pause Audio">&#x23F8;</button>
+        <button id="muteBtn" title="Unmute">&#x1F507;</button>
+        <button id="snapshotBtn" title="Snapshot">&#x1F4F7;</button>
+        <button id="recordBtn" title="Record 60s (WebM)">&#x23FA;</button>
+        <button id="fullscreenBtn" title="Fullscreen">&#x26F6;</button>
     </div>
-
-    <!-- HEVC/H264 multitrack simulcast - filled in by
-         updatePlaybackCodecStatus() in main.js once a codec is selected;
-         see docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md §4.4. -->
-    <span id="playbackCodecLabel" style="padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;background:#444;"></span>
-
-    <button id="startBtn" title="Start">&#x25B6;</button>
-    <button id="exitBtn" title="Exit">&#x23F9;</button>
-    <button id="videoPauseBtn" title="Pause Video">&#x23F8;</button>
-    <button id="audioPauseBtn" title="Pause Audio">&#x23F8;</button>
-    <button id="muteBtn" title="Unmute">&#x1F507;</button>
-    <button id="snapshotBtn" title="Snapshot">&#x1F4F7;</button>
-    <button id="recordBtn" title="Record 60s (WebM)">&#x23FA;</button>
-    <button id="fullscreenBtn" title="Fullscreen">&#x26F6;</button>
 </div>
 
 <div id="main-area">
@@ -153,7 +155,7 @@
 <!-- ES modules: main.js imports everything else, so only the entry point is
      listed here. Module scripts are deferred and run after parsing, so the
      DOM lookups at the top of main.js are safe. -->
-<script type="module" src="main.js?v=20260908-3"></script>
+<script type="module" src="main.js?v=20260908-4"></script>
 
 </body>
 </html>
