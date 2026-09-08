@@ -34,6 +34,52 @@ function ppcenterUrl() {
     return v || PPCENTER_DEFAULT_URL;
 }
 
+// HEVC/H264 multitrack simulcast (see
+// docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md §4.4):
+// pplayer picks a codecType before the WHEP handshake ever starts, since
+// H264 and HEVC live on two entirely independent WHIP/WHEP sessions
+// server-side - there's no way to switch codec mid-session the way ABR
+// switches simulcast layers.
+//
+// codecType is a URL *path segment* (".../h264/whep" or ".../hevc/whep"),
+// inserted right before the trailing "whep" - see the design doc's §3.1.
+// A URL with no codecType segment (the pre-multitrack shape) is left
+// untouched: ppcenter/ppmmx both interpret that as "h264" (§6.2 default),
+// so there is nothing to add when H264 is what got selected anyway.
+function insertCodecTypeSegment(whepUrl, codecType) {
+    if (codecType !== 'h264' && codecType !== 'hevc') return whepUrl;
+    const u = new URL(whepUrl);
+    const parts = u.pathname.split('/');
+    const whepIndex = parts.lastIndexOf('whep');
+    if (whepIndex <= 0) return whepUrl; // not a recognizable WHEP URL - leave it alone
+    // Idempotent: replaces an existing codecType segment (h264<->hevc
+    // fallback re-navigation) rather than accumulating one on retry.
+    if (whepIndex >= 2 && (parts[whepIndex - 1] === 'h264' || parts[whepIndex - 1] === 'hevc')) {
+        parts[whepIndex - 1] = codecType;
+    } else {
+        parts.splice(whepIndex, 0, codecType);
+    }
+    u.pathname = parts.join('/');
+    return u.toString();
+}
+
+// The inverse of insertCodecTypeSegment - strips a codecType segment back
+// out, used only for the one-shot HEVC->H264 fallback (see
+// negotiateAndConnect) so the retry doesn't keep stacking segments.
+function stripCodecTypeSegment(whepUrl) {
+    try {
+        const u = new URL(whepUrl);
+        const parts = u.pathname.split('/');
+        const whepIndex = parts.lastIndexOf('whep');
+        if (whepIndex >= 2 && (parts[whepIndex - 1] === 'h264' || parts[whepIndex - 1] === 'hevc')) {
+            parts.splice(whepIndex - 1, 1);
+            u.pathname = parts.join('/');
+            return u.toString();
+        }
+    } catch (e) { /* not a valid absolute URL - fall through */ }
+    return whepUrl;
+}
+
 let reader = null;
 let readerGeneration = 0;
 let seiReaderAttached = false;
@@ -42,6 +88,15 @@ let statsInterval = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
 let previousTrackType = null; // Track if we were in audio-only mode
 let lastVideoTrackId = null;
+// Which codec path (see insertCodecTypeSegment above) the active session is
+// using - drives the status display and tells attachSeiTimestampReader
+// which NAL framing to parse (see sei-timestamp.js).
+let activePlaybackCodec = 'h264';
+// HEVC/H264 multitrack §4.4 "播放失败降级": a HEVC session that fails to
+// negotiate falls back to H264 exactly once per startStream() call, so a
+// server that's misconfigured for both codecs can't cause an infinite
+// reconnect loop bouncing between them.
+let hevcFallbackUsed = false;
 
 // Codec names taken straight off the negotiated transceivers. getStats() only
 // emits a "codec" report for a track once media has actually been received on
@@ -264,6 +319,26 @@ if (!muteBtn) {
     const stopBtn = document.getElementById("stopPlay");
     if (stopBtn && stopBtn.parentNode) stopBtn.parentNode.insertBefore(muteBtn, stopBtn);
 }
+let snapshotBtn = document.getElementById("snapshotBtn");
+if (!snapshotBtn) {
+    snapshotBtn = document.createElement("a");
+    snapshotBtn.id = "snapshotBtn";
+    snapshotBtn.className = "waves-effect waves-light btn-small orange";
+    snapshotBtn.textContent = "\u{1F4F7}";
+    snapshotBtn.title = "Snapshot";
+    const stopBtn = document.getElementById("stopPlay");
+    if (stopBtn && stopBtn.parentNode) stopBtn.parentNode.insertBefore(snapshotBtn, stopBtn);
+}
+let recordBtn = document.getElementById("recordBtn");
+if (!recordBtn) {
+    recordBtn = document.createElement("a");
+    recordBtn.id = "recordBtn";
+    recordBtn.className = "waves-effect waves-light btn-small orange";
+    recordBtn.textContent = "\u23FA";
+    recordBtn.title = "Record 60s (WebM)";
+    const stopBtn = document.getElementById("stopPlay");
+    if (stopBtn && stopBtn.parentNode) stopBtn.parentNode.insertBefore(recordBtn, stopBtn);
+}
 videoPauseBtn.onclick = () => setMediaPaused('video', !videoPaused);
 audioPauseBtn.onclick = () => setMediaPaused('audio', !audioPaused);
 // Client-side mute: toggles local playback volume only, independent of
@@ -286,6 +361,88 @@ document.getElementById("fullscreenBtn").onclick = function() {
   else if (el && el.webkitRequestFullscreen) { el.webkitRequestFullscreen(); }
 };
 
+// Snapshot/Record only make sense pinned to one explicit layer - in Auto
+// (ABR) mode the resolution/bitrate can change mid-capture, so both actions
+// are disabled until the user picks a layer manually. Recording in progress
+// is force-stopped if the user switches back to Auto.
+const RECORD_DURATION_MS = 60000;
+let mediaRecorder = null;
+let recordStopTimer = null;
+
+function updateActionButtonsState() {
+    const disabled = !abrEngine || abrEngine.isAutoMode;
+    snapshotBtn.disabled = disabled;
+    recordBtn.disabled = disabled;
+    if (disabled && mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+    }
+}
+updateActionButtonsState();
+
+function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+snapshotBtn.onclick = () => {
+    if (snapshotBtn.disabled || !video.videoWidth || !video.videoHeight) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob((blob) => {
+        if (blob) downloadBlob(blob, `snapshot-${Date.now()}.png`);
+    }, 'image/png');
+};
+
+function startRecording() {
+    if (mediaRecorder || !video.srcObject) return;
+    const captureStream = video.captureStream || video.mozCaptureStream;
+    if (typeof captureStream !== 'function') {
+        console.warn('[Record] captureStream not supported in this browser');
+        return;
+    }
+    const stream = captureStream.call(video);
+    const mimeType = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+        .find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || 'video/webm';
+    const chunks = [];
+    mediaRecorder = new MediaRecorder(stream, { mimeType });
+    mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+    mediaRecorder.onstop = () => {
+        recordBtn.classList.remove('recording');
+        recordBtn.title = 'Record 60s (WebM)';
+        if (recordStopTimer) {
+            clearTimeout(recordStopTimer);
+            recordStopTimer = null;
+        }
+        mediaRecorder = null;
+        if (chunks.length) downloadBlob(new Blob(chunks, { type: 'video/webm' }), `record-${Date.now()}.webm`);
+    };
+    mediaRecorder.start();
+    recordBtn.classList.add('recording');
+    recordBtn.title = 'Stop Recording';
+    recordStopTimer = setTimeout(() => {
+        if (mediaRecorder) mediaRecorder.stop();
+    }, RECORD_DURATION_MS);
+}
+
+recordBtn.onclick = () => {
+    if (recordBtn.disabled) return;
+    if (mediaRecorder) {
+        mediaRecorder.stop();
+    } else {
+        startRecording();
+    }
+};
+
 layerSelect.addEventListener('change', (e) => {
     const val = e.target.value;
     if (val === "auto") {
@@ -305,47 +462,60 @@ layerSelect.addEventListener('change', (e) => {
             switchMediaTrack(trackId, 'manual_user');
         }
     }
+    updateActionButtonsState();
 });
 
-function startStream() {
-    stopStream();
-    const generation = ++readerGeneration;
-
-    const url = urlInput.value.trim();
-    if (!url) return alert('Please enter a WHEP URL');
-
-    // Publish (WHIP) and read (WHEP) URLs differ by one letter and are easy
-    // to swap by mistake. Sending a WHIP URL here silently registers this
-    // recvonly connection as a publish session: no error is returned, but
-    // no media ever flows and the control WebSocket is rejected as "not a
-    // reader session" a moment later. Fail loudly instead.
-    const lastSegment = url.split('?')[0].split('/').filter(Boolean).pop();
-    if (lastSegment === 'whip') {
-        const fixedUrl = url.replace(/\/whip(\?|$)/, '/whep$1');
-        alert(`This is a WHIP (publish) URL, not a WHEP (read) URL.\nUse:\n${fixedUrl}`);
-        return;
+function updatePlaybackCodecStatus(codecType) {
+    activePlaybackCodec = codecType;
+    console.log(`[Main] Playback codec: ${codecType}`);
+    // Prefer the label index.html declares inline in #controls; fall back
+    // to a floating badge for any HTML shell that doesn't have it (see the
+    // #wsStatus auto-creation above for the same pattern).
+    let label = document.getElementById('playbackCodecLabel');
+    if (!label) {
+        label = document.createElement('span');
+        label.id = 'playbackCodecLabel';
+        label.style.cssText = 'position:fixed;top:10px;right:30px;padding:2px 8px;border-radius:4px;' +
+            'font-size:12px;font-weight:bold;color:#fff;z-index:9999;';
+        document.body.appendChild(label);
     }
+    label.textContent = `Playback codec: ${codecType}`;
+    label.style.color = '#fff';
+    label.style.background = codecType === 'hevc' ? '#6f42c1' : '#007bff';
+}
 
-    statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
-    previousTrackType = null;
-    lastP2PDelayMs = null;
-    lastP2PDelayAt = 0;
-    lastP2PDelaySource = null;
-    seiReaderAttached = false;
-    negotiatedCodecs = { audio: null, video: null };
-
-    // Start calibrating against ppcenter in parallel with the WHEP handshake.
-    // Failure is non-fatal: playback continues, P2P Delay just falls back to
-    // the RTT/jitter-buffer estimate rather than showing an uncalibrated
-    // (and therefore meaningless) subtraction.
-    if (typeof window.TimeSync === 'function') {
-        timeSync = new window.TimeSync({ ppcenter: ppcenterUrl() });
-        timeSync.start().catch((e) => {
-            console.warn('[TimeSync] calibration unavailable:', e && e.message);
-        });
+// Determines which codec to request, given the raw WHEP URL the user (or
+// index.html's ?url= param) provided. A URL that already spells out a
+// codecType segment is treated as an explicit override and used as-is
+// (matching the design doc's example URLs in §2.2); otherwise this player
+// detects HEVC support itself and inserts the segment - see
+// insertCodecTypeSegment / codec-capability.js.
+async function resolveWhepUrlAndCodec(rawUrl) {
+    const explicitMatch = rawUrl.match(/\/(h264|hevc)\/whep(\?|$)/);
+    if (explicitMatch) {
+        return { url: rawUrl, codecType: explicitMatch[1] };
+    }
+    let codecType = 'h264';
+    if (typeof window.selectPlaybackCodec === 'function') {
+        try {
+            codecType = await window.selectPlaybackCodec();
+        } catch (e) {
+            console.warn('[Main] Codec capability detection failed, defaulting to h264:', e && e.message);
+        }
     } else {
-        console.warn('[TimeSync] time-sync.js not loaded; P2P delay will use the RTT estimate');
+        console.warn('[Main] codec-capability.js not loaded; defaulting to h264');
     }
+    return { url: insertCodecTypeSegment(rawUrl, codecType), codecType };
+}
+
+// Builds and connects a single WHEP session for the given (url, codecType)
+// pair. Returns nothing directly - success/failure surface through the
+// reader's onConnected/onError callbacks, same as before this function
+// existed; extracted from startStream() so the HEVC->H264 fallback (see
+// startStream) can call it a second time against a different URL/codec
+// without duplicating the whole reader setup.
+function negotiateAndConnect(generation, url, codecType) {
+    updatePlaybackCodecStatus(codecType);
 
     reader = new MediaMTXWebRTCReader({
         url: url,
@@ -361,13 +531,29 @@ function startStream() {
                 typeof window.attachSeiTimestampReader === 'function') {
                 seiReaderAttached = window.attachSeiTimestampReader(evt.receiver, (ts) => {
                     reportP2PDelay(ts, 'sei');
-                });
+                }, activePlaybackCodec);
                 if (seiReaderAttached) console.log('[SEI] abs-timestamp reader attached');
             }
         },
         onError: (err) => {
             if (generation !== readerGeneration) return;
             console.error("Reader Error:", err);
+
+            // One-shot HEVC->H264 fallback (design doc §4.4 "播放失败降级"):
+            // only for a codec/SDP negotiation failure, not a plain network
+            // error, and only before any media has ever flowed on this
+            // session (an established HEVC session losing its connection
+            // should reconnect as HEVC, not silently downgrade).
+            const looksLikeCodecFailure = /sdp|codec|not acceptable|406/i.test(String(err));
+            if (codecType === 'hevc' && !hevcFallbackUsed && looksLikeCodecFailure &&
+                (!reader || !reader.pc || reader.pc.connectionState !== 'connected')) {
+                hevcFallbackUsed = true;
+                console.warn('[Main] HEVC negotiation failed, falling back to H264 once:', err);
+                const fallbackUrl = stripCodecTypeSegment(url);
+                negotiateAndConnect(generation, insertCodecTypeSegment(fallbackUrl, 'h264'), 'h264');
+                return;
+            }
+
             statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${err}</div>`;
             // Force audio-only on connection failure to save bandwidth
             if (abrEngine && abrEngine.audioTrackId && abrEngine.currentTrackId !== abrEngine.audioTrackId) {
@@ -386,6 +572,52 @@ function startStream() {
             }
         }
     });
+}
+
+async function startStream() {
+    stopStream();
+    const generation = ++readerGeneration;
+
+    const rawUrl = urlInput.value.trim();
+    if (!rawUrl) return alert('Please enter a WHEP URL');
+
+    // Publish (WHIP) and read (WHEP) URLs differ by one letter and are easy
+    // to swap by mistake. Sending a WHIP URL here silently registers this
+    // recvonly connection as a publish session: no error is returned, but
+    // no media ever flows and the control WebSocket is rejected as "not a
+    // reader session" a moment later. Fail loudly instead.
+    const lastSegment = rawUrl.split('?')[0].split('/').filter(Boolean).pop();
+    if (lastSegment === 'whip') {
+        const fixedUrl = rawUrl.replace(/\/whip(\?|$)/, '/whep$1');
+        alert(`This is a WHIP (publish) URL, not a WHEP (read) URL.\nUse:\n${fixedUrl}`);
+        return;
+    }
+
+    statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
+    previousTrackType = null;
+    lastP2PDelayMs = null;
+    lastP2PDelayAt = 0;
+    lastP2PDelaySource = null;
+    seiReaderAttached = false;
+    negotiatedCodecs = { audio: null, video: null };
+    hevcFallbackUsed = false;
+
+    // Start calibrating against ppcenter in parallel with the WHEP handshake.
+    // Failure is non-fatal: playback continues, P2P Delay just falls back to
+    // the RTT/jitter-buffer estimate rather than showing an uncalibrated
+    // (and therefore meaningless) subtraction.
+    if (typeof window.TimeSync === 'function') {
+        timeSync = new window.TimeSync({ ppcenter: ppcenterUrl() });
+        timeSync.start().catch((e) => {
+            console.warn('[TimeSync] calibration unavailable:', e && e.message);
+        });
+    } else {
+        console.warn('[TimeSync] time-sync.js not loaded; P2P delay will use the RTT estimate');
+    }
+
+    const { url, codecType } = await resolveWhepUrlAndCodec(rawUrl);
+    if (generation !== readerGeneration) return; // superseded while awaiting codec detection
+    negotiateAndConnect(generation, url, codecType);
 
     lastStats.timestamp = Date.now();
     statsInterval = setInterval(updateStats, 1000);
@@ -582,6 +814,9 @@ function updateLayerSelectUI(tracks, activeId) {
 }
 
 function stopStream() {
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+    }
     if (timeSync) {
         timeSync.stop();
         timeSync = null;
@@ -608,6 +843,7 @@ function stopStream() {
     
     abrEngine.setAutoMode(true);
     previousTrackType = null;
+    updateActionButtonsState();
 }
 
 async function updateStats() {

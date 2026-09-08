@@ -6,6 +6,7 @@
 2.  **`ABREngine`**: 自适应码率（ABR）控制引擎，负责监控网络状态并自动切换视频层级。
 3.  **`MMXControlClient`** (内部): 负责 WebSocket 信令通道，与服务端进行层级切换通信。
 4.  **`TimeSync`**: 向 ppcenter 做应用层时钟校准，供端到端延迟（P2P Delay）计算使用。可选组件，不影响播放。
+5.  **`codec-capability.js`**: HEVC/H264 多轨同播的浏览器解码能力检测，决定连接 `.../h264/whep` 还是 `.../hevc/whep`。可选组件；未引入时固定请求 H264。详见 §7。
 
 ---
 
@@ -16,8 +17,9 @@
 ```html
 <script src="mmxplayer-v1.0.0.js"></script>
 <script src="abr-engine.js"></script>
-<script src="sei-timestamp.js"></script>  <!-- 可选：SEI 时间戳解析（Chromium） -->
-<script src="time-sync.js"></script>      <!-- 可选：时钟校准，见 §6 -->
+<script src="sei-timestamp.js"></script>       <!-- 可选：SEI 时间戳解析（Chromium），支持 H264/HEVC -->
+<script src="time-sync.js"></script>           <!-- 可选：时钟校准，见 §6 -->
+<script src="codec-capability.js"></script>    <!-- 可选：HEVC/H264 多轨同播能力检测，见 §7 -->
 ```
 
 ### 2.2 基础示例 (Main.js)
@@ -258,3 +260,104 @@ if (now !== null) {
 1.  **极速恢复**：因为 ICE 和 DTLS 根本没断，恢复耗时 = RTT (信令往返) + 0ms (建连)。
 2.  **带宽极低**：暂停期间只有音频流量（64kbps），对于宽带几乎可以忽略。
 3.  **实现简单**：不需要改动底层 WebRTC 握手逻辑，复用现有的 ABR 切换能力。
+
+---
+
+## 7. HEVC/H264 多轨同播 (codec-capability.js)
+
+详细设计见 `docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md`（ppcdn 仓库）。本节只说明 pplayer 侧的接入方式。
+
+### 7.1 背景
+
+ppobs 开启多轨同播后，会同时发布两条独立的 WHIP 会话：H264 和 HEVC，分别对应两个互不相关的 WHEP 地址：
+
+```
+http://edge:8889/{appId}/{stream}/h264/whep
+http://edge:8889/{appId}/{stream}/hevc/whep
+```
+
+两条会话在服务端完全独立（各自的 PeerConnection、RTP 状态、ABR 分层），因此**编解码器的选择必须在建立 WHEP 连接之前一次性确定**，播放中途不能像 ABR 切分层那样切换 codec。
+
+### 7.2 检测逻辑
+
+`selectPlaybackCodec()` 按以下顺序判断浏览器是否支持解码 HEVC：
+
+1. `navigator.mediaCapabilities.decodingInfo()`：向浏览器询问对 `hvc1.1.6.L93.B0`（HEVC Main Profile Level 3.1）在 WebRTC 场景下的解码能力。
+2. 若上一步的 API 不存在或结果不确定，回退到 `RTCRtpReceiver.getCapabilities('video')`，检查是否列出了 `video/H265` 或 `video/HEVC`。
+3. 两种方式都不确定（API 缺失、抛出异常、返回不支持）时，一律判定为不支持 HEVC，退回 H264。
+
+检测结果在页面生命周期内缓存一次，不会每次开播都重新探测。
+
+```javascript
+const codecType = await selectPlaybackCodec(); // "hevc" | "h264"
+```
+
+### 7.3 main.js 的接入方式
+
+`main.js` 在 `startStream()` 里，于建立 WHEP 连接**之前**完成 codec 选择，并把 codecType 作为 URL path segment 插入到 WHEP URL 中（插入位置固定在 `whep` 段之前，与设计文档 §3.1 一致）：
+
+```
+http://edge:8889/{appId}/{stream}/whep          →  .../{stream}/hevc/whep   (检测到支持 HEVC)
+http://edge:8889/{appId}/{stream}/whep          →  .../{stream}/h264/whep  (不支持，或未加载 codec-capability.js)
+```
+
+若输入的 WHEP URL 本身已经带有 `/h264/whep` 或 `/hevc/whep`，则视为显式指定，跳过浏览器能力检测直接使用。也可以通过 URL 查询参数强制指定（等价于手工在 WHEP URL 里写死 codec 段）：
+
+```
+index.html?url=<WHEP URL>&codecType=hevc
+```
+
+### 7.4 协商失败降级
+
+若选择了 HEVC 但 WHEP 建连失败，且失败原因看起来是 codec/SDP 协商问题（而不是普通网络错误），`main.js` 会在同一次 `startStream()` 调用内自动降级到 H264 重连一次；一次 `startStream()` 生命周期内最多降级一次，避免 HEVC/H264 来回反复重连。已经连接成功过的会话断线重连时，会按原 codec 重连，不做降级判断。
+
+### 7.5 状态展示
+
+播放开始后，`main.js` 会在页面右上角（`#playbackCodecLabel`，若 HTML 里没有该元素则自动创建一个悬浮标签）显示当前实际使用的 codec：
+
+```
+Playback codec: hevc
+Playback codec: h264
+```
+
+同时在 console 输出 `[Main] Playback codec: ...` 日志。
+
+### 7.6 SEI 时间戳解析的 HEVC 支持
+
+`sei-timestamp.js` 的 `attachSeiTimestampReader(receiver, onTimestamp, codec)` 新增第三个参数 `codec`（`'h264'` 或 `'hevc'`，默认 `'h264'`）。HEVC 与 H264 的 NAL 头长度和 SEI NAL type 不同（HEVC 头 2 字节、SEI 类型为 39/40；H264 头 1 字节、SEI 类型为 6），但两者内嵌的 SEI payload 格式一致，因此只需要按 codec 切换 NAL 解析方式即可复用同一套时间戳提取逻辑。`main.js` 会自动传入当前会话选中的 codec，无需手动指定。
+
+### 7.7 API
+
+| 函数 | 说明 |
+| :--- | :--- |
+| `isHevcPlaybackSupported()` | 返回 `Promise<Boolean>`，是否检测到浏览器可解码 HEVC。结果按页面生命周期缓存。 |
+| `selectPlaybackCodec()` | 返回 `Promise<String>`，`"hevc"` 或 `"h264"`。内部调用 `isHevcPlaybackSupported()`。 |
+
+未加载 `codec-capability.js` 时，`main.js` 会打印警告并固定按 H264 处理，播放不受影响。
+
+---
+
+## 8. 截图与录像 (Snapshot / Record)
+
+`index.html` 在控制栏提供两个按钮：📷 截图（`#snapshotBtn`）和 ⏺ 录像（`#recordBtn`），逻辑全部在 `main.js` 中，无需额外脚本。
+
+### 8.1 截图
+
+点击后用 `<canvas>` 抓取当前 `<video>` 帧（尺寸取 `video.videoWidth`/`videoHeight`），导出为 PNG 并触发浏览器下载，文件名 `snapshot-<timestamp>.png`。
+
+### 8.2 录像
+
+点击后用 `video.captureStream()` 拿到当前播放画面的 `MediaStream`，通过 `MediaRecorder` 录制为 WebM（优先 `vp9,opus`，其次 `vp8,opus`，均不支持时退回浏览器默认 `video/webm`）。
+
+- **固定时长**：最长 **60 秒**，到时自动停止；也可以再次点击按钮提前停止。
+- 录制中按钮会有红色脉冲动画提示，`title` 变为 `Stop Recording`。
+- 停止后自动导出 `record-<timestamp>.webm` 并触发下载。
+
+### 8.3 ABR 自动模式下禁用
+
+截图和录像都要求画面锁定在某一个明确的层级：Auto (ABR) 模式下分辨率/码率随时可能切换，截出来的图或录出来的视频会跳变，因此**两个按钮在 `layerSelect` 处于 `Auto` 时禁用**（`disabled` 属性 + 半透明样式），只有用户手动选择了某个画质层级后才能使用。
+
+- 若正在录像时用户切回 Auto 模式，录像会被立即强制停止并导出已录制的部分。
+- 停止播放（`stopStream()`，即点击 Exit）会重置为 Auto 模式，因此也会连带停止一次进行中的录像。
+
+依赖浏览器的 `HTMLMediaElement.captureStream()` 和 `MediaRecorder`；不支持这两个 API 的浏览器上，点击录像按钮不会有效果（`console.warn` 提示，不影响播放）。
