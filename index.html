@@ -22,8 +22,15 @@
         #videoPauseBtn:hover, #audioPauseBtn:hover { background: #6465bd; }
         #muteBtn { background: #00838f; color: white; }
         #muteBtn:hover { background: #00a5b5; }
+        #snapshotBtn { background: #6c5ce7; color: white; }
+        #snapshotBtn:hover { background: #7d6ff2; }
+        #recordBtn { background: #b71c1c; color: white; }
+        #recordBtn:hover { background: #d32f2f; }
+        #recordBtn.recording { background: #ff1744; animation: recordPulse 1s infinite; }
+        @keyframes recordPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
         #fullscreenBtn { background: #555; color: white; }
         #fullscreenBtn:hover { background: #777; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; animation: none; }
 
         #main-area { flex: 1; display: flex; position: relative; overflow: hidden; }
         #video-container { flex: 1; display: flex; justify-content: center; align-items: center; background: #000; }
@@ -66,11 +73,18 @@
         </select>
     </div>
 
+    <!-- HEVC/H264 multitrack simulcast - filled in by
+         updatePlaybackCodecStatus() in main.js once a codec is selected;
+         see docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md §4.4. -->
+    <span id="playbackCodecLabel" style="padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;background:#444;"></span>
+
     <button id="startBtn" title="Start">&#x25B6;</button>
     <button id="exitBtn" title="Exit">&#x23F9;</button>
     <button id="videoPauseBtn" title="Pause Video">&#x23F8;</button>
     <button id="audioPauseBtn" title="Pause Audio">&#x23F8;</button>
     <button id="muteBtn" title="Unmute">&#x1F507;</button>
+    <button id="snapshotBtn" title="Snapshot">&#x1F4F7;</button>
+    <button id="recordBtn" title="Record 60s (WebM)">&#x23FA;</button>
     <button id="fullscreenBtn" title="Fullscreen">&#x26F6;</button>
 </div>
 
@@ -92,17 +106,43 @@
   if (url) input.value = url;
   else if (host) input.value = 'http://' + host + '/live/table-view/whep';
 
+  // Optional explicit codecType override (HEVC/H264 multitrack - see
+  // docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md §4.4).
+  // Inserted as a URL path segment the same way main.js's
+  // insertCodecTypeSegment() does, so a manually-typed codecType=hevc
+  // parameter behaves identically to a WHEP URL that already spells out
+  // ".../hevc/whep" - main.js treats either as an explicit override and
+  // skips its own browser capability detection.
+  var codecType = params.get('codecType');
+  if (codecType === 'h264' || codecType === 'hevc') {
+    try {
+      var u = new URL(input.value);
+      var parts = u.pathname.split('/');
+      var whepIndex = parts.lastIndexOf('whep');
+      if (whepIndex > 0) {
+        if (whepIndex >= 2 && (parts[whepIndex - 1] === 'h264' || parts[whepIndex - 1] === 'hevc')) {
+          parts[whepIndex - 1] = codecType;
+        } else {
+          parts.splice(whepIndex, 0, codecType);
+        }
+        u.pathname = parts.join('/');
+        input.value = u.toString();
+      }
+    } catch (e) { /* not a valid absolute URL yet - leave it for the user to fix */ }
+  }
+
   var ppcenter = params.get('ppcenter');
   if (ppcenter) document.getElementById('ppcenterInput').value = ppcenter;
 })();
 </script>
 
 <!-- Load libraries before application scripts. -->
-<script src="mmxplayer.js?v=20260906-1"></script>
-<script src="abr-engine.js?v=20260906-1"></script>
-<script src="sei-timestamp.js?v=20260906-1"></script>
-<script src="time-sync.js?v=20260906-1"></script>
-<script src="main.js?v=20260906-1"></script>
+<script src="mmxplayer.js?v=20260908-2"></script>
+<script src="abr-engine.js?v=20260908-2"></script>
+<script src="sei-timestamp.js?v=20260908-2"></script>
+<script src="time-sync.js?v=20260908-2"></script>
+<script src="codec-capability.js?v=20260908-2"></script>
+<script src="main.js?v=20260908-2"></script>
 
 </body>
 </html>
