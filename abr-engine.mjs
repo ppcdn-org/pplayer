@@ -25,6 +25,8 @@ class ABREngine {
         this.upgradeCounter = 0;
         this.startupTime = Date.now();
         this.lastSwitchTime = Date.now();
+        this.lastDowngradeTime = 0;
+        this.lastUpgradeTime = 0;
         this.lagStartedAt = 0;
     }
 
@@ -83,6 +85,8 @@ class ABREngine {
         
         this.startupTime = Date.now();
         this.lastSwitchTime = Date.now();
+        this.lastDowngradeTime = 0;
+        this.lastUpgradeTime = 0;
     }
 
     notifyManualSwitch(trackId) {
@@ -187,21 +191,27 @@ class ABREngine {
         }
         
         if (this.currentTrackId !== this.audioTrackId) {
-            if (isLagging || isBandwidthLow) {
+            // After an upgrade, prevent downgrade for a probation period (15s)
+            // to let bandwidth stabilize and avoid oscillation.
+            const upgradeProbationSec = (now - this.lastUpgradeTime) / 1000;
+            const canDowngrade = this.lastUpgradeTime === 0 || upgradeProbationSec > 15;
+
+            if ((isLagging || isBandwidthLow) && canDowngrade) {
                 this.downgradeCounter++;
                 this.upgradeCounter = 0;
 
-                if (this.downgradeCounter >= 3) {
+                if (this.downgradeCounter >= 4) {
                     console.warn(`[ABR] DOWNGRADE TRIGGERED: AvgFPS=${this.avgFps.toFixed(1)}, BW=${this.avgBw.toFixed(0)}k`);
                     
                     if (currentVideoIndex > 0) {
                         const nextId = this.videoTrackIds[currentVideoIndex - 1];
-                        this._triggerSwitch(nextId, 'downgrade_video', 5);
+                        this.lastDowngradeTime = now;
+                        this._triggerSwitch(nextId, 'downgrade_video', 8);
                     } else if (currentVideoIndex === 0 && this.audioTrackId !== null) {
                         if (this.avgFps < 10 || this.avgBw < 200) {
                             console.warn("[ABR] Network Critical! Switching to Audio Only.");
                             this._reportLag();
-                            this._triggerSwitch(this.audioTrackId, 'downgrade_audio', 20);
+                            this._triggerSwitch(this.audioTrackId, 'downgrade_audio', 30);
                         }
                     }
                     this.downgradeCounter = 0; 
@@ -214,15 +224,25 @@ class ABREngine {
         // ==========================================
         // 升级逻辑 (Upgrade)
         // ==========================================
+        const now = Date.now();
         let canUpgrade = false;
-        const timeInAudio = (Date.now() - this.lastSwitchTime) / 1000;
+        const timeInAudio = (now - this.lastSwitchTime) / 1000;
         if (this.currentTrackId === this.audioTrackId && timeInAudio > 15) {
             canUpgrade = true;
             console.log(`[ABR] Audio stable for ${timeInAudio.toFixed(1)}s, probing video...`);
-            //this.lastSwitchTime = Date.now();
         } else {
-            if (this.avgFps >= 25 && this.avgBw >= (targetBitrateKbps * 0.95)) {
-                canUpgrade = true;
+            // Upgrade must check against the NEXT track's bitrate, not the current one.
+            // Require 20% headroom above the next track's bitrate to prevent oscillation.
+            const currentVideoIndex = this.videoTrackIds.indexOf(this.currentTrackId);
+            if (currentVideoIndex >= 0 && currentVideoIndex < this.videoTrackIds.length - 1) {
+                const nextId = this.videoTrackIds[currentVideoIndex + 1];
+                const nextTrack = this.trackRegistry[nextId];
+                if (nextTrack) {
+                    const nextBitrateKbps = (nextTrack.bitrate || 0) / 1000;
+                    if (this.avgFps >= 25 && this.avgBw >= nextBitrateKbps * 1.2) {
+                        canUpgrade = true;
+                    }
+                }
             }
         }
 
@@ -230,17 +250,14 @@ class ABREngine {
             this.upgradeCounter++;
             this.downgradeCounter = 0;
 
-            // Audio 模式下，升级计数器阈值可以低一点(尝试更积极)，或者保持一致
-            const upgradeThreshold = (this.currentTrackId === this.audioTrackId) ? 2 : 4;
+            const upgradeThreshold = (this.currentTrackId === this.audioTrackId) ? 3 : 5;
 
             if (this.upgradeCounter >= upgradeThreshold) {
                 let nextId = null;
                 
                 if (this.currentTrackId === this.audioTrackId) {
-                    // Audio -> Lowest Video
                     if (this.videoTrackIds.length > 0) nextId = this.videoTrackIds[0];
                 } else {
-                    // Video -> Higher Video
                     const currentVideoIndex = this.videoTrackIds.indexOf(this.currentTrackId);
                     if (currentVideoIndex >= 0 && currentVideoIndex < this.videoTrackIds.length - 1) {
                         nextId = this.videoTrackIds[currentVideoIndex + 1];
@@ -249,8 +266,8 @@ class ABREngine {
 
                 if (nextId !== null) {
                     console.log(`[ABR] UPGRADE: Trying ID ${nextId} (Current: ${this.currentTrackId})`);
-                    // Audio 升 Video 后，冷却时间给长一点 (10s)，防止震荡
-                    const cooldown = (this.currentTrackId === this.audioTrackId) ? 10 : 5;
+                    this.lastUpgradeTime = now;
+                    const cooldown = (this.currentTrackId === this.audioTrackId) ? 15 : 10;
                     this._triggerSwitch(nextId, 'upgrade', cooldown);
                 }
                 this.upgradeCounter = 0;
