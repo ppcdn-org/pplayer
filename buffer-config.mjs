@@ -12,7 +12,7 @@ export const MAX_BUFFER_MS = 1000;
 // default is deliberately on the generous side: 200ms rides out ordinary
 // jitter while staying well under the ~500ms race window the P2P/Edge
 // controller works with.
-export const DEFAULT_BUFFER_MS = 200;
+export const DEFAULT_BUFFER_MS = 100;
 
 // parseBufferMs reads the raw "bufferMs" query value and clamps it into the
 // supported [100, 1000] range. Missing/invalid input returns null rather than
