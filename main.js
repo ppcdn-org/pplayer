@@ -630,6 +630,7 @@ function resetSessionState() {
     seiReaderAttached = false;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
+    lastStats = { videoBytes: 0, audioBytes: 0, videoPacketsLost: 0, audioPacketsLost: 0, timestamp: 0 };
 }
 
 // Two ways in, deliberately kept side by side:
