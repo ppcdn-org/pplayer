@@ -13,6 +13,7 @@ import { probeNATAndSubmit } from './nat-probe.mjs';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs';
+import { StallWatchdog } from './stall-watchdog.mjs';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
@@ -57,6 +58,21 @@ const catchupTargetMs = (() => {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_TARGET_MS;
 })();
 const catchUpController = new CatchUpController(video, { targetMs: catchupTargetMs });
+
+// Auto-recovers the "receiving bytes but decoding nothing" stall (see
+// stall-watchdog.mjs) by doing exactly what a manual Start click does -
+// tear down and renegotiate the whole session. Observed cause: an OBS
+// stop/restart during which Origin's forward-to-Edge WHIP session survives
+// in a stuck state (see the 2026-09-16 incident notes), which no amount of
+// front-end buffering/catch-up tuning fixes since no decodable frame is
+// ever arriving in the first place.
+const stallWatchdog = new StallWatchdog({
+    onStall: () => {
+        console.warn('[Watchdog] Video stalled (receiving data, 0 fps) - restarting stream');
+        showToast('Stream stalled, reconnecting...');
+        startStream();
+    }
+});
 
 // Playout buffer length: how much media the jitter buffer holds before
 // rendering, trading latency against resilience to jitter. Purely local -
@@ -649,6 +665,7 @@ function resetSessionState() {
     hevcFallbackUsed = false;
     lastStats = { videoBytes: 0, audioBytes: 0, videoPacketsLost: 0, audioPacketsLost: 0, timestamp: 0 };
     catchUpController.reset();
+    stallWatchdog.reset();
 }
 
 // Two ways in, deliberately kept side by side:
@@ -1030,6 +1047,7 @@ function stopStream() {
     }
     video.srcObject = null;
     catchUpController.reset();
+    stallWatchdog.reset();
     statsContainer.innerHTML = '<div style="color: #888; text-align: center;">Stopped</div>';
     
     wsStatusDot.classList.remove('ws-connected');
@@ -1101,6 +1119,14 @@ async function updateStats() {
         }
 
         lastStats.timestamp = now;
+
+        // Video is expected to actually be decoding right now only when
+        // it's not deliberately paused and the ABR engine isn't parked on
+        // its audio-only track - both of those legitimately read fps=0
+        // without being a stall.
+        const isVideoActive = !videoPaused &&
+            !(abrEngine && abrEngine.currentTrackId === abrEngine.audioTrackId);
+        stallWatchdog.update(videoKbps, fps, isVideoActive);
 
         // --- 调用 ABR 引擎 ---
         if (abrEngine) {
