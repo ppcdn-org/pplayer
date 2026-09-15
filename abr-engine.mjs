@@ -158,6 +158,7 @@ class ABREngine {
         const currentTrackInfo = this.trackRegistry[this.currentTrackId];
         if (!currentTrackInfo) return;
 
+        const now = Date.now();
         const fpsAlpha = fps > 0 ? 0.2 : 0.5;
         this.avgFps = (this.avgFps === 0) ? fps : (fpsAlpha * fps + (1 - fpsAlpha) * this.avgFps);
         
@@ -224,7 +225,6 @@ class ABREngine {
         // ==========================================
         // 升级逻辑 (Upgrade)
         // ==========================================
-        const now = Date.now();
         let canUpgrade = false;
         const timeInAudio = (now - this.lastSwitchTime) / 1000;
         if (this.currentTrackId === this.audioTrackId && timeInAudio > 15) {
