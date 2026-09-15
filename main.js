@@ -12,6 +12,7 @@ import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-r
 import { probeNATAndSubmit } from './nat-probe.mjs';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs';
+import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
@@ -44,6 +45,18 @@ function ppcenterUrl() {
     const v = ppcenterInput && ppcenterInput.value ? ppcenterInput.value.trim() : '';
     return v || PPCENTER_DEFAULT_URL;
 }
+
+// Live-edge catch-up (see catchup-controller.mjs): nudges playbackRate up
+// while measured delay sits above targetMs, draining buffer that has
+// already built up rather than just limiting how fast new delay accrues.
+// "catchupTargetMs" lets a deployment tune this the same way "bufferMs"
+// tunes the playout buffer.
+const catchupTargetMs = (() => {
+    const raw = new URLSearchParams(window.location.search).get('catchupTargetMs');
+    const parsed = raw !== null ? Number(raw) : NaN;
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_TARGET_MS;
+})();
+const catchUpController = new CatchUpController(video, { targetMs: catchupTargetMs });
 
 // Playout buffer length: how much media the jitter buffer holds before
 // rendering, trading latency against resilience to jitter. Purely local -
@@ -322,6 +335,10 @@ video.addEventListener('loadedmetadata', () => {
 // ✅ NEW: Monitor video state for debugging
 video.addEventListener('waiting', () => {
     console.log('[Video] State: WAITING (buffering)');
+    // A stall means whatever the jitter buffer/network is doing is already
+    // out of the catch-up controller's hands - don't fight browser-side
+    // recovery with a stale 1.05x once it resumes.
+    catchUpController.reset();
 });
 
 video.addEventListener('playing', () => {
@@ -631,6 +648,7 @@ function resetSessionState() {
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
     lastStats = { videoBytes: 0, audioBytes: 0, videoPacketsLost: 0, audioPacketsLost: 0, timestamp: 0 };
+    catchUpController.reset();
 }
 
 // Two ways in, deliberately kept side by side:
@@ -1011,6 +1029,7 @@ function stopStream() {
         statsInterval = null;
     }
     video.srcObject = null;
+    catchUpController.reset();
     statsContainer.innerHTML = '<div style="color: #888; text-align: center;">Stopped</div>';
     
     wsStatusDot.classList.remove('ws-connected');
@@ -1154,11 +1173,20 @@ async function updateStats() {
                     ? `~${estimatedP2PDelayMs.toFixed(0)} ms (est.)`
                     : `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`;
 
+            // Only chase a measurement that's both fresh and plausible - the
+            // same gate the displayed label uses. The RTT/jitter-buffer
+            // estimate is deliberately not used here even as a fallback: it
+            // already includes the jitter buffer, so it can't distinguish
+            // "buffer is at its configured size" from "buffer has grown and
+            // needs draining", which is exactly what catch-up needs to tell
+            // apart.
+            catchUpController.update(p2pFresh && !p2pImplausible ? lastP2PDelayMs : null);
+
             const netRows = {
                 'RTT': `${(networkStats.currentRoundTripTime * 1000).toFixed(1)} ms`,
                 'Est. Bandwidth': bw,
                 'ABR State': abrStatus,
-                'P2P Delay': p2pLabel
+                'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ` (catching up ${video.playbackRate}x)` : '')
             };
             // Surface the calibration itself: a large offset or RTT is the
             // first thing to look at when a delay reading looks wrong.
