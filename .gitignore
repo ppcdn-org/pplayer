@@ -1,0 +1,3 @@
+# Local web-server config, not part of the SDK
+.htaccess
+nginx.htaccess
