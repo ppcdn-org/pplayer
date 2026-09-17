@@ -8,6 +8,12 @@ if (typeof crypto !== "undefined" && !crypto.randomUUID) {
     };
 }
 
+// SELECT_LAYER reason that tells mmx this switch is the client carrying out
+// its own ABR_RECOMMEND, not a user's manual pick - must match
+// abrReasonAutoBandwidth in ppmmx's abr_ws_handler.go exactly, since the
+// server keys off this string to decide whether to leave auto mode on.
+const ABR_REASON_AUTO_BANDWIDTH = 'auto_bandwidth';
+
 // ==========================================
 // 1. MMX Control Client (WebSocket Protocol)
 // ==========================================
@@ -149,6 +155,37 @@ class MMXControlClient {
                 if (this.callbacks.onObsTimestamp) this.callbacks.onObsTimestamp(data);
                 break;
 
+            case 'ABR_MODE':
+                // Who is currently driving layer selection. Sent on connect
+                // and in reply to SET_ABR_MODE, so a reconnecting client
+                // resyncs rather than assuming its own last known value.
+                if (this.callbacks.onABRMode) this.callbacks.onABRMode(!!data.auto);
+                break;
+
+            case 'BANDWIDTH_ESTIMATE':
+                // Server-side estimate of what this link will carry, in bits
+                // per second (see abr_controller.go). Informational only -
+                // the actual layer decision arrives separately as
+                // ABR_RECOMMEND.
+                if (this.callbacks.onBandwidthEstimate) {
+                    this.callbacks.onBandwidthEstimate(data.bits_per_second || 0);
+                }
+                break;
+
+            case 'ABR_RECOMMEND':
+                // The server's suggested layer, computed from the bandwidth
+                // estimate (see abr_controller.go). The server does not
+                // switch anything itself - execution (calling selectLayer,
+                // which is what actually asks mmx to switch) is this
+                // client's job, so the same TrackSelector.Select code path
+                // handles every switch, automatic or manual, and a user's
+                // manual pick can never be silently overridden by a
+                // concurrent server-side one.
+                if (this.callbacks.onAbrRecommend) {
+                    this.callbacks.onAbrRecommend(data.target_track_id);
+                }
+                break;
+
             case 'ERROR':
                 const errMsg = data?.message || data?.error || 'Unknown Error';
                 const errCode = data?.code || 'N/A';
@@ -181,6 +218,24 @@ class MMXControlClient {
         
         console.log(`[WS] Sending SELECT_LAYER id=${trackId} reason=${reason}`);
         this.ws.send(JSON.stringify(msg));
+    }
+
+    // Hands layer selection to the server (auto=true) or takes it back
+    // (auto=false). Note that selectLayer() implies auto=false server-side,
+    // so this only needs calling explicitly to return to automatic mode.
+    setABRMode(auto) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            console.warn('[WS] Cannot set ABR mode: WebSocket not connected');
+            return false;
+        }
+        this.ws.send(JSON.stringify({
+            msg_id: crypto.randomUUID(),
+            type: 'SET_ABR_MODE',
+            timestamp: Math.floor(Date.now() / 1000),
+            data: { auto: !!auto }
+        }));
+        console.log(`[WS] Sending SET_ABR_MODE auto=${!!auto}`);
+        return true;
     }
 
     setMediaState(state) {
@@ -522,4 +577,4 @@ class MediaMTXWebRTCReader {
   }
 }
 
-export { MMXControlClient, MediaMTXWebRTCReader };
+export { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH };

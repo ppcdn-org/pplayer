@@ -1,36 +1,43 @@
 
+// Layer bookkeeping for the quality selector.
+//
+// This used to be a full ABR decision engine: it sampled getStats() every
+// second and picked a layer from decoded FPS and received bitrate. Both
+// judgements now live server-side, driven by the send-side bandwidth
+// estimate GCC derives from TWCC feedback (see abr_controller.go in ppmmx),
+// which measures the link rather than inferring it from what happened to
+// arrive. Received bitrate could not tell congestion apart from a publisher
+// whose own bitrate had dropped; FPS measured the local decoder, not the
+// network, and is now reported in LATENCY_REPORT for statistics only.
+//
+// What remains here is the client's half of that arrangement: which layers
+// exist, which one is playing, and whether the user has taken manual
+// control. The server owns the choice while in auto mode and switches on
+// its own; those switches arrive as LAYER_SWITCHED exactly like the ones
+// this client asks for.
 class ABREngine {
     constructor(callbacks) {
-        this.callbacks = callbacks || {}; 
-        
+        this.callbacks = callbacks || {};
+
         this.isAutoMode = true;
-        this.abrCooldown = 0;
         this.currentTrackId = null;
         // Layer the user asked for but the server hasn't confirmed yet (see
         // notifyManualSwitch). currentTrackId deliberately stays on the old
         // layer until LAYER_SWITCHED arrives, so this is what the quality
         // selector should display in the meantime.
         this.pendingTrackId = null;
-        
-        this.audioTrackId = null;
-        this.videoTrackIds = []; 
-        this.trackRegistry = {}; 
 
-        this.avgFps = 0;
-        this.avgBw = 0;
-        
-        this.ignoreUpdates = 0;
-        
-        this.downgradeCounter = 0;
-        this.upgradeCounter = 0;
-        this.startupTime = Date.now();
-        this.lastSwitchTime = Date.now();
-        this.lastDowngradeTime = 0;
-        this.lastUpgradeTime = 0;
-        this.lagStartedAt = 0;
+        this.audioTrackId = null;
+        this.videoTrackIds = [];
+        this.trackRegistry = {};
+
+        // Most recent server-side bandwidth estimate in bits per second, or
+        // null before the first BANDWIDTH_ESTIMATE arrives. Display only.
+        this.lastBandwidthEstimate = null;
     }
 
-    // [修复] 增加 currentVideoWidth 参数，用于基于真实画面探测当前 Track
+    // currentVideoWidth is used only to guess the starting layer when the
+    // server hasn't told us which one is active.
     setTracks(tracks, activeId, currentVideoWidth = 0) {
         this.trackRegistry = {};
         this.videoTrackIds = [];
@@ -49,9 +56,6 @@ class ABREngine {
             this.audioTrackId = audioT.id;
         }
 
-        // ==========================================
-        // 初始化当前 Track ID 的智能判定
-        // ==========================================
         // Note that setTracks runs on every TRACKS_INFO, not just the first:
         // mmx resends it whenever track metadata changes (e.g. once it parses
         // each layer's real SPS, see SetTrackDimensions in
@@ -61,7 +65,7 @@ class ABREngine {
         if (activeId !== undefined && activeId !== null) {
             this.currentTrackId = activeId;
         } else if (this.currentTrackId === null && this.videoTrackIds.length > 0) {
-            
+
             let matchedId = null;
             // 尝试通过当前 video 标签的真实宽度来匹配 Track
             if (currentVideoWidth > 0) {
@@ -74,26 +78,20 @@ class ABREngine {
                 this.currentTrackId = matchedId;
                 console.log(`[ABR] Initial track detected by real resolution: ID ${this.currentTrackId}`);
             } else {
-                // 兜底方案：因为 main.js 初始化 maxBitrate 为 2500，默认是在最高画质
-                // 取排序后数组的最后一个元素 (High)
+                // 兜底方案：取排序后数组的最后一个元素 (High)
                 this.currentTrackId = this.videoTrackIds[this.videoTrackIds.length - 1];
                 console.log(`[ABR] Initial track not provided, assuming Highest: ID ${this.currentTrackId}`);
             }
         }
 
-        console.log(`[ABR] Engine Initialized. Video IDs (Low->High): ${this.videoTrackIds}, Audio ID: ${this.audioTrackId}`);
-        
-        this.startupTime = Date.now();
-        this.lastSwitchTime = Date.now();
-        this.lastDowngradeTime = 0;
-        this.lastUpgradeTime = 0;
+        console.log(`[ABR] Tracks loaded. Video IDs (Low->High): ${this.videoTrackIds}, Audio ID: ${this.audioTrackId}`);
     }
 
     notifyManualSwitch(trackId) {
         this.isAutoMode = false;
         // Do NOT update currentTrackId here: it's still the *old* layer
         // until the server confirms the switch (onLayerSwitched ->
-        // notifyLayerSwitched, once mmxplayer.js gets a LAYER_SWITCHED
+        // notifyLayerSwitched, once ppplayer.mjs gets a LAYER_SWITCHED
         // message back). Setting it eagerly to the target made every
         // manual switch's very next switchMediaTrack() call see
         // trackId === currentTrackId and treat it as a no-op "redundant"
@@ -103,7 +101,6 @@ class ABREngine {
         // Record it as pending instead, so the UI can keep showing the
         // user's choice while the switch is in flight.
         this.pendingTrackId = trackId;
-        this._resetCounters();
         console.log(`[ABR] Manual switch detected. Auto Mode OFF.`);
     }
 
@@ -114,184 +111,28 @@ class ABREngine {
     }
 
     notifyLayerSwitched(trackId) {
-        this._updateCurrentTrack(trackId);
+        this.currentTrackId = trackId;
         this.pendingTrackId = null;
-        this.ignoreUpdates = 3; 
-        this.avgFps = 0;
-        this._resetCounters();
-        this.lastSwitchTime = Date.now(); // 记录切换时间
     }
 
-    _updateCurrentTrack(trackId) {
-        this.currentTrackId = trackId;
-    }
-    
-    _resetCounters() {
-        this.downgradeCounter = 0;
-        this.upgradeCounter = 0;
+    // Reflects the server's view of who is driving selection (ABR_MODE).
+    // Kept separate from setAutoMode so a server-sent state can't be
+    // mistaken for a local request and echoed straight back.
+    notifyAutoMode(enabled) {
+        this.isAutoMode = enabled;
+        if (enabled) this.pendingTrackId = null;
+        console.log(`[ABR] Auto Mode (from server): ${enabled}`);
     }
 
     setAutoMode(enabled) {
         this.isAutoMode = enabled;
         // Going back to auto abandons any outstanding manual pick.
         if (enabled) this.pendingTrackId = null;
-        this._resetCounters();
         console.log(`[ABR] Auto Mode: ${enabled}`);
     }
 
-    update(videoKbps, audioKbps, fps, packetsLost) {
-        if (!this.isAutoMode) return;
-        
-        if (this.abrCooldown > 0) {
-            this.abrCooldown--;
-            return;
-        }
-        
-        if (this.ignoreUpdates > 0) {
-            this.ignoreUpdates--;
-            return;
-        }
-        
-        if (Date.now() - this.startupTime < 5000) return;
-
-        if (this.currentTrackId === null) return;
-        const currentTrackInfo = this.trackRegistry[this.currentTrackId];
-        if (!currentTrackInfo) return;
-
-        const now = Date.now();
-        const fpsAlpha = fps > 0 ? 0.2 : 0.5;
-        this.avgFps = (this.avgFps === 0) ? fps : (fpsAlpha * fps + (1 - fpsAlpha) * this.avgFps);
-        
-        const totalThroughput = videoKbps + audioKbps;
-        const bwAlpha = 0.2;
-        this.avgBw = (this.avgBw === 0) ? totalThroughput : (bwAlpha * totalThroughput + (1 - bwAlpha) * this.avgBw);
-
-        const targetBitrateKbps = (currentTrackInfo.bitrate || 0) / 1000;
-        if (targetBitrateKbps <= 0) return;
-
-        if (this.avgBw > 0) {
-            console.debug(`[ABR Check] Track:${this.currentTrackId} | AvgFPS:${this.avgFps.toFixed(1)} | AvgBW:${this.avgBw.toFixed(0)}k / Target:${targetBitrateKbps.toFixed(0)}k | DG-Count:${this.downgradeCounter}`);
-        }
-
-        // ==========================================
-        // 降级逻辑 (Downgrade)
-        // ==========================================
-        const currentVideoIndex = this.videoTrackIds.indexOf(this.currentTrackId);
-        const isLowestVideo = (currentVideoIndex === 0);
-        
-        const fpsThreshold = isLowestVideo ? 12 : 20; 
-        const bwThresholdRatio = isLowestVideo ? 0.5 : 0.7; 
-
-        const isLagging = this.avgFps < fpsThreshold;
-        const isBandwidthLow = this.avgBw < (targetBitrateKbps * bwThresholdRatio);
-
-        if (isLagging || isBandwidthLow) {
-            if (!this.lagStartedAt) this.lagStartedAt = Date.now();
-        } else if (this.lagStartedAt) {
-            this._reportLag();
-        }
-        
-        if (this.currentTrackId !== this.audioTrackId) {
-            // After an upgrade, prevent downgrade for a probation period (15s)
-            // to let bandwidth stabilize and avoid oscillation.
-            const upgradeProbationSec = (now - this.lastUpgradeTime) / 1000;
-            const canDowngrade = this.lastUpgradeTime === 0 || upgradeProbationSec > 15;
-
-            if ((isLagging || isBandwidthLow) && canDowngrade) {
-                this.downgradeCounter++;
-                this.upgradeCounter = 0;
-
-                if (this.downgradeCounter >= 4) {
-                    console.warn(`[ABR] DOWNGRADE TRIGGERED: AvgFPS=${this.avgFps.toFixed(1)}, BW=${this.avgBw.toFixed(0)}k`);
-                    
-                    if (currentVideoIndex > 0) {
-                        const nextId = this.videoTrackIds[currentVideoIndex - 1];
-                        this.lastDowngradeTime = now;
-                        this._triggerSwitch(nextId, 'downgrade_video', 8);
-                    } else if (currentVideoIndex === 0 && this.audioTrackId !== null) {
-                        if (this.avgFps < 10 || this.avgBw < 200) {
-                            console.warn("[ABR] Network Critical! Switching to Audio Only.");
-                            this._reportLag();
-                            this._triggerSwitch(this.audioTrackId, 'downgrade_audio', 30);
-                        }
-                    }
-                    this.downgradeCounter = 0; 
-                }
-            } else {
-                if (this.downgradeCounter > 0) this.downgradeCounter--;
-            }
-        }
-
-        // ==========================================
-        // 升级逻辑 (Upgrade)
-        // ==========================================
-        let canUpgrade = false;
-        const timeInAudio = (now - this.lastSwitchTime) / 1000;
-        if (this.currentTrackId === this.audioTrackId && timeInAudio > 15) {
-            canUpgrade = true;
-            console.log(`[ABR] Audio stable for ${timeInAudio.toFixed(1)}s, probing video...`);
-        } else {
-            // Upgrade must check against the NEXT track's bitrate, not the current one.
-            // Require 20% headroom above the next track's bitrate to prevent oscillation.
-            const currentVideoIndex = this.videoTrackIds.indexOf(this.currentTrackId);
-            if (currentVideoIndex >= 0 && currentVideoIndex < this.videoTrackIds.length - 1) {
-                const nextId = this.videoTrackIds[currentVideoIndex + 1];
-                const nextTrack = this.trackRegistry[nextId];
-                if (nextTrack) {
-                    const nextBitrateKbps = (nextTrack.bitrate || 0) / 1000;
-                    if (this.avgFps >= 25 && this.avgBw >= nextBitrateKbps * 1.2) {
-                        canUpgrade = true;
-                    }
-                }
-            }
-        }
-
-        if (canUpgrade) {
-            this.upgradeCounter++;
-            this.downgradeCounter = 0;
-
-            const upgradeThreshold = (this.currentTrackId === this.audioTrackId) ? 3 : 5;
-
-            if (this.upgradeCounter >= upgradeThreshold) {
-                let nextId = null;
-                
-                if (this.currentTrackId === this.audioTrackId) {
-                    if (this.videoTrackIds.length > 0) nextId = this.videoTrackIds[0];
-                } else {
-                    const currentVideoIndex = this.videoTrackIds.indexOf(this.currentTrackId);
-                    if (currentVideoIndex >= 0 && currentVideoIndex < this.videoTrackIds.length - 1) {
-                        nextId = this.videoTrackIds[currentVideoIndex + 1];
-                    }
-                }
-
-                if (nextId !== null) {
-                    console.log(`[ABR] UPGRADE: Trying ID ${nextId} (Current: ${this.currentTrackId})`);
-                    this.lastUpgradeTime = now;
-                    const cooldown = (this.currentTrackId === this.audioTrackId) ? 15 : 10;
-                    this._triggerSwitch(nextId, 'upgrade', cooldown);
-                }
-                this.upgradeCounter = 0;
-            }
-        } else {
-             if (this.upgradeCounter > 0) this.upgradeCounter--;
-        }
-    }
-
-    _triggerSwitch(trackId, reason, cooldownTime) {
-        if (trackId === this.currentTrackId) return;
-        if (this.callbacks.onSwitchLayer) {
-            this.callbacks.onSwitchLayer(trackId, reason);
-        }
-        this.abrCooldown = cooldownTime; 
-        this.ignoreUpdates = 3; 
-        this._resetCounters();
-    }
-
-    _reportLag() {
-        if (!this.lagStartedAt) return;
-        const duration = Date.now() - this.lagStartedAt;
-        this.lagStartedAt = 0;
-        if (duration >= 1000 && this.callbacks.onLag) this.callbacks.onLag(duration);
+    notifyBandwidthEstimate(bitsPerSecond) {
+        this.lastBandwidthEstimate = bitsPerSecond;
     }
 }
 

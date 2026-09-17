@@ -2,7 +2,7 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader } from './ppplayer.mjs';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs';
 import { ABREngine } from './abr-engine.mjs';
 import { attachSeiTimestampReader } from './sei-timestamp.mjs';
 import { selectPlaybackCodec } from './codec-capability.mjs';
@@ -287,15 +287,10 @@ function reportP2PDelay(timestampMs, source) {
     }
 }
 
-// 实例化 ABR 引擎
-const abrEngine = new ABREngine({
-    onSwitchLayer: (trackId, reason) => {
-        if (controlClient) {
-            console.log(`[Main] ABR Triggered Switch: ${trackId} (${reason})`);
-            switchMediaTrack(trackId, reason);
-        }
-    }
-});
+// Layer bookkeeping. The layer *choice* is made server-side from the
+// bandwidth estimate (see abr_controller.go in ppmmx); this side tracks what
+// is playing and what the user has asked for. See abr-engine.mjs.
+const abrEngine = new ABREngine();
 
 function switchMediaTrack(trackId, reason) {
     if (!controlClient) return;
@@ -310,17 +305,26 @@ function switchMediaTrack(trackId, reason) {
         console.log(`[Main] Ignore redundant layer switch: ${trackId} (${reason})`);
         return;
     }
-    lastVideoTrackId = trackId;
     if (videoPaused) {
         // Audio-only pauses video but keeps the selector on the last video
         // layer. Resume media first; select only when the target differs.
+        //
+        // The comparison has to happen before lastVideoTrackId is updated:
+        // assigning first made this condition always true, so resuming to a
+        // *different* layer than the one paused on would report the switch
+        // as complete locally without ever sending SELECT_LAYER, leaving
+        // client and server disagreeing until the next TRACKS_INFO.
+        const resumingSameLayer = (trackId === lastVideoTrackId);
+        lastVideoTrackId = trackId;
         controlClient.setMediaState({ video: 'resumed' });
         videoPaused = false;
-        if (trackId === lastVideoTrackId) {
+        if (resumingSameLayer) {
             abrEngine.notifyLayerSwitched(trackId);
             previousTrackType = 'video';
             return;
         }
+    } else {
+        lastVideoTrackId = trackId;
     }
     controlClient.selectLayer(trackId, reason);
 }
@@ -538,10 +542,14 @@ layerSelect.addEventListener('change', (e) => {
     const val = e.target.value;
     if (val === "auto") {
         abrEngine.setAutoMode(true);
+        // Hand selection back to the server. A plain selectLayer() would
+        // pin the layer again (it implies manual mode server-side), so
+        // resuming from audio-only has to be done before this, not after.
         if (videoPaused || abrEngine.currentTrackId === abrEngine.audioTrackId) {
             const lowestVideo = abrEngine.videoTrackIds[0];
             if (lowestVideo !== undefined) switchMediaTrack(lowestVideo, 'user_resume');
         }
+        if (controlClient) controlClient.setABRMode(true);
         console.log(`[UI] Switched to AUTO mode`);
     } else {
         abrEngine.setAutoMode(false);
@@ -869,6 +877,36 @@ function initControlClient(whepUrl, sessionId) {
             if (activeRid === null || String(data.rid) !== activeRid) return;
             reportP2PDelay(data.timestamp, 'datachannel');
         },
+        onABRMode: (auto) => {
+            // The server is authoritative about who is choosing layers -
+            // it flips to manual on any SELECT_LAYER, including ones this
+            // client sent, so adopt its view rather than tracking our own.
+            abrEngine.notifyAutoMode(auto);
+            if (!layerSelect.disabled) {
+                updateLayerSelectUI(controlClient ? controlClient.tracks : [], abrEngine.currentTrackId);
+            }
+            updateActionButtonsState();
+        },
+        onBandwidthEstimate: (bps) => {
+            abrEngine.notifyBandwidthEstimate(bps);
+        },
+        onAbrRecommend: (trackId) => {
+            // The server only ever recommends; this client is the one that
+            // actually asks mmx to switch, via the same switchMediaTrack
+            // path a manual pick uses - see ppplayer.mjs's ABR_RECOMMEND
+            // case and runABRControl's doc comment in ppmmx for why. If the
+            // user has since taken manual control, or a manual switch is
+            // still in flight, a stale recommendation must not undo it.
+            if (!abrEngine.isAutoMode) return;
+            if (abrEngine.pendingTrackId !== null) return;
+            // The user deliberately paused video (audio-only): switchMediaTrack
+            // unconditionally resumes video whenever videoPaused is true, so an
+            // automatic recommendation arriving while paused would silently
+            // undo that choice. Bandwidth recommendations resume on their own
+            // once the user un-pauses.
+            if (videoPaused) return;
+            switchMediaTrack(trackId, ABR_REASON_AUTO_BANDWIDTH);
+        },
         onLayerSwitched: (id) => {
             console.log("[UI] Received Track switch:", id);
 
@@ -1128,10 +1166,9 @@ async function updateStats() {
             !(abrEngine && abrEngine.currentTrackId === abrEngine.audioTrackId);
         stallWatchdog.update(videoKbps, fps, isVideoActive);
 
-        // --- 调用 ABR 引擎 ---
-        if (abrEngine) {
-            abrEngine.update(videoKbps, audioKbps, fps, currentPacketLoss);
-        }
+        // No client-side ABR decision here any more: the layer is chosen
+        // server-side from the bandwidth estimate. fps/loss below are
+        // reported for statistics and drive the stall watchdog only.
 
         // RTT/jitter-buffer-based rough p2p delay estimate. Used both as
         // the LATENCY_REPORT payload's estimated_e2e_ms and, when the
@@ -1183,8 +1220,11 @@ async function updateStats() {
                 bw = `${(networkStats.availableIncomingBitrate / 1000).toFixed(0)} kbps`;
             }
             
-            let abrStatus = (abrEngine && abrEngine.isAutoMode) ? 'Auto' : 'Manual';
-            if (abrEngine && abrEngine.abrCooldown > 0) abrStatus += ` (Cool ${abrEngine.abrCooldown})`;
+            // "Auto" now means the server is choosing; see abr-engine.mjs.
+            let abrStatus = (abrEngine && abrEngine.isAutoMode) ? 'Auto (server)' : 'Manual';
+            if (abrEngine && abrEngine.lastBandwidthEstimate !== null) {
+                abrStatus += ` · est ${(abrEngine.lastBandwidthEstimate / 1000).toFixed(0)}k`;
+            }
 
             const p2pFresh = lastP2PDelayMs !== null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS;
             // A fresh measurement outside [SUSPECT, MAX_PLAUSIBLE] is a clock

@@ -1,9 +1,14 @@
 # MediaMTX Player SDK v1.0 开发文档
 
+## 官方链接
+
+- 官方在线 demo: <https://www.pp-cdn.org/>
+- 官方 TG 运营群: <https://t.me/+oEpcmaGXdihjMzY1>
+
 ## 1. 简介
 本 SDK 是一套轻量级的前端解决方案，专为配合 MediaMTX 服务的 WebRTC WHEP 接口和 Simulcast 功能设计。它包含以下核心组件：
 1.  **`MediaMTXWebRTCReader`**: 负责 WHEP 协议交互、WebRTC 连接建立、RTP 接收和 SDP 协商。
-2.  **`ABREngine`**: 自适应码率（ABR）控制引擎，负责监控网络状态并自动切换视频层级。
+2.  **`ABREngine`**: 层级状态记录。**自适应码率的决策已移到服务端**（见 §5），本模块只负责记录有哪些层级、当前在播哪一层、以及用户是否接管了手动选择。
 3.  **`MMXControlClient`** (内部): 负责 WebSocket 信令通道，与服务端进行层级切换通信。
 4.  **`TimeSync`**: 向 ppcenter 做应用层时钟校准，供端到端延迟（P2P Delay）计算使用。可选组件，不影响播放。
 5.  **`codec-capability.js`**: HEVC/H264 多轨同播的浏览器解码能力检测，决定连接 `.../h264/whep` 还是 `.../hevc/whep`。可选组件；未引入时固定请求 H264。详见 §7。
@@ -35,7 +40,7 @@ import { ABREngine } from './abr-engine.mjs';
 | :--- | :--- |
 | `main.js` | 入口：UI 绑定、播放流程编排 |
 | `ppplayer.mjs` | `MediaMTXWebRTCReader` + `MMXControlClient` |
-| `abr-engine.mjs` | ABR 引擎 |
+| `abr-engine.mjs` | 层级状态记录（决策在服务端，见 §5） |
 | `time-sync.mjs` | 时钟校准（§6） |
 | `obs-timestamp.mjs` | 端到端延迟计算（§6） |
 | `sei-timestamp.mjs` | 码流内 SEI 时间戳解析（Chromium） |
@@ -51,16 +56,8 @@ import { ABREngine } from './abr-engine.mjs';
 
 ### 2.2 基础示例 (Main.js)
 ```javascript
-// 1. 实例化 ABR 引擎
-const abrEngine = new ABREngine({
-    // 当 ABR 决策需要切换时回调
-    onSwitchLayer: (trackId, reason) => {
-        if (controlClient) {
-            console.log(`切换到 Track: ${trackId}, 原因: ${reason}`);
-            controlClient.selectLayer(trackId, reason);
-        }
-    }
-});
+// 1. 实例化层级状态记录（无需回调：切换由服务端发起，见 §5）
+const abrEngine = new ABREngine();
 
 // 2. 实例化播放器
 const reader = new MediaMTXWebRTCReader({
@@ -93,19 +90,22 @@ function initControlClient(sessionId) {
             abrEngine.setTracks(tracks, activeId);
         },
         onLayerSwitched: (id) => {
-            // 通知 ABR 引擎切换完成
+            // 服务端确认切换（可能是服务端自己发起的，也可能是本端请求的）
             abrEngine.notifyLayerSwitched(id);
+        },
+        onABRMode: (auto) => {
+            // 服务端告知当前由谁选层，以它为准
+            abrEngine.notifyAutoMode(auto);
+        },
+        onBandwidthEstimate: (bps) => {
+            // 服务端的带宽估计，仅供展示
+            abrEngine.notifyBandwidthEstimate(bps);
         }
     });
 }
-
-// 4. 周期性驱动 ABR (建议 1s - 3s 一次)
-setInterval(async () => {
-    const stats = await reader.pc.getStats();
-    // ... 计算 kbps 和 fps ...
-    abrEngine.update(videoKbps, audioKbps, fps);
-}, 1000);
 ```
+
+> 注意：这里**不需要**再周期性地把 `getStats()` 的 fps/码率喂给 ABR——层级选择已由服务端根据带宽估计做出（§5）。
 
 ---
 
@@ -158,34 +158,43 @@ setInterval(async () => {
 | `onConnected` | - | WebSocket 连接成功。 |
 | `onDisconnected` | - | WebSocket 连接断开。 |
 | `onTracksInfo` | `(tracks: Array, activeId: Number)` | 收到服务端下发的流列表 (Tracks Manifest)。 |
-| `onLayerSwitched` | `(currentId: Number)` | 服务端确认切换完成。 |
+| `onLayerSwitched` | `(currentId: Number)` | 切换完成。**注意**：服务端在 Auto 模式下会自行切换，因此该回调不一定对应本端发出的请求。 |
+| `onABRMode` | `(auto: Boolean)` | 服务端告知当前由谁选层。连接建立时和每次 `SET_ABR_MODE` 后下发。 |
+| `onBandwidthEstimate` | `(bitsPerSecond: Number)` | 服务端的带宽估计（整条连接，含音频），每秒一次，仅供展示。 |
+| `onAbrRecommend` | `(targetTrackId: Number)` | 服务端建议切换到的层级（见 §5）。**服务端只建议，不执行**——收到后必须由本端调用 `selectLayer(targetTrackId, ABR_REASON_AUTO_BANDWIDTH)` 才会真正切换。 |
 
 #### 方法
 | 方法名 | 参数 | 说明 |
 | :--- | :--- | :--- |
-| `selectLayer(trackId, reason)` | `trackId`: Number, `reason`: String | 发送切换指令给服务端。 |
+| `selectLayer(trackId, reason)` | `trackId`: Number, `reason`: String | 发送切换指令给服务端。**副作用**：`reason` 为任意值都会让服务端认为用户接管了选层、自动退出 Auto 模式——**除了** `ABR_REASON_AUTO_BANDWIDTH`（导出的常量，值为 `"auto_bandwidth"`），这个值专门告诉服务端"这是在执行你自己的建议，不是用户手动选的"，因此不会退出 Auto 模式。 |
+| `setABRMode(auto)` | `auto`: Boolean | 交还选层权给服务端（`true`）或收回（`false`）。由于 `selectLayer` 已隐含 `false`，通常只在恢复 Auto 时需要显式调用。 |
 | `close()` | - | 关闭 WebSocket 连接。 |
 
 ---
 
-### 3.3 ABREngine (自适应码率引擎)
+### 3.3 ABREngine (层级状态记录)
 
 #### 构造函数
-`new ABREngine(callbacks)`
+`new ABREngine()`
 
-**callbacks 参数对象:**
-| 回调名 | 参数 | 说明 |
+不接受回调：层级选择由服务端做出（§5），本模块不产生切换动作。
+
+#### 属性
+| 属性名 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `onSwitchLayer` | `(trackId: Number, reason: String)` | 当 ABR 算法决定需要切换时触发。需在此回调中调用 `controlClient.selectLayer`。 |
+| `isAutoMode` | Boolean | 当前是否由服务端选层。 |
+| `currentTrackId` | Number | 实际在播的层级。 |
+| `lastBandwidthEstimate` | Number \| null | 最近一次服务端带宽估计 (bps)，首次下发前为 `null`。 |
 
 #### 方法
 | 方法名 | 参数 | 说明 |
 | :--- | :--- | :--- |
-| `setTracks(tracks, activeId)` | `tracks`: Array, `activeId`: Number | 初始化引擎。传入从 WebSocket 获取的 track 列表。 |
-| `update(videoKbps, audioKbps, fps)` | `videoKbps`: Number (kbps)<br>`audioKbps`: Number (kbps)<br>`fps`: Number | **核心驱动方法**。需由外部定时器调用，传入实时统计数据。 |
-| `notifyLayerSwitched(trackId)` | `trackId`: Number | 通知引擎切换已完成（重置内部冷却计时器）。 |
-| `notifyManualSwitch(trackId)` | `trackId`: Number | 通知引擎用户进行了手动切换（将自动关闭 Auto 模式）。 |
-| `setAutoMode(enabled)` | `enabled`: Boolean | 开启/关闭自动 ABR 模式。 |
+| `setTracks(tracks, activeId)` | `tracks`: Array, `activeId`: Number | 传入从 WebSocket 获取的 track 列表。每次 `TRACKS_INFO` 都会调用，不止首次。 |
+| `notifyLayerSwitched(trackId)` | `trackId`: Number | 切换已完成。 |
+| `notifyManualSwitch(trackId)` | `trackId`: Number | 用户进行了手动选择（记为 pending，等服务端确认）。 |
+| `notifyAutoMode(enabled)` | `enabled`: Boolean | 采纳服务端下发的模式（对应 `onABRMode`）。 |
+| `setAutoMode(enabled)` | `enabled`: Boolean | 本端请求切换模式。仍需调用 `controlClient.setABRMode()` 通知服务端。 |
+| `selectedTrackId()` | - | 选择器应显示的层级：有未确认的手动选择时显示它，否则显示在播层级。 |
 
 ---
 
@@ -206,21 +215,76 @@ setInterval(async () => {
 
 ---
 
-## 5. ABR 逻辑说明 (内置策略)
+## 5. ABR 逻辑说明（服务端决策，客户端执行）
 
-**ABREngine** 采用保守降级、探测升级策略：
+**选哪一层由服务端判定**，客户端不参与判定逻辑（见 §5.2）；但**实际切换动作由客户端发起**——服务端算出目标层级后只通过 `ABR_RECOMMEND` 消息发一条建议，本端收到后调用 `selectLayer()` 才会真正生效。判定实现见 ppmmx 的
+`internal/servers/webrtc/abr_controller.go`。
 
-1.  **降级 (Downgrade)**:
-    *   **触发条件**: `AvgFPS < 12` (严重卡顿) 或 `Bandwidth < Target * 0.5` (严重拥塞)。
-    *   **防抖**: 需连续 **3次** `update` 均满足条件才触发切换。
-    *   **Audio Only**: 仅当 FPS < 10 或 带宽极低 (< 200kbps) 时才降级至纯音频。
+### 5.0 为什么执行也要放到客户端
 
-2.  **升级 (Upgrade)**:
-    *   **触发条件**: `AvgFPS >= 25` (流畅) 且 `Bandwidth >= Target * 0.95` (带宽充裕)。
-    *   **防抖**: 需连续 **3次** `update` 均满足条件。
+早期实现里服务端算出目标层级后直接调用 `TrackSelector.Select()`，绕过客户端。这带来两个问题：
 
-3.  **起播保护**:
-    *   引擎初始化后的前 **5秒** 内不执行降级操作，以等待缓冲区填充和解码器稳定。
+1. **手动选择可能被悄悄覆盖或丢失**：用户刚点了某个画质，服务端的下一次自动评估几乎同时也在调用同一个 `Select()`，谁后到谁生效——用户手动选层经常"看起来没生效"或者选完立刻被切走。
+2. **客户端无法区分"这次切换是我自己请求的"还是"服务端自己切的"**：两者对客户端来说是同一条 `LAYER_SWITCHED` 消息，没有办法做不同处理。
+
+解决办法是让每一次切换（无论自动还是手动）都必须经过同一条路径：客户端发 `SELECT_LAYER`，服务端才调用 `Select()`。这样 `Select()` 只有一个调用方，不会再有谁覆盖谁的问题。自动切换与手动切换的唯一区别就是 `reason` 字段的值：自动执行用保留字符串 `ABR_REASON_AUTO_BANDWIDTH`（`"auto_bandwidth"`），服务端据此保持 Auto 模式不退出；其余任何值都视为用户手动选择。
+
+### 5.1 为什么移到服务端
+
+此前客户端用两个指标做判定，各有问题：
+
+- **接收码率**（`bytesReceived` 差值）：只是"实际收到多少"，无法区分"网络拥塞"和"推流端自己降了码率"（VBR 静态画面很常见），会误判。
+- **解码 FPS**：测的是观众设备的解码能力，不是链路。
+
+服务端改用 **GCC 发送侧带宽估计**：mmx 给下行 RTP 打上 TWCC 序号，浏览器回 TWCC feedback，由此估算这条链路真正能承载多少。这是对网络的直接测量，而非从结果反推。
+
+> **FPS 的现状**：仍由客户端采集，通过 `LATENCY_REPORT` 上报，但**仅作统计用途**，不再参与任何升降判定。
+
+### 5.2 判定规则
+
+以带宽估计（整条连接，扣除音频预留 128kbps 后的余量）为唯一输入：
+
+1.  **选层**：选择码率能被预算覆盖、且留有 **1.2 倍余量**的最高层级。没有层级满足时退到最低层（总得发点什么）。
+2.  **降级**：预算跌破当前层码率的 **0.85 倍**，连续 **2 次**评估确认后切换。
+3.  **升级**：连续 **5 次**评估确认后切换。升级比降级慢，是因为切高了代价（卡顿）比切低了代价（画质）更大。
+4.  **滞回**：0.85（降级线）与 1.2（升级线）之间是死区。估计值停在这个区间里时不做任何动作，避免在层级边界反复横跳。
+5.  **起播保护**：前 **5 秒**不做判定——GCC 在收到足够 feedback 之前返回的是配置的初始值，此时判定等于在对一个常数做判断。
+6.  **冷却**：与客户端手动切换共用 `webrtcABRSwitchCooldown`（默认 3000ms），因此服务端和客户端加起来也不会比任一方单独切得更频繁。
+
+评估周期 1 秒。
+
+### 5.3 自动 / 手动模式
+
+服务端只在 **Auto 模式**下发送 `ABR_RECOMMEND`。模式由客户端掌握：
+
+- 客户端发 `SELECT_LAYER`（`reason` 不是 `ABR_REASON_AUTO_BANDWIDTH`，即用户手动选画质）→ 服务端**自动退出** Auto 模式，此后不再发建议，用户选的层级会一直保持。
+- 客户端发 `SET_ABR_MODE {auto:true}` → 交还选层权，服务端恢复发送建议。
+- 服务端通过 `ABR_MODE` 消息回传当前模式，连接建立时也会下发一次，因此重连的客户端会重新对齐而不是沿用自己的旧状态。
+
+手动模式下 `BANDWIDTH_ESTIMATE` 仍照常每秒下发，只是不再触发 `ABR_RECOMMEND`——播放器可以用带宽估计给用户展示"当前链路能撑多少"。
+
+### 5.3.1 建议→执行的完整流程
+
+```
+mmx: 每秒评估一次带宽估计
+  └─ 判定需要切层，且处于 Auto 模式
+       └─ 下发 ABR_RECOMMEND { target_track_id, reason: "auto_bandwidth" }
+
+player: 收到 ABR_RECOMMEND
+  └─ 若仍处于 Auto 模式，且没有正在等待确认的手动选择，且视频未被用户暂停
+       └─ 调用 selectLayer(targetTrackId, ABR_REASON_AUTO_BANDWIDTH)
+
+mmx: 收到 SELECT_LAYER，reason === "auto_bandwidth"
+  └─ 正常执行 TrackSelector.Select()（走关键帧对齐等既有逻辑）
+  └─ 不退出 Auto 模式（与手动 SELECT_LAYER 的唯一区别）
+  └─ 下发 LAYER_SWITCHED 确认
+```
+
+若播放器没有响应某次 `ABR_RECOMMEND`（消息丢失、或此时已退出 Auto 模式），服务端不会重试或强制切换——下一次评估周期里，只要目标层级仍然没变，判定逻辑会自然再发一次同样的建议，不需要额外的重试状态。
+
+### 5.4 纯音频降级
+
+当前服务端 ABR **不会**自动降到纯音频。纯音频仍是客户端的显式动作（`SET_MEDIA_STATE`，对应暂停视频按钮，见 §6 后的"视频秒开方案"）。
 
 ---
 
