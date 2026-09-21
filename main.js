@@ -1215,9 +1215,16 @@ async function updateStats() {
         }
 
         if (networkStats) {
+            // availableIncomingBitrate is a non-standard candidate-pair
+            // field Chromium leaves at 0/undefined, so prefer it but fall
+            // back to the server-side estimate the ABR controller already
+            // sends (BANDWIDTH_ESTIMATE -> abrEngine.lastBandwidthEstimate)
+            // rather than showing N/A on a working connection.
             let bw = 'N/A';
             if (networkStats.availableIncomingBitrate) {
                 bw = `${(networkStats.availableIncomingBitrate / 1000).toFixed(0)} kbps`;
+            } else if (abrEngine && abrEngine.lastBandwidthEstimate !== null) {
+                bw = `${(abrEngine.lastBandwidthEstimate / 1000).toFixed(0)} kbps (server)`;
             }
             
             // "Auto" now means the server is choosing; see abr-engine.mjs.
