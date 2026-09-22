@@ -56,6 +56,56 @@ test('surfaces API error and rejects unsupported decisions', async () => {
     }, { fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ mode: 'invalid' }) }) }), /unsupported/);
 });
 
+test('passes through stunServers on a valid P2P decision', async () => {
+    const result = await requestPlayDecision({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, { fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+            mode: 'p2p-connect',
+            playUrl: 'https://edge.example/app/live/whep',
+            p2p: {
+                sessionId: 'session', signalUrl: 'wss://signal.example', token: 'token',
+                raceWindowMs: 500, connectTimeoutMs: 2000, stunServers: ['stun:api.pp-cdn.org:3478'],
+            },
+        }),
+    }) });
+    assert.deepEqual(result.p2p.stunServers, ['stun:api.pp-cdn.org:3478']);
+});
+
+test('accepts a P2P decision with no stunServers at all', async () => {
+    const result = await requestPlayDecision({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, { fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+            mode: 'p2p-connect',
+            playUrl: 'https://edge.example/app/live/whep',
+            p2p: { sessionId: 'session', signalUrl: 'wss://signal.example', token: 'token', raceWindowMs: 500, connectTimeoutMs: 2000 },
+        }),
+    }) });
+    assert.equal(result.p2p.stunServers, undefined);
+});
+
+test('rejects P2P decisions with a malformed stunServers field', async () => {
+    await assert.rejects(() => requestPlayDecision({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, { fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+            mode: 'p2p-connect',
+            playUrl: 'https://edge.example/app/live/whep',
+            p2p: {
+                sessionId: 'session', signalUrl: 'wss://signal.example', token: 'token',
+                raceWindowMs: 500, connectTimeoutMs: 2000, stunServers: 'stun:api.pp-cdn.org:3478',
+            },
+        }),
+    }) }), /invalid P2P decision/);
+});
+
 test('rejects P2P decisions with invalid race timing', async () => {
     await assert.rejects(() => requestPlayDecision({
         ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',

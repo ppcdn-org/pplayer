@@ -107,7 +107,7 @@ export class P2PPlaybackPath {
     }
 
     async #createOffer() {
-        this.pc = new this.PeerConnectionClass();
+        this.pc = new this.PeerConnectionClass(this.#iceServersConfig());
         this.pc.addTransceiver('video', { direction: 'recvonly' });
         this.pc.addTransceiver('audio', { direction: 'recvonly' });
         this.pc.ontrack = (event) => {
@@ -127,6 +127,22 @@ export class P2PPlaybackPath {
         const offer = await this.pc.createOffer();
         await this.pc.setLocalDescription(offer);
         this.#send({ type: 'offer', sdp: offer.sdp });
+    }
+
+    // ppcenter's own STUN address (models.STUNConfig.URLs() server-side)
+    // rides in on session.stunServers, the same play-decision response
+    // everything else here comes from. Without it this PeerConnection can
+    // only gather `host` ICE candidates and never learns its own
+    // public-facing address - P2P is then structurally unable to connect
+    // for any viewer not on the publisher's LAN, regardless of NAT type.
+    // Filtered the same way ppobs's C++ client filters this field
+    // (ppcenter-signal.cpp/ppcenter-client.cpp): stun:/stuns: only, anything
+    // else silently dropped rather than handed to the browser and rejected
+    // at PeerConnection construction time.
+    #iceServersConfig() {
+        const stunUrls = (this.session.stunServers ?? []).filter(
+            (url) => typeof url === 'string' && (url.startsWith('stun:') || url.startsWith('stuns:')));
+        return stunUrls.length ? { iceServers: stunUrls.map((urls) => ({ urls })) } : undefined;
     }
 
     #send(message) {

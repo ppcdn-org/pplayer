@@ -20,7 +20,7 @@ class FakeWebSocket {
 }
 
 class FakePeerConnection {
-    constructor() { this.remoteDescription = null; this.connectionState = 'new'; this.candidates = []; FakePeerConnection.instance = this; }
+    constructor(config) { this.config = config; this.remoteDescription = null; this.connectionState = 'new'; this.candidates = []; FakePeerConnection.instance = this; }
     addTransceiver() {}
     async createOffer() { return { type: 'offer', sdp: 'offer-sdp' }; }
     async setLocalDescription(description) { this.localDescription = description; }
@@ -162,6 +162,51 @@ test('P2P path reports signaling close and errors as failures', () => {
     assert.equal(failures.length, 2);
     assert.match(failures[0].message, /signaling failed/);
     assert.match(failures[1].message, /signaling closed/);
+});
+
+test('P2P path configures iceServers from session.stunServers on offer', async () => {
+    const path = new P2PPlaybackPath({
+        session: {
+            sessionId: 'session-6', signalUrl: 'wss://center.example/v1/p2p/signal', token: 'secret',
+            stunServers: ['stun:api.pp-cdn.org:3478'],
+        },
+        WebSocketClass: FakeWebSocket,
+        PeerConnectionClass: FakePeerConnection,
+    });
+    path.start({ onFirstFrame() {}, onFailed(error) { throw error; } });
+    FakeWebSocket.instance.message({ v: 1, type: 'ready' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(FakePeerConnection.instance.config, { iceServers: [{ urls: 'stun:api.pp-cdn.org:3478' }] });
+});
+
+test('P2P path drops non-stun entries and constructs with no config when nothing survives', async () => {
+    const path = new P2PPlaybackPath({
+        session: {
+            sessionId: 'session-7', signalUrl: 'wss://center.example/v1/p2p/signal', token: 'secret',
+            stunServers: ['turn:relay.example:3478', 42, null],
+        },
+        WebSocketClass: FakeWebSocket,
+        PeerConnectionClass: FakePeerConnection,
+    });
+    path.start({ onFirstFrame() {}, onFailed(error) { throw error; } });
+    FakeWebSocket.instance.message({ v: 1, type: 'ready' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(FakePeerConnection.instance.config, undefined);
+});
+
+test('P2P path constructs with no iceServers config when session has no stunServers (unchanged default)', async () => {
+    const path = new P2PPlaybackPath({
+        session: { sessionId: 'session-8', signalUrl: 'wss://center.example/v1/p2p/signal', token: 'secret' },
+        WebSocketClass: FakeWebSocket,
+        PeerConnectionClass: FakePeerConnection,
+    });
+    path.start({ onFirstFrame() {}, onFailed(error) { throw error; } });
+    FakeWebSocket.instance.message({ v: 1, type: 'ready' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(FakePeerConnection.instance.config, undefined);
 });
 
 test('P2P path reports PeerConnection failure', async () => {

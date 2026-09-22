@@ -829,6 +829,22 @@ function startTimeSync(ppcenter) {
     });
 }
 
+// Waiting out the NAT probe's full worst case (nat-probe.mjs caps ICE
+// gathering at 5000ms) before even asking ppcenter for a play decision means
+// every viewer pays that tax up front - including whenever it ends up
+// edge-only anyway, which is exactly what happens when the probe is merely
+// slow: ppcenter already treats a play request with no natProbeId as "decide
+// without it" (PLY-002, the same fallback a failed/errored probe hits today),
+// so there is nothing gained by blocking Edge behind a probe that hasn't
+// finished. The probe is capped here at NAT_PROBE_GRACE_MS instead: if it
+// hasn't resolved by then, the play request goes out with whatever
+// natProbeId is (or isn't) available, and the probe keeps running
+// unawaited - probeNATAndSubmit posts its result to ppcenter itself, so a
+// late resolution still lands in ppcenter's observation store for a future
+// attempt (a retry, or the next stream switch), it is just too late to help
+// this one. See docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
+const NAT_PROBE_GRACE_MS = 800;
+
 async function startFromPpcenter(playConfig, generation) {
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Requesting playback route...</div>';
 
@@ -838,25 +854,26 @@ async function startFromPpcenter(playConfig, generation) {
     let natProbeId = null;
     if (wantP2P) {
         // PLY-002: report the NAT observation so ppcenter can judge whether a
-        // direct connection is even worth attempting. Non-fatal - a failed probe
-        // just means ppcenter decides without it and most likely says edge-only.
-        try {
-            // The viewer's observation must be kind="player" (the publisher
-            // observation comes from ppobs; a mislabelled player probe fails
-            // eligibility as an identity mismatch). streamName is still sent
-            // because the viewer token is signed over appId/streamName and
-            // ppcenter verifies it from this field.
-            const probe = await probeNATAndSubmit({
-                ppcenter: playConfig.ppcenter,
-                appId: playConfig.appId,
-                txTime: playConfig.txTime,
-                txSecret: playConfig.txSecret,
-                clientId: playConfig.clientId,
-                streamName: playConfig.streamName,
-                kind: 'player',
-            });
-            if (probe && probe.probeId) natProbeId = probe.probeId;
-        } catch (e) { /* probe failure is non-fatal */ }
+        // direct connection is even worth attempting. Non-fatal - a failed or
+        // still-running probe just means ppcenter decides without it and
+        // most likely says edge-only.
+        //
+        // The viewer's observation must be kind="player" (the publisher
+        // observation comes from ppobs; a mislabelled player probe fails
+        // eligibility as an identity mismatch). streamName is still sent
+        // because the viewer token is signed over appId/streamName and
+        // ppcenter verifies it from this field.
+        const probePromise = probeNATAndSubmit({
+            ppcenter: playConfig.ppcenter,
+            appId: playConfig.appId,
+            txTime: playConfig.txTime,
+            txSecret: playConfig.txSecret,
+            clientId: playConfig.clientId,
+            streamName: playConfig.streamName,
+            kind: 'player',
+        }).then((probe) => probe?.probeId || null).catch(() => null);
+        const grace = new Promise((resolve) => setTimeout(() => resolve(null), NAT_PROBE_GRACE_MS));
+        natProbeId = await Promise.race([probePromise, grace]);
         if (generation !== readerGeneration) return;
     }
 

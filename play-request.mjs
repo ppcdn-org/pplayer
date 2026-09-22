@@ -55,9 +55,12 @@ export async function requestPlayDecision(config, { fetchImpl = fetch, signal, n
     if ((body?.mode !== 'edge-only' && body?.mode !== 'p2p-connect') || !body?.playUrl) {
         throw new Error('ppcenter returned an unsupported play decision');
     }
+    // stunServers is optional (ppcenter omits it when its own STUN server
+    // isn't configured) - absent is fine, present-but-malformed is not.
     if (body.mode === 'p2p-connect' && (!body.p2p?.sessionId || !body.p2p?.signalUrl || !body.p2p?.token ||
         !Number.isInteger(body.p2p.raceWindowMs) || body.p2p.raceWindowMs < 0 ||
-        !Number.isInteger(body.p2p.connectTimeoutMs) || body.p2p.connectTimeoutMs <= body.p2p.raceWindowMs)) {
+        !Number.isInteger(body.p2p.connectTimeoutMs) || body.p2p.connectTimeoutMs <= body.p2p.raceWindowMs ||
+        (body.p2p.stunServers !== undefined && !Array.isArray(body.p2p.stunServers)))) {
         throw new Error('ppcenter returned an invalid P2P decision');
     }
     const playUrl = new URL(body.playUrl);
