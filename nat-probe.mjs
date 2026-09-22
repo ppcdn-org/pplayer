@@ -1,25 +1,30 @@
 // ppcenter runs its own STUN server (internal/stun) on the same host as the
 // API, conventionally at port 3478 - deriving it from `ppcenter` means the
 // probe doesn't need ppcenter to have answered anything yet (it runs before
-// the first request of any kind). Tried first, ahead of the public fallback:
-// it shares this viewer's network path to ppcenter itself, so it isn't
-// subject to a public STUN provider being slow or blocked on networks where
-// reaching it is unreliable - confirmed in production 2026-09-22, a remote
-// viewer's probe routinely took several seconds against Google's STUN alone,
-// well past the caller's own grace period (main.js's NAT_PROBE_GRACE_MS),
-// so natProbeId was silently empty on every attempt. See
+// the first request of any kind).
+//
+// Deliberately the *only* STUN server, not one of a race against a public
+// fallback (e.g. Google's) - two servers with different address-family
+// reachability (api.pp-cdn.org has no AAAA record; a public STUN provider
+// typically does) meant the publisher and a player could each win their own
+// race against a *different* server and come back with different address
+// families (one IPv4, one IPv6), which ppcenter's eligibility check rejects
+// outright as address_family_mismatch - confirmed in production 2026-09-22
+// as the failure mode right after fixing every earlier one. Using only
+// ppcenter's own (IPv4-only) server makes both sides' results consistent by
+// construction. A failed/slow probe here already falls back to edge-only
+// exactly like today - this isn't a new failure mode, just no longer papered
+// over by a second server that could disagree with the first. See
 // docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
 function deriveStunIceServers(ppcenter) {
-    const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
     try {
         const host = new URL(ppcenter).hostname;
-        if (host) servers.unshift({ urls: `stun:${host}:3478` });
+        if (host) return [{ urls: `stun:${host}:3478` }];
     } catch {
-        // Malformed ppcenter URL - fall back to the public server alone;
-        // requestPlayDecision will surface the same malformed URL as an
-        // error shortly after anyway.
+        // Malformed ppcenter URL - requestPlayDecision will surface the same
+        // malformed URL as an error shortly after anyway.
     }
-    return servers;
+    return [];
 }
 
 export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, clientId, streamName, kind }) {

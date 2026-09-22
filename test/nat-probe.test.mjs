@@ -181,7 +181,7 @@ test('NAT probe returns null when fetch fails', async () => {
     assert.equal(await probePromise, null);
 });
 
-test('NAT probe tries ppcenter\'s own STUN server first, Google STUN as fallback', async () => {
+test('NAT probe uses only ppcenter\'s own STUN server, derived from the ppcenter URL', async () => {
     const { probeNATAndSubmit } = await import('../nat-probe.mjs');
     globalThis.RTCPeerConnection = FakeRTCPeerConnection;
     globalThis.fetch = mockFetch;
@@ -192,17 +192,18 @@ test('NAT probe tries ppcenter\'s own STUN server first, Google STUN as fallback
         clientId: 'viewer',
     });
 
-    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [
-        { urls: 'stun:api.pp-cdn.org:3478' },
-        { urls: 'stun:stun.l.google.com:19302' },
-    ]);
+    // Deliberately not racing a second (e.g. public) STUN server - see
+    // deriveStunIceServers's doc comment: two servers can disagree on
+    // address family between the publisher's and a player's own probe,
+    // which ppcenter's eligibility check rejects outright.
+    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [{ urls: 'stun:api.pp-cdn.org:3478' }]);
 
     await new Promise(r => setTimeout(r, 10));
     FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' }]);
     await probePromise;
 });
 
-test('NAT probe falls back to Google STUN alone when ppcenter is not a valid URL', async () => {
+test('NAT probe has no STUN server (and no candidate) when ppcenter is not a valid URL', async () => {
     const { probeNATAndSubmit } = await import('../nat-probe.mjs');
     globalThis.RTCPeerConnection = FakeRTCPeerConnection;
     globalThis.fetch = mockFetch;
@@ -213,11 +214,11 @@ test('NAT probe falls back to Google STUN alone when ppcenter is not a valid URL
         clientId: 'viewer',
     });
 
-    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [{ urls: 'stun:stun.l.google.com:19302' }]);
+    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, []);
 
     await new Promise(r => setTimeout(r, 10));
-    FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' }]);
-    await probePromise;
+    FakeRTCPeerConnection.latest.gather([]); // no ICE servers configured -> gathering "completes" with nothing found
+    assert.equal(await probePromise, null);
 });
 
 test('NAT probe resolves on the first srflx candidate without waiting for gathering to finish', async () => {
