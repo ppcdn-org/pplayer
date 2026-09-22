@@ -2,18 +2,18 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260922-1';
-import { ABREngine } from './abr-engine.mjs?v=20260922-1';
-import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260922-1';
-import { selectPlaybackCodec } from './codec-capability.mjs?v=20260922-1';
-import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260922-1';
-import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260922-1';
-import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260922-1';
-import { probeNATAndSubmit } from './nat-probe.mjs?v=20260922-1';
-import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260922-1';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260922-1';
-import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260922-1';
-import { StallWatchdog } from './stall-watchdog.mjs?v=20260922-1';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260922-2';
+import { ABREngine } from './abr-engine.mjs?v=20260922-2';
+import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260922-2';
+import { selectPlaybackCodec } from './codec-capability.mjs?v=20260922-2';
+import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260922-2';
+import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260922-2';
+import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260922-2';
+import { probeNATAndSubmit } from './nat-probe.mjs?v=20260922-2';
+import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260922-2';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260922-2';
+import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260922-2';
+import { StallWatchdog } from './stall-watchdog.mjs?v=20260922-2';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
@@ -958,6 +958,11 @@ function startRacedPlayback(decision, generation) {
             activePlaybackPath = selected;
             activePlaybackPathName = path;
             if (selected.stream) video.srcObject = selected.stream;
+            // The visible element is now this stream's consumer, so the
+            // private sink the path used to get itself decoded during the
+            // race can go - otherwise the same stream decodes twice. See
+            // createDecodeSink in playback-paths.mjs.
+            selected.releaseDecodeSink?.();
             // The path already applied the buffer on its own track event;
             // this call only reports which API took it now that a winner
             // exists.

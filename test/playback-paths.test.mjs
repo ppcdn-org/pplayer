@@ -226,3 +226,131 @@ test('P2P path reports PeerConnection failure', async () => {
     assert.equal(failures.length, 1);
     assert.match(failures[0].message, /P2P connection failed/);
 });
+
+// A browser only decodes an inbound track while something consumes it, and
+// main.js attaches the visible <video> only to the race *winner* - so each
+// leg needs its own sink to be able to decode a frame and win at all. See
+// createDecodeSink in playback-paths.mjs; production 2026-09-22 deadlocked
+// with both legs connected and silent because neither had one.
+class FakeVideoElement {
+    constructor() {
+        this.muted = false;
+        this.autoplay = false;
+        this.playsInline = false;
+        this.srcObject = null;
+        this.style = {};
+        this.removed = false;
+        this.playCalls = 0;
+    }
+    play() { this.playCalls += 1; return Promise.resolve(); }
+    remove() { this.removed = true; }
+}
+
+// Must be async and await `run`: with a plain `return run(...)` the finally
+// block restores document the moment the promise is *created*, so anything
+// in `run` after its first await would see no DOM again.
+async function withFakeDocument(run) {
+    const created = [];
+    const appended = [];
+    const previous = globalThis.document;
+    globalThis.document = {
+        createElement(tag) {
+            const element = new FakeVideoElement();
+            created.push({ tag, element });
+            return element;
+        },
+        body: { appendChild(element) { appended.push(element); } },
+    };
+    try {
+        return await run({ created, appended });
+    } finally {
+        if (previous === undefined) delete globalThis.document;
+        else globalThis.document = previous;
+    }
+}
+
+test('Edge path attaches a muted hidden decode sink on track, so framesDecoded can move', async () => {
+    await withFakeDocument(async ({ created, appended }) => {
+        const path = new EdgeWHEPPath({ url: 'https://edge.example/app/live/whep', ReaderClass: FakeReader });
+        path.start({ onFirstFrame() {}, onFailed(error) { throw error; } });
+
+        const stream = { id: 'edge-stream' };
+        FakeReader.instance.connect(stream);
+
+        assert.equal(created.length, 1);
+        assert.equal(created[0].tag, 'video');
+        const sink = created[0].element;
+        assert.equal(sink.srcObject, stream);
+        assert.equal(sink.muted, true);
+        assert.equal(sink.playCalls, 1);
+        assert.equal(appended[0], sink);
+        // Invisible, but still rendered - a never-rendered element can have
+        // its decoding throttled, which would reintroduce the deadlock.
+        assert.match(sink.style.cssText, /opacity:0/);
+        assert.doesNotMatch(sink.style.cssText, /display:\s*none/);
+    });
+});
+
+test('Edge path releases its decode sink once the visible element takes over', async () => {
+    await withFakeDocument(async ({ created }) => {
+        const path = new EdgeWHEPPath({ url: 'https://edge.example/app/live/whep', ReaderClass: FakeReader });
+        path.start({ onFirstFrame() {}, onFailed(error) { throw error; } });
+        FakeReader.instance.connect();
+
+        const sink = created[0].element;
+        path.releaseDecodeSink();
+
+        assert.equal(sink.srcObject, null);
+        assert.equal(sink.removed, true);
+        assert.equal(path.decodeSink, null);
+        path.releaseDecodeSink(); // idempotent - onSelected may fire before stop()
+    });
+});
+
+test('Edge path tears its decode sink down on stop, even without winning', async () => {
+    await withFakeDocument(async ({ created }) => {
+        const path = new EdgeWHEPPath({ url: 'https://edge.example/app/live/whep', ReaderClass: FakeReader });
+        path.start({ onFirstFrame() {}, onFailed(error) { throw error; } });
+        FakeReader.instance.connect();
+
+        path.stop('p2p_selected');
+
+        assert.equal(created[0].element.removed, true);
+    });
+});
+
+test('P2P path attaches and releases its own decode sink the same way', async () => {
+    await withFakeDocument(async ({ created }) => {
+        const path = new P2PPlaybackPath({
+            session: { sessionId: 'session-sink', signalUrl: 'wss://center.example/v1/p2p/signal', token: 'secret' },
+            WebSocketClass: FakeWebSocket,
+            PeerConnectionClass: FakePeerConnection,
+        });
+        path.start({ onFirstFrame() {}, onFailed(error) { throw error; } });
+        FakeWebSocket.instance.message({ v: 1, type: 'ready' });
+        await new Promise((resolve) => setImmediate(resolve));
+
+        const stream = { id: 'p2p-stream' };
+        FakePeerConnection.instance.ontrack({ streams: [stream] });
+
+        assert.equal(created.length, 1);
+        assert.equal(created[0].element.srcObject, stream);
+
+        path.releaseDecodeSink();
+        assert.equal(created[0].element.removed, true);
+
+        // FakePeerConnection.getStats() never returns an inbound-rtp report,
+        // so waitForVideoFrame is still polling on a timer here - stop()
+        // cancels it, without which the runner's event loop never drains.
+        path.stop('done');
+    });
+});
+
+test('paths still work with no DOM at all (Node), rather than throwing on document', async () => {
+    assert.equal(typeof globalThis.document, 'undefined');
+    const path = new EdgeWHEPPath({ url: 'https://edge.example/app/live/whep', ReaderClass: FakeReader });
+    path.start({ onFirstFrame() {}, onFailed(error) { throw error; } });
+    FakeReader.instance.connect();
+    assert.equal(path.decodeSink, null);
+    path.stop('done');
+});

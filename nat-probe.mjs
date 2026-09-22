@@ -20,6 +20,12 @@
 // whichever answers first - see the onicecandidate handler and
 // pickProbeCandidate's ranking. See docs/test/ppcdn-debug-log.md's
 // 2026-09-22 entry for the full trail.
+//
+// Note this two-server arrangement is browser-only and deliberately NOT
+// mirrored in ppobs's nat-probe.cpp, even though the two files otherwise
+// track each other closely: libdatachannel/libjuice uses only the first
+// STUN entry and silently discards the rest, so the publisher side always
+// probes against ppcenter's own alone. See that file's own comment.
 function deriveStunIceServers(ppcenter) {
     const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
     try {
