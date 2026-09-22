@@ -863,6 +863,7 @@ async function startFromPpcenter(playConfig, generation) {
         // eligibility as an identity mismatch). streamName is still sent
         // because the viewer token is signed over appId/streamName and
         // ppcenter verifies it from this field.
+        const probeStartedAt = performance.now();
         const probePromise = probeNATAndSubmit({
             ppcenter: playConfig.ppcenter,
             appId: playConfig.appId,
@@ -872,8 +873,22 @@ async function startFromPpcenter(playConfig, generation) {
             streamName: playConfig.streamName,
             kind: 'player',
         }).then((probe) => probe?.probeId || null).catch(() => null);
+        // Logged unconditionally, even when it resolves after the grace
+        // window below has already moved on - a probeId that shows up here
+        // but never made it into a play/requests call is exactly the
+        // signature of a slow/unreachable STUN server, which is otherwise
+        // invisible from the console (see nat-probe.mjs's own STUN choice).
+        probePromise.then((id) => {
+            const elapsedMs = Math.round(performance.now() - probeStartedAt);
+            console.log(id
+                ? `[P2P] NAT probe resolved in ${elapsedMs}ms: ${id}`
+                : `[P2P] NAT probe found no usable candidate (${elapsedMs}ms)`);
+        });
         const grace = new Promise((resolve) => setTimeout(() => resolve(null), NAT_PROBE_GRACE_MS));
         natProbeId = await Promise.race([probePromise, grace]);
+        if (!natProbeId) {
+            console.log(`[P2P] NAT probe still pending after the ${NAT_PROBE_GRACE_MS}ms grace window; requesting playback without it`);
+        }
         if (generation !== readerGeneration) return;
     }
 
@@ -887,6 +902,8 @@ async function startFromPpcenter(playConfig, generation) {
         });
         if (playRequestAbortController !== abortController || generation !== readerGeneration) return;
         playRequestAbortController = null;
+        console.log(`[P2P] ppcenter decision: mode=${decision.mode}` +
+            (decision.p2p ? `, stunServers=${JSON.stringify(decision.p2p.stunServers || [])}` : ' (no p2p block offered)'));
         startPlaybackFromDecision(decision, {
             startDirectStream: (url) => startDirectStream(url, generation),
             startRacedPlayback: (d) => startRacedPlayback(d, generation),
@@ -936,6 +953,7 @@ function startRacedPlayback(decision, generation) {
         ReaderClass: MediaMTXWebRTCReader,
         onSelected: ({ path }) => {
             if (generation !== readerGeneration) return;
+            console.log(`[P2P] race selected: ${path}`);
             const selected = path === 'p2p' ? playback.p2pPath : playback.edgePath;
             activePlaybackPath = selected;
             activePlaybackPathName = path;

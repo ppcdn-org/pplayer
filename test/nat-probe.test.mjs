@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 class FakeRTCPeerConnection {
-    constructor() {
+    constructor(config) {
+        this.config = config;
         this.onicecandidate = null;
         this._gathered = false;
         FakeRTCPeerConnection.latest = this;
@@ -178,6 +179,71 @@ test('NAT probe returns null when fetch fails', async () => {
     await new Promise(r => setTimeout(r, 10));
     FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '1.2.3.4', port: 9 }]);
     assert.equal(await probePromise, null);
+});
+
+test('NAT probe tries ppcenter\'s own STUN server first, Google STUN as fallback', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'https://api.pp-cdn.org',
+        appId: 'app123',
+        clientId: 'viewer',
+    });
+
+    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [
+        { urls: 'stun:api.pp-cdn.org:3478' },
+        { urls: 'stun:stun.l.google.com:19302' },
+    ]);
+
+    await new Promise(r => setTimeout(r, 10));
+    FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' }]);
+    await probePromise;
+});
+
+test('NAT probe falls back to Google STUN alone when ppcenter is not a valid URL', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'not-a-url',
+        appId: 'app123',
+        clientId: 'viewer',
+    });
+
+    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [{ urls: 'stun:stun.l.google.com:19302' }]);
+
+    await new Promise(r => setTimeout(r, 10));
+    FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' }]);
+    await probePromise;
+});
+
+test('NAT probe resolves on the first srflx candidate without waiting for gathering to finish', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'https://center.example',
+        appId: 'app123',
+        clientId: 'viewer',
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    // Only fires the srflx candidate - no `candidate: null` end-of-gathering
+    // event ever arrives (simulates a second configured ICE server that
+    // never finishes). Before this fix probeNATAndSubmit would have hung
+    // here until the 5000ms ceiling; it must now resolve immediately.
+    if (!FakeRTCPeerConnection.latest.onicecandidate) throw new Error('onicecandidate not set');
+    FakeRTCPeerConnection.latest.onicecandidate({
+        candidate: { type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' },
+    });
+    const result = await probePromise;
+
+    assert.equal(result.probeId, 'probe-test-client');
+    assert.equal(capturedBody.publicIp, '138.84.153.1');
 });
 
 test('NAT probe times out gracefully without candidates', async () => {
