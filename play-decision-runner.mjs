@@ -1,5 +1,5 @@
-import { PlaybackRaceController } from './playback-race-controller.mjs';
-import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs';
+import { PlaybackRaceController } from './playback-race-controller.mjs?v=20260922-1';
+import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs?v=20260922-1';
 
 export function getEdgeFallbackUrl(decision) {
     if (!decision?.playUrl) {

@@ -78,6 +78,92 @@ test('NAT probe falls back to candidate string parsing without address', async (
     assert.equal(capturedBody.kind, 'player');
 });
 
+test('NAT probe skips mDNS host candidates and prefers the srflx address', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'https://center.example',
+        appId: 'app123',
+        clientId: 'viewer',
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    FakeRTCPeerConnection.latest.gather([
+        { type: 'host', address: '8642ef70-a937.local', port: 50000, candidate: 'candidate:1 1 udp 2113 8642ef70-a937.local 50000 typ host' },
+        { type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' },
+    ]);
+    const result = await probePromise;
+
+    assert.equal(result.probeId, 'probe-test-client');
+    assert.equal(capturedBody.publicIp, '138.84.153.1');
+    assert.equal(capturedBody.publicPort, 25657);
+    assert.equal(capturedBody.natType, 'restricted');
+    assert.equal(capturedBody.kind, 'player');
+});
+
+test('NAT probe honours an explicit kind while keeping streamName for auth', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'https://center.example',
+        appId: 'app123',
+        txTime: 'abc',
+        txSecret: 'sig',
+        clientId: 'viewer',
+        streamName: 'B01-frontView',
+        kind: 'player',
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' }]);
+    await probePromise;
+
+    assert.equal(capturedBody.kind, 'player');
+    assert.equal(capturedBody.streamName, 'B01-frontView');
+    assert.equal(capturedBody.publicIp, '138.84.153.1');
+});
+
+test('NAT probe strips IPv6 brackets from the address', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'https://center.example',
+        appId: 'app123',
+        clientId: 'viewer',
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '[2001:db8::1]', port: 40000, candidate: '' }]);
+    const result = await probePromise;
+
+    assert.equal(capturedBody.publicIp, '2001:db8::1');
+    assert.equal(capturedBody.natType, 'restricted');
+});
+
+test('NAT probe returns null when only mDNS host candidates are available', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'https://center.example',
+        appId: 'app123',
+        clientId: 'viewer',
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    FakeRTCPeerConnection.latest.gather([
+        { type: 'host', address: 'abcd.local', port: 50000, candidate: 'candidate:1 1 udp 2113 abcd.local 50000 typ host' },
+    ]);
+    assert.equal(await probePromise, null);
+});
+
 test('NAT probe returns null when fetch fails', async () => {
     const { probeNATAndSubmit } = await import('../nat-probe.mjs');
     globalThis.RTCPeerConnection = FakeRTCPeerConnection;

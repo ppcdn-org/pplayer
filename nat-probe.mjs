@@ -1,4 +1,4 @@
-export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, clientId, streamName }) {
+export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, clientId, streamName, kind }) {
     const pc = new RTCPeerConnection({
         iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
         iceTransportPolicy: 'all',
@@ -21,19 +21,23 @@ export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, cli
     await icePromise;
     pc.close();
 
-    const srflx = candidates.find((c) => c.type === 'srflx' || c.type === 'host');
-    if (!srflx) return null;
+    const chosen = pickProbeCandidate(candidates);
+    if (!chosen) return null;
 
-    const [ip, portStr] = srflx.address ? [srflx.address, srflx.port] : parseCandidateAddress(srflx.candidate);
-    if (!ip) return null;
-
-    const natType = srflx.type === 'srflx' ? 'restricted' : 'public';
+    // A server-reflexive address means we are behind a NAT whose exact type
+    // the browser cannot see (it can't tell full-cone from port-restricted),
+    // so report the conservative "restricted". A real (non-mDNS) host address
+    // means the machine is directly reachable.
+    const natType = chosen.type === 'srflx' ? 'restricted' : 'public';
     const body = {
-        kind: streamName ? 'publisher' : 'player',
+        // kind is explicit: the viewer's probe is a "player" observation even
+        // though it still carries streamName, which ppcenter needs only to
+        // verify the viewer token (the token is signed over appId/streamName).
+        kind: kind || (streamName ? 'publisher' : 'player'),
         clientId,
         natType,
-        publicIp: ip,
-        publicPort: parseInt(portStr, 10) || 0,
+        publicIp: chosen.ip,
+        publicPort: chosen.port,
     };
     if (streamName) body.streamName = streamName;
     if (appId) body.appId = appId;
@@ -58,12 +62,45 @@ export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, cli
     }
 }
 
-function parseCandidateAddress(candidate) {
-    const parts = candidate.split(' ');
+// Chrome mDNS-obfuscates host candidates to "<uuid>.local" - a name the
+// server cannot dial - and ICE candidate .address is not always present, so
+// take a real IP literal from either field and never report a hostname.
+function normalizeIp(value) {
+    if (!value) return '';
+    let ip = String(value).trim();
+    if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1); // IPv6 literal
+    if (ip.toLowerCase().endsWith('.local')) return '';
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return ip;
+    if (ip.includes(':')) return ip; // IPv6
+    return '';
+}
+
+function candidateParts(candidate) {
+    const fromAddress = normalizeIp(candidate.address);
+    if (fromAddress) return { ip: fromAddress, port: Number(candidate.port) || 0 };
+    const parts = String(candidate.candidate || '').split(' ');
     for (let i = 4; i < parts.length - 1; i++) {
-        if (parts[i].match(/^\d+\.\d+\.\d+\.\d+$/)) {
-            return [parts[i], parseInt(parts[i + 1], 10)];
-        }
+        const ip = normalizeIp(parts[i]);
+        if (ip) return { ip, port: parseInt(parts[i + 1], 10) || 0 };
     }
-    return [];
+    return null;
+}
+
+// Prefer what the far side can actually reach: IPv4 server-reflexive, then
+// any server-reflexive, then a real (non-mDNS) host address.
+function pickProbeCandidate(candidates) {
+    const resolved = [];
+    for (const candidate of candidates) {
+        const parts = candidateParts(candidate);
+        if (parts && parts.port > 0) resolved.push({ ...parts, type: candidate.type });
+    }
+    const rank = (c) => {
+        const ipv4 = !c.ip.includes(':');
+        if (c.type === 'srflx' && ipv4) return 0;
+        if (c.type === 'srflx') return 1;
+        if (ipv4) return 2;
+        return 3;
+    };
+    resolved.sort((a, b) => rank(a) - rank(b));
+    return resolved[0] || null;
 }

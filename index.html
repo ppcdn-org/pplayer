@@ -4,12 +4,13 @@
     <meta charset="UTF-8">
     <link rel="icon" type="image/x-icon" href="favicon.ico">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MMXPlayer (Simulcast Control)</title>
+    <title>pplayer</title>
     <style>
         body { background: #1a1a1a; color: #fff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
         
         #controls { background: #333; padding: 15px; display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid #444; }
         .controls-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
         input[type="text"] { flex: 1; padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; }
         
         select { padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; min-width: 150px; }
@@ -94,6 +95,12 @@
             <span id="bufferValue">200 ms</span>
         </div>
 
+        <label for="p2pCheckbox" style="display: flex; align-items: center; gap: 5px; margin-left: 10px; cursor: pointer;"
+               title="Prefer a direct P2P connection to the publisher and fall back to the edge node when NAT traversal fails. Unchecked forces the edge node.">
+            <input type="checkbox" id="p2pCheckbox" checked style="accent-color: #00bcd4;">
+            P2P
+        </label>
+
         <button id="startBtn" title="Start">&#x25B6;</button>
         <button id="exitBtn" title="Exit">&#x23F9;</button>
         <button id="videoPauseBtn" title="Pause Video">&#x23F8;</button>
@@ -156,7 +163,7 @@
 <!-- ES modules: main.js imports everything else, so only the entry point is
      listed here. Module scripts are deferred and run after parsing, so the
      DOM lookups at the top of main.js are safe. -->
-<script type="module" src="main.js?v=20260918-1"></script>
+<script type="module" src="main.js?v=20260922-1"></script>
 
 </body>
 </html>

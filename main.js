@@ -2,18 +2,18 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs';
-import { ABREngine } from './abr-engine.mjs';
-import { attachSeiTimestampReader } from './sei-timestamp.mjs';
-import { selectPlaybackCodec } from './codec-capability.mjs';
-import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs';
-import { parsePlayRequest, requestPlayDecision } from './play-request.mjs';
-import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs';
-import { probeNATAndSubmit } from './nat-probe.mjs';
-import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs';
-import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs';
-import { StallWatchdog } from './stall-watchdog.mjs';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260922-1';
+import { ABREngine } from './abr-engine.mjs?v=20260922-1';
+import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260922-1';
+import { selectPlaybackCodec } from './codec-capability.mjs?v=20260922-1';
+import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260922-1';
+import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260922-1';
+import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260922-1';
+import { probeNATAndSubmit } from './nat-probe.mjs?v=20260922-1';
+import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260922-1';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260922-1';
+import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260922-1';
+import { StallWatchdog } from './stall-watchdog.mjs?v=20260922-1';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
@@ -83,6 +83,23 @@ const bufferRange = document.getElementById('bufferRange');
 const bufferValue = document.getElementById('bufferValue');
 const bufferControl = document.getElementById('bufferControl');
 let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs')) ?? DEFAULT_BUFFER_MS;
+
+// P2P is opt-out for signed links: checked, playback asks ppcenter for a
+// direct connection and races it against the edge leg, falling back to the
+// edge node when NAT traversal fails or the decision is edge-only. Unchecked
+// forces edge-only. ?p2p=0 / ?p2p=false unchecks it (edge-only share link);
+// on a page with no ppcenter params the checkbox has no effect.
+const p2pCheckbox = document.getElementById('p2pCheckbox');
+(() => {
+    const raw = new URLSearchParams(window.location.search).get('p2p');
+    if (p2pCheckbox && raw !== null) {
+        p2pCheckbox.checked = !(raw === '0' || raw === 'false');
+    }
+})();
+
+function preferP2P() {
+    return p2pCheckbox ? p2pCheckbox.checked : true;
+}
 
 (() => {
     if (!bufferRange) return;
@@ -676,6 +693,70 @@ function resetSessionState() {
     stallWatchdog.reset();
 }
 
+// A signed P2P link is a URL that carries all five ppcenter params (see
+// parsePlayRequest). A partial one is a malformed link, not a normal page:
+// report exactly what is wrong in the stats panel - which is always on screen
+// - rather than an alert() the viewer has to dismiss first.
+function showLinkNotice(message) {
+    if (!statsContainer) return;
+    const example = 'https://pplayer.pp-cdn.org/?ppcenter=https://api.pp-cdn.org'
+        + '&amp;appId=&lt;appId&gt;&amp;streamName=&lt;tableId&gt;-&lt;view&gt;'
+        + '&amp;txTime=&lt;hex&gt;&amp;txSecret=&lt;hmac&gt;';
+    statsContainer.innerHTML =
+        '<div style="padding: 4px;">' +
+        '<div style="color: #ffc107; font-weight: bold; margin-bottom: 6px;">Invalid signed P2P link</div>' +
+        `<div style="color: #ffc107; margin-bottom: 10px;">${message}</div>` +
+        '<div style="color: #888; font-size: 12px; line-height: 1.5;">Expected format:<br>' +
+        `<code style="word-break: break-all;">${example}</code></div>` +
+        '</div>';
+}
+
+// The pplayer page can build its own signed P2P link: ppcenter's public
+// POST /v1/play/link turns appId+streamName into a short-lived viewer token
+// without the appSecret ever reaching the browser. appId and streamName are
+// the first two path segments of any edge WHEP URL
+// (https://edge-1.edge.pp-cdn.org/{appId}/{streamName}[/{codec}]/whep).
+function parseStreamFromWhepUrl(rawUrl) {
+    let parsed;
+    try {
+        parsed = new URL(rawUrl, window.location.href);
+    } catch {
+        return null;
+    }
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    const whepIndex = parts.lastIndexOf('whep');
+    if (whepIndex < 2) return null;
+    return { appId: parts[0], streamName: parts[1] };
+}
+
+async function buildPlayConfigFromLinkGenerator(appId, streamName) {
+    const base = ppcenterUrl();
+    const response = await fetch(new URL('/v1/play/link', base).toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appId, streamName }),
+    });
+    let body = null;
+    try { body = await response.json(); } catch { /* the error below covers it */ }
+    if (!response.ok) {
+        throw new Error(body?.message || `play link request failed with status ${response.status}`);
+    }
+    if (!body?.txTime || !body?.txSecret) {
+        throw new Error('ppcenter returned an invalid play link');
+    }
+    if (body.pplayerUrl) console.log('[Main] generated P2P link:', body.pplayerUrl);
+    return {
+        ppcenter: base,
+        appId,
+        streamName,
+        txTime: body.txTime,
+        txSecret: body.txSecret,
+        clientId: crypto.randomUUID(),
+        requestRegion: '',
+        natProbeId: '',
+    };
+}
+
 // Two ways in, deliberately kept side by side:
 //
 //  - With the five ppcenter parameters in the query string (PLY-001), the
@@ -697,7 +778,7 @@ async function startStream() {
     try {
         playConfig = parsePlayRequest(window.location.search);
     } catch (error) {
-        alert(error.message);
+        showLinkNotice(error.message);
         return;
     }
 
@@ -711,6 +792,30 @@ async function startStream() {
 
     const rawUrl = urlInput.value.trim();
     if (!rawUrl) return alert('Please enter a WHEP URL');
+
+    if (preferP2P()) {
+        // Checked, with no signed page params: derive appId/streamName from
+        // the entered WHEP URL and mint a short-lived link from ppcenter so
+        // P2P works without pasting a token. Falls back to the edge node when
+        // the URL has no stream path or the generator is unavailable.
+        const stream = parseStreamFromWhepUrl(rawUrl);
+        if (stream) {
+            try {
+                const generated = await buildPlayConfigFromLinkGenerator(stream.appId, stream.streamName);
+                if (generation !== readerGeneration) return;
+                await startFromPpcenter(generated, generation);
+                return;
+            } catch (error) {
+                console.warn('[Main] P2P link generation failed, using the edge node:', error);
+                showToast('P2P link failed — using edge node');
+            }
+        } else {
+            console.warn('[Main] P2P is checked but the WHEP URL has no appId/streamName path; using edge.');
+            showToast('P2P needs appId/streamName in the URL — using edge node');
+        }
+        if (generation !== readerGeneration) return;
+    }
+
     await startDirectStream(rawUrl, generation);
 }
 
@@ -727,22 +832,33 @@ function startTimeSync(ppcenter) {
 async function startFromPpcenter(playConfig, generation) {
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Requesting playback route...</div>';
 
-    // PLY-002: report the NAT observation so ppcenter can judge whether a
-    // direct connection is even worth attempting. Non-fatal - a failed probe
-    // just means ppcenter decides without it and most likely says edge-only.
+    // The NAT probe only matters for P2P; when the viewer unchecked it there
+    // is nothing to ask ppcenter for, so skip the round trip entirely.
+    const wantP2P = preferP2P();
     let natProbeId = null;
-    try {
-        const probe = await probeNATAndSubmit({
-            ppcenter: playConfig.ppcenter,
-            appId: playConfig.appId,
-            txTime: playConfig.txTime,
-            txSecret: playConfig.txSecret,
-            clientId: playConfig.clientId,
-            streamName: playConfig.streamName,
-        });
-        if (probe && probe.probeId) natProbeId = probe.probeId;
-    } catch (e) { /* probe failure is non-fatal */ }
-    if (generation !== readerGeneration) return;
+    if (wantP2P) {
+        // PLY-002: report the NAT observation so ppcenter can judge whether a
+        // direct connection is even worth attempting. Non-fatal - a failed probe
+        // just means ppcenter decides without it and most likely says edge-only.
+        try {
+            // The viewer's observation must be kind="player" (the publisher
+            // observation comes from ppobs; a mislabelled player probe fails
+            // eligibility as an identity mismatch). streamName is still sent
+            // because the viewer token is signed over appId/streamName and
+            // ppcenter verifies it from this field.
+            const probe = await probeNATAndSubmit({
+                ppcenter: playConfig.ppcenter,
+                appId: playConfig.appId,
+                txTime: playConfig.txTime,
+                txSecret: playConfig.txSecret,
+                clientId: playConfig.clientId,
+                streamName: playConfig.streamName,
+                kind: 'player',
+            });
+            if (probe && probe.probeId) natProbeId = probe.probeId;
+        } catch (e) { /* probe failure is non-fatal */ }
+        if (generation !== readerGeneration) return;
+    }
 
     const abortController = new AbortController();
     playRequestAbortController = abortController;
@@ -750,6 +866,7 @@ async function startFromPpcenter(playConfig, generation) {
         const decision = await requestPlayDecision(playConfig, {
             signal: abortController.signal,
             natProbeId,
+            preferP2P: wantP2P,
         });
         if (playRequestAbortController !== abortController || generation !== readerGeneration) return;
         playRequestAbortController = null;
@@ -1183,6 +1300,14 @@ async function updateStats() {
         // --- 渲染 UI ---
         let html = '';
 
+        // Which path is actually carrying media right now: "p2p" (direct to
+        // the publisher, selected by the race) or "edge-node" (via the edge).
+        // activePlaybackPathName is maintained by the reader/race already (it
+        // is also what latency reporting uses).
+        html += renderStatGroup('Connection', {
+            'Type': activePlaybackPathName === 'p2p' ? 'p2p' : 'edge-node'
+        });
+
         if (videoStats) {
             const displayW = video.videoWidth || videoStats.frameWidth || 0;
             const displayH = video.videoHeight || videoStats.frameHeight || 0;
@@ -1327,3 +1452,17 @@ function updateMediaState(state) {
     const audioOnly = abrEngine.currentTrackId === abrEngine.audioTrackId;
     layerSelect.disabled = videoPaused && !audioOnly;
 }
+
+// A signed P2P link should just play: opening it must not require finding the
+// Start button first. A partial query string is surfaced as a link error; a
+// page with none of the five params stays in the normal manual/direct mode.
+(function autoStartFromSignedLink() {
+    let playConfig = null;
+    try {
+        playConfig = parsePlayRequest(window.location.search);
+    } catch (error) {
+        showLinkNotice(error.message);
+        return;
+    }
+    if (playConfig) startStream();
+})();

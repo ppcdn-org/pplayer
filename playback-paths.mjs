@@ -1,5 +1,5 @@
-import { applyPlayoutBuffer } from './buffer-config.mjs';
-import { MediaMTXWebRTCReader } from './ppplayer.mjs';
+import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260922-1';
+import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260922-1';
 
 function waitForVideoFrame(getPeerConnection, callback, intervalMs = 50) {
     let stopped = false;

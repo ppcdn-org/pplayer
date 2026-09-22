@@ -35,6 +35,18 @@ test('requests edge-only WHEP decision with exact authorization', async () => {
     assert.equal(result.playUrl, decision.playUrl);
 });
 
+test('edge-only request drops the p2p capability when P2P is off', async () => {
+    let captured;
+    await requestPlayDecision({
+        ppcenter: 'https://center.example', appId: 'app1', streamName: 'live',
+        txTime: 'abc', txSecret: 'sig', clientId: 'viewer', requestRegion: '',
+    }, { preferP2P: false, fetchImpl: async (url, options) => {
+        captured = { url, options };
+        return { ok: true, status: 200, json: async () => ({ mode: 'edge-only', playUrl: 'https://edge.example/app/live/whep' }) };
+    }});
+    assert.deepEqual(JSON.parse(captured.options.body).capabilities, ['whep']);
+});
+
 test('surfaces API error and rejects unsupported decisions', async () => {
     await assert.rejects(() => requestPlayDecision({
         ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',

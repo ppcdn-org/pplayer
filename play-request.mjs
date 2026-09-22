@@ -10,16 +10,24 @@ export function parsePlayRequest(search, randomUUID = () => crypto.randomUUID())
         requestRegion: params.get('requestRegion')?.trim() || '',
         natProbeId: params.get('natProbeId')?.trim() || '',
     };
-    const supplied = [config.ppcenter, config.appId, config.streamName, config.txTime, config.txSecret]
-        .filter(Boolean).length;
-    if (supplied !== 0 && supplied !== 5) {
-        throw new Error('ppcenter, appId, streamName, txTime and txSecret must be provided together');
+    const required = ['ppcenter', 'appId', 'streamName', 'txTime', 'txSecret'];
+    const missing = required.filter((key) => !config[key]);
+    // None supplied is the manual/direct-play page; all five is a signed P2P
+    // link. Anything in between is a malformed link, and listing exactly
+    // which params are absent makes it fixable instead of a guessing game.
+    if (missing.length !== 0 && missing.length !== required.length) {
+        throw new Error(
+            'ppcenter, appId, streamName, txTime and txSecret must be provided together' +
+            ` (missing: ${missing.join(', ')})`);
     }
-    return supplied === 5 ? config : null;
+    return missing.length === 0 ? config : null;
 }
 
-export async function requestPlayDecision(config, { fetchImpl = fetch, signal, natProbeId } = {}) {
+export async function requestPlayDecision(config, { fetchImpl = fetch, signal, natProbeId, preferP2P = true } = {}) {
     const endpoint = new URL('/v1/play/requests', config.ppcenter).toString();
+    // Without the p2p capability ppcenter answers edge-only, which is exactly
+    // what the unchecked P2P box should do.
+    const capabilities = preferP2P ? ['whep', 'p2p-h264-opus'] : ['whep'];
     const response = await fetchImpl(endpoint, {
         method: 'POST',
         signal,
@@ -31,7 +39,7 @@ export async function requestPlayDecision(config, { fetchImpl = fetch, signal, n
             streamName: config.streamName,
             clientId: config.clientId,
             requestRegion: config.requestRegion,
-            capabilities: ['whep', 'p2p-h264-opus'],
+            capabilities,
             ...(config.natProbeId || natProbeId ? { natProbeId: natProbeId || config.natProbeId } : {}),
         }),
     });
