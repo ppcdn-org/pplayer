@@ -1,30 +1,36 @@
 // ppcenter runs its own STUN server (internal/stun) on the same host as the
 // API, conventionally at port 3478 - deriving it from `ppcenter` means the
 // probe doesn't need ppcenter to have answered anything yet (it runs before
-// the first request of any kind).
+// the first request of any kind). Google's public STUN is raced alongside it
+// as a reachability fallback: some networks can't reach ppcenter's own STUN
+// at all (confirmed in production 2026-09-22 - a publisher's network that
+// reached Google's STUN reliably every 4 minutes via ppobs's probe refresh
+// got zero responses from ppcenter's own the moment Google was removed as a
+// fallback), and a failed probe here means the whole attempt falls back to
+// edge-only, so reachability matters more than which server answers.
 //
-// Deliberately the *only* STUN server, not one of a race against a public
-// fallback (e.g. Google's) - two servers with different address-family
-// reachability (api.pp-cdn.org has no AAAA record; a public STUN provider
-// typically does) meant the publisher and a player could each win their own
-// race against a *different* server and come back with different address
-// families (one IPv4, one IPv6), which ppcenter's eligibility check rejects
-// outright as address_family_mismatch - confirmed in production 2026-09-22
-// as the failure mode right after fixing every earlier one. Using only
-// ppcenter's own (IPv4-only) server makes both sides' results consistent by
-// construction. A failed/slow probe here already falls back to edge-only
-// exactly like today - this isn't a new failure mode, just no longer papered
-// over by a second server that could disagree with the first. See
-// docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
+// Racing two servers can make the publisher and a player each win against a
+// *different* one and disagree on address family (api.pp-cdn.org has no
+// AAAA record, so ppcenter's own can only ever answer IPv4; Google's
+// typically answers whichever family the network prefers) - ppcenter's
+// eligibility check rejects that pairing outright as address_family_mismatch
+// (also confirmed in production 2026-09-22, as the failure mode right after
+// fixing identity_mismatch). Handled below by resolving early only on an
+// IPv4 srflx candidate specifically, from either server, rather than on
+// whichever answers first - see the onicecandidate handler and
+// pickProbeCandidate's ranking. See docs/test/ppcdn-debug-log.md's
+// 2026-09-22 entry for the full trail.
 function deriveStunIceServers(ppcenter) {
+    const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
     try {
         const host = new URL(ppcenter).hostname;
-        if (host) return [{ urls: `stun:${host}:3478` }];
+        if (host) servers.unshift({ urls: `stun:${host}:3478` });
     } catch {
-        // Malformed ppcenter URL - requestPlayDecision will surface the same
-        // malformed URL as an error shortly after anyway.
+        // Malformed ppcenter URL - fall back to the public server alone;
+        // requestPlayDecision will surface the same malformed URL as an
+        // error shortly after anyway.
     }
-    return [];
+    return servers;
 }
 
 export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, clientId, streamName, kind }) {
@@ -44,19 +50,26 @@ export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, cli
                 return;
             }
             candidates.push(event.candidate);
-            // Resolve as soon as a server-reflexive candidate shows up
-            // rather than waiting for every configured ICE server to
-            // finish (the `candidate: null` end-of-gathering event) -
-            // srflx is already pickProbeCandidate's top-ranked type, so
-            // nothing is gained by continuing to wait, and waiting here
-            // means one slow/unreachable server (e.g. a public STUN
-            // fallback on a network where it's throttled) holds up the
-            // whole probe even though another one already answered.
-            // Confirmed in production 2026-09-22: with two configured ICE
-            // servers, gathering still ran the full ~5s before this fix,
-            // one confirmed-fast server notwithstanding - see
-            // docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
-            if (event.candidate.type === 'srflx') resolve();
+            // Resolve as soon as an IPv4 server-reflexive candidate shows up
+            // rather than waiting for every configured ICE server to finish
+            // (the `candidate: null` end-of-gathering event) - srflx is
+            // already pickProbeCandidate's top-ranked type, so nothing is
+            // gained by continuing to wait once one is in hand, and waiting
+            // means one slow/unreachable server holds up the whole probe
+            // even though another one already answered (confirmed in
+            // production 2026-09-22: with two configured ICE servers,
+            // gathering still ran the full ~5s before this fix, one
+            // confirmed-fast server notwithstanding).
+            //
+            // Specifically IPv4, not "any srflx": with two STUN servers
+            // racing, an IPv6 candidate from whichever server answers first
+            // must not short-circuit gathering before an IPv4 one (from
+            // either server) has a chance to arrive - see
+            // deriveStunIceServers's doc comment on address_family_mismatch.
+            // If IPv4 never shows up before the timeout, pickProbeCandidate
+            // still falls back to the best of whatever did arrive.
+            const parts = event.candidate.type === 'srflx' ? candidateParts(event.candidate) : null;
+            if (parts && !parts.ip.includes(':')) resolve();
         };
         setTimeout(resolve, 5000);
     });

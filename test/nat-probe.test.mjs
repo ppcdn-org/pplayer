@@ -181,7 +181,7 @@ test('NAT probe returns null when fetch fails', async () => {
     assert.equal(await probePromise, null);
 });
 
-test('NAT probe uses only ppcenter\'s own STUN server, derived from the ppcenter URL', async () => {
+test('NAT probe races ppcenter\'s own STUN server (tried first) against Google\'s as a reachability fallback', async () => {
     const { probeNATAndSubmit } = await import('../nat-probe.mjs');
     globalThis.RTCPeerConnection = FakeRTCPeerConnection;
     globalThis.fetch = mockFetch;
@@ -192,18 +192,22 @@ test('NAT probe uses only ppcenter\'s own STUN server, derived from the ppcenter
         clientId: 'viewer',
     });
 
-    // Deliberately not racing a second (e.g. public) STUN server - see
-    // deriveStunIceServers's doc comment: two servers can disagree on
-    // address family between the publisher's and a player's own probe,
-    // which ppcenter's eligibility check rejects outright.
-    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [{ urls: 'stun:api.pp-cdn.org:3478' }]);
+    // Google stays configured as a fallback: some networks can't reach
+    // ppcenter's own STUN at all (confirmed in production 2026-09-22) - see
+    // deriveStunIceServers's doc comment. Address-family consistency is
+    // handled separately, by preferring an IPv4 srflx candidate regardless
+    // of which server it came from (see the next two tests).
+    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [
+        { urls: 'stun:api.pp-cdn.org:3478' },
+        { urls: 'stun:stun.l.google.com:19302' },
+    ]);
 
     await new Promise(r => setTimeout(r, 10));
     FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' }]);
     await probePromise;
 });
 
-test('NAT probe has no STUN server (and no candidate) when ppcenter is not a valid URL', async () => {
+test('NAT probe falls back to Google\'s STUN server alone when ppcenter is not a valid URL', async () => {
     const { probeNATAndSubmit } = await import('../nat-probe.mjs');
     globalThis.RTCPeerConnection = FakeRTCPeerConnection;
     globalThis.fetch = mockFetch;
@@ -214,11 +218,62 @@ test('NAT probe has no STUN server (and no candidate) when ppcenter is not a val
         clientId: 'viewer',
     });
 
-    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, []);
+    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [{ urls: 'stun:stun.l.google.com:19302' }]);
 
     await new Promise(r => setTimeout(r, 10));
-    FakeRTCPeerConnection.latest.gather([]); // no ICE servers configured -> gathering "completes" with nothing found
+    FakeRTCPeerConnection.latest.gather([]); // Google unreachable too -> gathering "completes" with nothing found
     assert.equal(await probePromise, null);
+});
+
+test('NAT probe does not resolve early on an IPv6 srflx candidate, to give an IPv4 one from either server a chance', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'https://center.example',
+        appId: 'app123',
+        clientId: 'viewer',
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    // IPv6 srflx arrives first (e.g. Google answering over IPv6) - must not
+    // short-circuit gathering, or the probe could report a different
+    // address family than the other side's own probe (address_family_mismatch).
+    if (!FakeRTCPeerConnection.latest.onicecandidate) throw new Error('onicecandidate not set');
+    FakeRTCPeerConnection.latest.onicecandidate({
+        candidate: { type: 'srflx', address: '2001:db8::1', port: 40000, candidate: '' },
+    });
+    // IPv4 srflx arrives shortly after (e.g. ppcenter's own, IPv4-only) -
+    // this one must resolve immediately rather than waiting further.
+    FakeRTCPeerConnection.latest.onicecandidate({
+        candidate: { type: 'srflx', address: '138.84.153.1', port: 25657, candidate: '' },
+    });
+    const result = await probePromise;
+
+    assert.equal(result.probeId, 'probe-test-client');
+    assert.equal(capturedBody.publicIp, '138.84.153.1');
+});
+
+test('NAT probe falls back to an IPv6 srflx candidate if no IPv4 one ever arrives', async () => {
+    const { probeNATAndSubmit } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    globalThis.fetch = mockFetch;
+
+    const probePromise = probeNATAndSubmit({
+        ppcenter: 'https://center.example',
+        appId: 'app123',
+        clientId: 'viewer',
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    // Only an IPv6 srflx ever shows up (gather() fires end-of-gathering
+    // right after) - still better than reporting nothing.
+    FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '2001:db8::1', port: 40000, candidate: '' }]);
+    const result = await probePromise;
+
+    assert.equal(result.probeId, 'probe-test-client');
+    assert.equal(capturedBody.publicIp, '2001:db8::1');
 });
 
 test('NAT probe resolves on the first srflx candidate without waiting for gathering to finish', async () => {
