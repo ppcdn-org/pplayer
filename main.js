@@ -13,7 +13,7 @@ import { probeNATAndSubmit } from './nat-probe.mjs?v=20260924-2';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260924-2';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260924-2';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260924-2';
-import { StallWatchdog } from './stall-watchdog.mjs?v=20260924-3';
+import { StallWatchdog } from './stall-watchdog.mjs?v=20260924-4';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
@@ -190,6 +190,7 @@ let playbackRace = null;
 let playRequestAbortController = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
 let previousTrackType = null; // Track if we were in audio-only mode
+let firstFrameDecoded = false; // Set when fps>0 is first seen; only then does the stall watchdog start monitoring
 let lastVideoTrackId = null;
 // Which codec path (see insertCodecTypeSegment above) the active session is
 // using - drives the status display and tells attachSeiTimestampReader
@@ -710,6 +711,7 @@ function negotiateAndConnect(generation, url, codecType) {
 
 function resetSessionState() {
     previousTrackType = null;
+    firstFrameDecoded = false;
     lastP2PDelayMs = null;
     lastP2PDelayAt = 0;
     lastP2PDelaySource = null;
@@ -1369,7 +1371,13 @@ async function updateStats() {
         // without being a stall.
         const isVideoActive = !videoPaused &&
             !(abrEngine && abrEngine.currentTrackId === abrEngine.audioTrackId);
-        stallWatchdog.update(videoKbps, fps, isVideoActive);
+        // The stall watchdog only starts after the first video frame has been
+        // decoded. The edge-primary model selects edge on WHEP connection,
+        // before any frame arrives, so fps=0 during the cold-start window is
+        // expected — not a stall. Once normal playback is established, the
+        // watchdog detects the real stuck-while-receiving scenario.
+        if (fps > 0) firstFrameDecoded = true;
+        if (firstFrameDecoded) stallWatchdog.update(videoKbps, fps, isVideoActive);
 
         // No client-side ABR decision here any more: the layer is chosen
         // server-side from the bandwidth estimate. fps/loss below are
