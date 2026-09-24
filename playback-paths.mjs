@@ -1,5 +1,5 @@
-import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260924-5';
-import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260924-5';
+import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260924-8';
+import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260924-8';
 
 // Two playback legs for a p2p-connect decision, driven by
 // PlaybackRaceController's edge-primary + verified-P2P-upgrade model:
@@ -29,6 +29,10 @@ export class EdgeWHEPPath {
         this.reader = new this.ReaderClass({
             url: this.url,
             maxBitrate: 2500,
+            // Deliberately no insertableStreams: the race path does not read the
+            // SEI, so it must NOT enable the encoded transform - enabling it
+            // without consuming it freezes decode (framesDecoded stays 0, black
+            // screen). See ppplayer.mjs's encodedInsertableStreams comment.
             onTrack: (event) => {
                 this.stream = event.streams[0] || this.stream;
                 // Receivers only exist once a track has arrived, so this is the

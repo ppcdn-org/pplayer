@@ -16,6 +16,11 @@ const defaultClock = {
 //   * P2P runs in the background. It is detected as "delivering media" purely
 //     from transport stats (inbound packetsReceived), which move even while the
 //     track is off-screen - so a working P2P is found without disturbing edge.
+//   * The trial also waits for edge to actually decode a frame, not merely
+//     connect: until edge has put a picture up there is nothing to protect and
+//     a lot to lose - the trial would blank the viewer's first seconds, and a
+//     revert would drop edge back onto a decoder that has to re-acquire a
+//     keyframe (production 2026-09-24).
 //   * Only then is P2P put on-screen on trial, with edge kept alive; if P2P
 //     decodes within a short window it is committed (edge dropped, bandwidth
 //     saved), otherwise the visible element reverts to the still-live edge with
@@ -44,6 +49,13 @@ export class PlaybackRaceController {
         // decodes before reverting to edge.
         p2pVerifyMs = 2500,
         pollIntervalMs = 150,
+        // When false, P2P still connects and is watched from transport stats,
+        // but is NEVER put on the visible <video> on trial. Showing a P2P leg
+        // that cannot decode blanks the viewer for p2pVerifyMs then reverts - a
+        // visible flash for no gain - so the on-screen trial stays off until P2P
+        // decode is proven end-to-end (re-enable with ?p2ptrial=1). Edge, which
+        // is already decoding, just stays on screen.
+        enableVisibleTrial = true,
         onSelected = () => {},
         onFailed = () => {},
         onTelemetry = () => {},
@@ -57,6 +69,7 @@ export class PlaybackRaceController {
         this.p2pConnectTimeoutMs = p2pConnectTimeoutMs;
         this.p2pVerifyMs = p2pVerifyMs;
         this.pollIntervalMs = pollIntervalMs;
+        this.enableVisibleTrial = enableVisibleTrial;
         this.onSelected = onSelected;
         this.onFailed = onFailed;
         this.onTelemetry = onTelemetry;
@@ -65,11 +78,13 @@ export class PlaybackRaceController {
         // idle | connecting | playing_edge | p2p_trial | playing_p2p | failed | stopped
         this.state = 'idle';
         this.selectedPath = null;
-        this.edgeState = { ready: false, failed: false };
+        this.edgeState = { ready: false, decoding: false, failed: false };
         this.p2pState = { flowing: false, failed: false, done: false };
         this.failureReported = false;
+        this._trialSuppressed = false;
         this._timers = new Set();
         this._cancelMediaPoll = null;
+        this._cancelEdgeDecodePoll = null;
         this._cancelVerifyPoll = null;
         this._p2pDeadline = null;
         this._verifyDeadline = null;
@@ -136,8 +151,31 @@ export class PlaybackRaceController {
             this._emit('edge_playing');
             this.onSelected({ path: PATH_EDGE, previousPath: null, reason: 'edge_ready' });
         }
-        // P2P media may already be flowing (it connected before edge); upgrade
-        // now that edge is playing and can be the revert target.
+        // "Connected" is not "showing a picture": edge still has to receive a
+        // keyframe before the first frame decodes, which is typically a few
+        // hundred ms and can be a whole GOP. Handing the screen to the P2P
+        // trial during that window means the viewer's first seconds are blank
+        // no matter which leg wins - and if the trial then reverts, edge
+        // re-attaches and has to wait for a keyframe all over again
+        // (production 2026-09-24: P2P took the screen 180ms after edge
+        // connected, and nothing had been displayed yet). So the upgrade waits
+        // until edge itself has decoded on-screen; only then is there a picture
+        // worth risking, and a revert lands on a leg that is already decoding.
+        this._cancelEdgeDecodePoll = this._pollInbound(
+            () => this.edgePath.pc,
+            (report) => report.framesDecoded > 0,
+            () => this._edgeDecoding(),
+        );
+    }
+
+    _edgeDecoding() {
+        if (this._terminal() || this.edgeState.decoding) return;
+        this.edgeState.decoding = true;
+        this._cancelEdgeDecodePoll?.();
+        this._cancelEdgeDecodePoll = null;
+        this._emit('edge_decoding');
+        // P2P media may already be flowing (it connected first); now that edge
+        // is on screen and decoding, it is a safe revert target.
         this._maybeUpgradeToP2P();
     }
 
@@ -173,6 +211,18 @@ export class PlaybackRaceController {
     _maybeUpgradeToP2P() {
         if (this._terminal() || this.p2pState.done) return;
         if (this.state !== 'playing_edge' || !this.p2pState.flowing) return;
+        // Never take the screen away from an edge leg that has not put a
+        // picture on it yet - see _edgeReady().
+        if (!this.edgeState.decoding) return;
+        // With the on-screen trial disabled, edge (already decoding) stays put
+        // and P2P is never shown; report the settled outcome as edge, once.
+        if (!this.enableVisibleTrial) {
+            if (!this._trialSuppressed) {
+                this._trialSuppressed = true;
+                this._emit('p2p_trial_suppressed', { reason: 'visible_trial_disabled' });
+            }
+            return;
+        }
         // Trial: show P2P but keep edge running, so a revert is an instant
         // re-attach of the still-live edge stream with no visible gap.
         this.state = 'p2p_trial';
@@ -277,7 +327,7 @@ export class PlaybackRaceController {
     _restartEdge(reason) {
         this.selectedPath = null;
         this.state = 'reconnecting_edge';
-        this.edgeState = { ready: false, failed: false };
+        this.edgeState = { ready: false, decoding: false, failed: false };
         this._clearTimer(this._p2pDeadline);
         this._p2pDeadline = null;
         this._emit('edge_restarting', { reason });
@@ -307,6 +357,8 @@ export class PlaybackRaceController {
     _teardownPolls() {
         this._cancelMediaPoll?.();
         this._cancelMediaPoll = null;
+        this._cancelEdgeDecodePoll?.();
+        this._cancelEdgeDecodePoll = null;
         this._cancelVerifyPoll?.();
         this._cancelVerifyPoll = null;
     }

@@ -2,18 +2,18 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260924-5';
-import { ABREngine } from './abr-engine.mjs?v=20260924-5';
-import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260924-5';
-import { selectPlaybackCodec } from './codec-capability.mjs?v=20260924-5';
-import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260924-5';
-import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260924-5';
-import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260924-5';
-import { probeNATAndSubmit } from './nat-probe.mjs?v=20260924-5';
-import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260924-5';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260924-5';
-import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260924-5';
-import { StallWatchdog } from './stall-watchdog.mjs?v=20260924-5';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260924-8';
+import { ABREngine } from './abr-engine.mjs?v=20260924-8';
+import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260924-8';
+import { selectPlaybackCodec } from './codec-capability.mjs?v=20260924-8';
+import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260924-8';
+import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260924-8';
+import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260924-8';
+import { probeNATAndSubmit } from './nat-probe.mjs?v=20260924-8';
+import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260924-8';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260924-8';
+import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260924-8';
+import { StallWatchdog } from './stall-watchdog.mjs?v=20260924-8';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
@@ -84,13 +84,26 @@ const bufferValue = document.getElementById('bufferValue');
 const bufferControl = document.getElementById('bufferControl');
 let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs')) ?? DEFAULT_BUFFER_MS;
 
-// P2P is opt-out for signed links: checked, playback asks ppcenter for a
-// direct connection and races it against the edge leg, falling back to the
-// edge node when NAT traversal fails or the decision is edge-only. Unchecked
-// forces edge-only. ?p2p=0 / ?p2p=false unchecks it (edge-only share link);
-// on a page with no ppcenter params the checkbox has no effect.
+// Normally P2P is opt-out for signed links: checked, playback asks ppcenter
+// for a direct connection and races it against the edge leg, falling back to
+// the edge node when NAT traversal fails or the decision is edge-only.
+// Unchecked forces edge-only. ?p2p=0 / ?p2p=false unchecks it (edge-only share
+// link); on a page with no ppcenter params the checkbox has no effect.
+//
+// P2P connection is temporarily disabled in pplayer while the standalone
+// p2player harness (D:\gitlab\ppcdn\p2player) brings up and verifies P2P
+// playback. All P2P code below and in playback-paths.mjs /
+// playback-race-controller.mjs / nat-probe.mjs is retained; flip this to true
+// to re-enable once P2P playback is proven end-to-end.
+const P2P_CONNECTION_ENABLED = false;
+
 const p2pCheckbox = document.getElementById('p2pCheckbox');
 (() => {
+    if (p2pCheckbox && !P2P_CONNECTION_ENABLED) {
+        p2pCheckbox.checked = false;
+        p2pCheckbox.disabled = true;
+        p2pCheckbox.title = 'P2P is temporarily disabled (testing in p2player).';
+    }
     const raw = new URLSearchParams(window.location.search).get('p2p');
     if (p2pCheckbox && raw !== null) {
         p2pCheckbox.checked = !(raw === '0' || raw === 'false');
@@ -98,7 +111,7 @@ const p2pCheckbox = document.getElementById('p2pCheckbox');
 })();
 
 function preferP2P() {
-    return p2pCheckbox ? p2pCheckbox.checked : true;
+    return P2P_CONNECTION_ENABLED && (p2pCheckbox ? p2pCheckbox.checked : true);
 }
 
 (() => {
@@ -653,6 +666,11 @@ function negotiateAndConnect(generation, url, codecType) {
     reader = new MediaMTXWebRTCReader({
         url: url,
         maxBitrate: 2500, // 初始带宽限制
+        // The direct path reads the OBS abs-timestamp SEI out of the encoded
+        // bitstream (attachSeiTimestampReader below), which needs the encoded
+        // transform - and it DOES consume it, so enabling it here is safe. See
+        // ppplayer.mjs's encodedInsertableStreams comment.
+        insertableStreams: true,
         onTrack: (evt) => {
             if (generation !== readerGeneration) return;
             if (evt.track.kind === 'video' || evt.track.kind === 'audio') {
@@ -986,13 +1004,34 @@ function startRacedPlayback(decision, generation, playConfig) {
     const playback = createPlaybackRace(decision, {
         bufferMs,
         ReaderClass: MediaMTXWebRTCReader,
+        // The on-screen P2P trial is off by default: a P2P leg that cannot
+        // decode blanks the viewer for p2pVerifyMs then reverts (a visible
+        // flash) for no gain. P2P still connects in the background (diagnosable
+        // from stats / ppobs logs); opt into the visible trial with ?p2ptrial=1
+        // once P2P decode is expected to work.
+        enableVisibleTrial: new URLSearchParams(window.location.search).get('p2ptrial') === '1',
         onSelected: ({ path }) => {
             if (generation !== readerGeneration) return;
             console.log(`[P2P] race selected: ${path}`);
             const selected = path === 'p2p' ? playback.p2pPath : playback.edgePath;
             activePlaybackPath = selected;
             activePlaybackPathName = path;
-            if (selected.stream) video.srcObject = selected.stream;
+            if (selected.stream && video.srcObject !== selected.stream) {
+                video.srcObject = selected.stream;
+                // Assigning srcObject re-runs the element's load algorithm and
+                // leaves it paused. `autoplay` covers the first load; a path
+                // switch (edge -> P2P trial -> back to edge) is a later one, so
+                // ask explicitly instead of handing the viewer a frozen frame.
+                // The element is muted, so this cannot trip the autoplay policy.
+                // A rapid trial->revert swaps srcObject again before this play()
+                // settles, which rejects the pending promise with AbortError -
+                // expected and harmless (the next swap's own play() takes over),
+                // so swallow just that one and let real failures surface.
+                video.play().catch((err) => {
+                    if (err && err.name === 'AbortError') return;
+                    console.warn('[P2P] play after path switch failed:', err);
+                });
+            }
             // The visible element is now this stream's consumer, so the
             // private sink the path used to get itself decoded during the
             // race can go - otherwise the same stream decodes twice. See
@@ -1031,7 +1070,8 @@ function startRacedPlayback(decision, generation, playConfig) {
             // it actually committed to the P2P leg; edge if it gave up on P2P
             // or reverted. reportPlayOutcome is guarded to fire once per play.
             if (event.event === 'p2p_committed') reportPlayOutcome(playConfig, 'p2p');
-            else if (event.event === 'p2p_give_up' || event.event === 'p2p_reverted') reportPlayOutcome(playConfig, 'edge');
+            else if (event.event === 'p2p_give_up' || event.event === 'p2p_reverted' ||
+                     event.event === 'p2p_trial_suppressed') reportPlayOutcome(playConfig, 'edge');
         },
     });
     playbackRace = playback.controller;
@@ -1039,6 +1079,11 @@ function startRacedPlayback(decision, generation, playConfig) {
 }
 
 function initControlClient(whepUrl, sessionId) {
+    // A P2P trial that reverts re-selects the same, never-stopped edge leg, so
+    // onSelected calls this again with the session it is already connected to.
+    // Tearing that control channel down and redialing it drops the layer list
+    // and resets ABR for no reason; keep the live one instead.
+    if (controlClient && controlClient.sessionId === sessionId) return;
     // Destroy previous client to stop stale reconnects
     if (controlClient) {
         controlClient.close();

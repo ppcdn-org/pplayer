@@ -25,7 +25,12 @@ class FakeEdgePath {
     callbacks = null;
     stream = { id: 'edge-stream' };
     sessionId = 'edge-session';
-    pc = null; // edge is shown, not polled
+    // Edge is polled for framesDecoded - the P2P trial only starts once edge
+    // itself is decoding on-screen (see PlaybackRaceController._edgeReady).
+    pc = {
+        connectionState: 'connected',
+        getStats: async () => new Map([['video', { type: 'inbound-rtp', kind: 'video', framesDecoded: 3 }]]),
+    };
     start(callbacks) { this.starts++; this.callbacks = callbacks; }
     stop(reason) { this.stops.push(reason ?? 'stopped'); }
     ready() { this.callbacks.onReady({ stream: this.stream }); }

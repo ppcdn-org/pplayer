@@ -1,5 +1,5 @@
-import { PlaybackRaceController } from './playback-race-controller.mjs?v=20260924-5';
-import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs?v=20260924-5';
+import { PlaybackRaceController } from './playback-race-controller.mjs?v=20260924-8';
+import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs?v=20260924-8';
 
 export function getEdgeFallbackUrl(decision) {
     if (!decision?.playUrl) {
@@ -16,6 +16,7 @@ export function createPlaybackRace(decision, {
     WebSocketClass,
     PeerConnectionClass,
     bufferMs = null,
+    enableVisibleTrial = true,
     ControllerClass = PlaybackRaceController,
 } = {}) {
     if (decision?.mode !== 'p2p-connect' || !decision.p2p) {
@@ -33,6 +34,7 @@ export function createPlaybackRace(decision, {
     const controller = new ControllerClass({
         edgePath,
         p2pPath,
+        enableVisibleTrial,
         onSelected,
         onFailed,
         onTelemetry,

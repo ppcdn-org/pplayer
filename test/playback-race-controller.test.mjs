@@ -36,11 +36,24 @@ class FakeClock {
 class FakeEdgePath {
     starts = 0; stops = []; cb = null;
     stream = { id: 'edge-stream' };
+    // Edge IS polled now, for framesDecoded: the controller will not hand the
+    // screen to a P2P trial until edge has actually put a picture on it.
+    // Defaulting to "already decoding" keeps the tests that only care about
+    // P2P behaviour reading as before; setStats({ framesDecoded: 0 }) holds
+    // edge at connected-but-blank.
+    _stats = { framesDecoded: 3 };
     start(cb) { this.starts++; this.cb = cb; }
     stop() { this.stops.push('stopped'); }
     ready() { this.cb.onReady({ stream: this.stream }); }
     fail(error = new Error('edge failed')) { this.cb.onFailed(error); }
-    get pc() { return null; } // edge is never polled - it is shown, not probed
+    setStats(patch) { Object.assign(this._stats, patch); }
+    get pc() {
+        const stats = this._stats;
+        return {
+            connectionState: 'connected',
+            getStats: async () => new Map([['v', { type: 'inbound-rtp', kind: 'video', ...stats }]]),
+        };
+    }
 }
 
 class FakeP2PPath {
@@ -168,6 +181,61 @@ test('upgrades even if P2P media arrives before edge connects (order-independent
     await flush(); // edge playing -> upgrade proceeds -> decode confirmed -> commit
     assert.equal(c.controller.getState().state, 'playing_p2p');
     assert.deepEqual(c.selections.map((s) => s.path), ['edge', 'p2p']);
+});
+
+test('P2P never takes the screen before edge has shown a frame', async () => {
+    // Regression (production 2026-09-24): the trial began 180ms after edge
+    // connected, while edge was still waiting for its first keyframe. The
+    // viewer's first seconds were blank whichever leg won, and the revert put
+    // edge back on a decoder that then had to wait for a keyframe again.
+    const c = setup();
+    c.controller.start();
+    c.edgePath.setStats({ framesDecoded: 0 }); // connected, nothing on screen yet
+    c.edgePath.ready();
+    c.p2pPath.setStats({ packetsReceived: 20, framesDecoded: 8 });
+    c.p2pPath.negotiate();
+    await flush();
+
+    // P2P is delivering media and would decode - but edge has shown nothing,
+    // so the screen stays with edge.
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge']);
+    assert.deepEqual(c.p2pPath.stops, []); // P2P leg kept alive, just not shown
+
+    // Edge decodes -> there is now a picture worth risking -> trial proceeds
+    // and P2P commits.
+    c.edgePath.setStats({ framesDecoded: 1 });
+    c.clock.advance(100); // pollIntervalMs -> next edge decode poll tick
+    await flush();
+    assert.equal(c.controller.getState().state, 'playing_p2p');
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge', 'p2p']);
+    assert.deepEqual(c.edgePath.stops, ['stopped']);
+});
+
+test('enableVisibleTrial:false keeps edge on screen and never trials P2P', async () => {
+    const c = setup({ enableVisibleTrial: false });
+    c.controller.start();
+    c.edgePath.ready();
+    c.p2pPath.setStats({ packetsReceived: 20, framesDecoded: 8 }); // P2P would decode
+    c.p2pPath.negotiate();
+    await flush();
+
+    // Edge stays on screen; the visible trial never happens even though P2P is
+    // delivering media and would decode.
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge']);
+    assert.deepEqual(c.edgePath.stops, []);
+    // Reported once as edge (settled outcome), and only once.
+    const suppressed = c.telemetry.filter((e) => e.event === 'p2p_trial_suppressed');
+    assert.equal(suppressed.length, 1);
+
+    // P2P leg is left connected (not torn down) so it stays diagnosable.
+    assert.deepEqual(c.p2pPath.stops, []);
+    // Crossing p2pVerifyMs must not do anything (no trial is running).
+    c.clock.advance(5000);
+    await flush();
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.equal(c.telemetry.filter((e) => e.event === 'p2p_trial_suppressed').length, 1);
 });
 
 test('P2P failure never disturbs a playing edge', () => {

@@ -475,12 +475,18 @@ class MediaMTXWebRTCReader {
     this.pc = new RTCPeerConnection({
       iceServers,
       sdpSemantics: 'unified-plan',
-      // Enables RTCRtpReceiver.createEncodedStreams() (Chromium-only) so
-      // sei-timestamp.js can read the OBS abs-timestamp SEI directly out
-      // of the encoded bitstream, independent of the DataChannel relay
-      // and of any mmx-to-mmx cascading. Harmless on browsers that ignore
-      // this option (createEncodedStreams then simply isn't available).
-      encodedInsertableStreams: true,
+      // Opt-in ONLY. Enabling encodedInsertableStreams makes Chrome route every
+      // inbound encoded frame through a transform insertion point - and if the
+      // caller never calls receiver.createEncodedStreams() and pumps
+      // readable->writable, the frames are held there forever: they are
+      // received and assembled but never reach the decoder, so framesDecoded
+      // stays 0 and the <video> shows nothing (confirmed live 2026-09-24: the
+      // race path enabled this but never consumed it, and manually pumping the
+      // stream in the console immediately unfroze decode). So only turn it on
+      // when a consumer WILL attach - i.e. the direct path, which reads the OBS
+      // abs-timestamp SEI via sei-timestamp.mjs (attachSeiTimestampReader ->
+      // createEncodedStreams). The race path leaves it off and decodes normally.
+      encodedInsertableStreams: this.conf.insertableStreams === true,
     });
 
     const direction = 'recvonly';
