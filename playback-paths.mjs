@@ -1,5 +1,5 @@
-import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260924-2';
-import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260924-2';
+import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260924-5';
+import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260924-5';
 
 // Two playback legs for a p2p-connect decision, driven by
 // PlaybackRaceController's edge-primary + verified-P2P-upgrade model:

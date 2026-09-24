@@ -34,8 +34,12 @@ export class PlaybackRaceController {
         p2pPath,
         // How long P2P has to start delivering media before we give up on it
         // for this session and stay on edge. A symmetric-NAT viewer never
-        // delivers, so this just bounds the wasted background attempt.
-        p2pConnectTimeoutMs = 8000,
+        // delivers, so this just bounds the wasted background attempt. Kept
+        // generous: edge itself can take several seconds to connect and the
+        // P2P signal WebSocket handshake can be slow, so a short window would
+        // give up before P2P had a fair chance. Cleared as soon as P2P media
+        // actually flows (see _p2pMediaFlowing).
+        p2pConnectTimeoutMs = 15000,
         // After P2P is put on-screen on trial, how long to confirm it actually
         // decodes before reverting to edge.
         p2pVerifyMs = 2500,
@@ -88,7 +92,7 @@ export class PlaybackRaceController {
         });
 
         this._p2pDeadline = this._setTimeout(() => {
-            if (this.state === 'playing_p2p' || this.p2pState.done) return;
+            if (this.state === 'p2p_trial' || this.state === 'playing_p2p' || this.p2pState.done) return;
             this._emit('p2p_give_up', { reason: 'no_media_within_timeout' });
             this._abandonP2P();
         }, this.p2pConnectTimeoutMs);
@@ -155,6 +159,12 @@ export class PlaybackRaceController {
         this.p2pState.flowing = true;
         this._cancelMediaPoll?.();
         this._cancelMediaPoll = null;
+        // Media is flowing, so the "no media within timeout" deadline no longer
+        // applies. Clear it here so it cannot fire during the on-screen trial
+        // and abandon a P2P leg that is actually working (edge can take several
+        // seconds to connect, so the trial often begins right at the deadline).
+        this._clearTimer(this._p2pDeadline);
+        this._p2pDeadline = null;
         // Edge may not be playing yet (P2P delivered media first); the upgrade
         // waits until it is, so edge is always the revert target.
         this._maybeUpgradeToP2P();

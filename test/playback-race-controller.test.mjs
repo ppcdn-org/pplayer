@@ -227,3 +227,29 @@ test('can only be started once', () => {
     c.controller.start();
     assert.throws(() => c.controller.start(), /can only be started once/);
 });
+
+test('the connect deadline does not abandon an in-progress P2P trial', async () => {
+    // Verify window deliberately longer than the connect deadline so only the
+    // latter can fire during the trial.
+    const c = setup({ p2pVerifyMs: 20000 });
+    c.controller.start();
+    c.edgePath.ready();
+    // Media flows and the trial begins at t=0, i.e. well before the 5s deadline.
+    c.p2pPath.setStats({ packetsReceived: 20, framesDecoded: 0 });
+    c.p2pPath.negotiate();
+    await flush();
+    assert.equal(c.controller.getState().state, 'p2p_trial');
+
+    // Crossing p2pConnectTimeoutMs must NOT give up / tear down a P2P leg that
+    // is already delivering media and being shown on trial.
+    c.clock.advance(5000);
+    await flush();
+    assert.equal(c.controller.getState().state, 'p2p_trial');
+    assert.deepEqual(c.p2pPath.stops, []);
+    assert.equal(c.telemetry.filter((e) => e.event === 'p2p_give_up').length, 0);
+
+    // The verify window still decides it normally (no decode -> revert to edge).
+    c.clock.advance(20000);
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.deepEqual(c.p2pPath.stops, ['stopped']);
+});
