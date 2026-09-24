@@ -1,116 +1,58 @@
-import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260922-2';
-import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260922-2';
+import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260924-2';
+import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260924-2';
 
-// A browser only decodes an inbound WebRTC video track while something is
-// consuming it. The race selects on framesDecoded > 0 (waitForVideoFrame
-// below), but main.js attaches the visible <video> only once a path has
-// *won* (its onSelected handler) - so with no consumer of its own, neither
-// leg ever decodes a frame, never reports a first frame, and the race never
-// selects anything. Playback deadlocks with both legs connected and silent.
-//
-// Confirmed in production 2026-09-22: this was the first time ppcenter ever
-// returned mode=p2p-connect, so startRacedPlayback had never actually run
-// against a real stream before - the edge-only path (main.js's
-// negotiateAndConnect) sets video.srcObject directly in onTrack and is
-// unaffected, which is why edge playback worked all along.
-//
-// Each leg therefore gets its own muted, effectively-invisible sink element
-// purely to drive decoding, so framesDecoded can move and the race can be
-// decided on real media as designed. The visible element still follows only
-// the winner; the winner drops its sink at that point (releaseDecodeSink)
-// so the same stream isn't decoded twice.
-function createDecodeSink(stream) {
-    // Unit tests run in Node with no DOM - the sink is a browser-only
-    // concern and its absence must not break path construction.
-    if (typeof document === 'undefined' || !stream) return null;
-    const el = document.createElement('video');
-    el.muted = true;
-    el.autoplay = true;
-    el.playsInline = true;
-    el.srcObject = stream;
-    // Not display:none - a video element that is never rendered can have
-    // its decoding throttled. 1px and fully transparent is rendered, and
-    // cannot be seen or interacted with.
-    el.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none';
-    document.body.appendChild(el);
-    // Autoplay is allowed because the element is muted; a rejection here
-    // (policy, or the element being torn down mid-start) must not surface
-    // as an unhandled rejection.
-    el.play?.()?.catch?.(() => {});
-    return el;
-}
-
-function destroyDecodeSink(element) {
-    if (!element) return;
-    element.srcObject = null;
-    element.remove?.();
-}
-
-function waitForVideoFrame(getPeerConnection, callback, intervalMs = 50) {
-    let stopped = false;
-    let timer = null;
-    const check = async () => {
-        if (stopped) return;
-        const pc = getPeerConnection();
-        if (pc) {
-            const stats = await pc.getStats().catch(() => null);
-            if (stats) {
-                for (const report of stats.values()) {
-                    if (report.type === 'inbound-rtp' && report.kind === 'video' && report.framesDecoded > 0) {
-                        callback();
-                        return;
-                    }
-                }
-            }
-        }
-        timer = setTimeout(check, intervalMs);
-    };
-    check();
-    return () => { stopped = true; if (timer) clearTimeout(timer); };
-}
+// Two playback legs for a p2p-connect decision, driven by
+// PlaybackRaceController's edge-primary + verified-P2P-upgrade model:
+//   * EdgeWHEPPath is the default. It reports `onReady` the moment its WHEP
+//     session connects; the controller hands it straight to the on-screen
+//     <video>, which is what drives its decode. No off-screen decode probing -
+//     an off-screen sink does not decode in Chrome anyway (see the controller).
+//   * P2PPlaybackPath is the background bandwidth optimization. It reports
+//     `onNegotiated` once its media track lands; the controller then watches
+//     its PeerConnection's transport stats (packetsReceived) to tell whether
+//     media is actually arriving before ever putting it on screen.
+// Both report `onFailed`; neither decides anything itself.
 
 export class EdgeWHEPPath {
-    // ReaderClass stays injectable for the tests, but now defaults to the
-    // imported SDK reader rather than a global - nothing assigns
-    // window.MediaMTXWebRTCReader any more since the move to ES modules.
+    // ReaderClass stays injectable for the tests, but defaults to the imported
+    // SDK reader - nothing assigns window.MediaMTXWebRTCReader since the move
+    // to ES modules.
     constructor({ url, ReaderClass = MediaMTXWebRTCReader, bufferMs = null }) {
         this.url = url;
         this.ReaderClass = ReaderClass;
         this.bufferMs = bufferMs;
         this.reader = null;
         this.stream = null;
-        this.cancelFrameWait = null;
-        this.decodeSink = null;
     }
 
-    start({ onFirstFrame, onFailed }) {
+    start({ onReady, onFailed }) {
         this.reader = new this.ReaderClass({
             url: this.url,
             maxBitrate: 2500,
             onTrack: (event) => {
                 this.stream = event.streams[0] || this.stream;
-                // Receivers only exist once a track has arrived, so this is
-                // the earliest point the buffer length can be set.
+                // Receivers only exist once a track has arrived, so this is the
+                // earliest point the buffer length can be set.
                 if (this.bufferMs !== null) applyPlayoutBuffer(this.pc, this.bufferMs);
-                if (!this.decodeSink) this.decodeSink = createDecodeSink(this.stream);
+                console.log(`[P2P] edge onTrack: kind=${event.track?.kind} stream=${Boolean(this.stream)}`);
             },
             onConnected: () => {
-                this.cancelFrameWait = waitForVideoFrame(() => this.reader?.pc, () => onFirstFrame({ stream: this.stream }));
+                // Edge is the guaranteed default path: as soon as it connects it
+                // is handed to the on-screen <video> (the controller's
+                // onSelected), which is what actually drives decode.
+                console.log('[P2P] edge connected - handing to the visible player');
+                onReady?.({ stream: this.stream });
             },
             onError: onFailed,
         });
     }
 
-    // Called once this path has won the race and the visible element has
-    // taken over as the stream's consumer - see createDecodeSink.
-    releaseDecodeSink() {
-        destroyDecodeSink(this.decodeSink);
-        this.decodeSink = null;
-    }
+    // Retained as a no-op so main.js's onSelected can call it unconditionally
+    // across an edge<->P2P switch. There is no longer any off-screen decode
+    // sink to release (edge decodes on the visible element).
+    releaseDecodeSink() {}
 
     stop() {
-        this.cancelFrameWait?.();
-        this.releaseDecodeSink();
         this.reader?.close();
         this.reader = null;
     }
@@ -128,16 +70,17 @@ export class P2PPlaybackPath {
         this.ws = null;
         this.pc = null;
         this.stream = null;
-        this.callbacks = null;
+        this.onNegotiated = null;
+        this.onFailed = null;
+        this.negotiated = false;
         this.pendingCandidates = [];
-        this.cancelFrameWait = null;
-        this.decodeSink = null;
         this.stopped = false;
         this.seq = 0;
     }
 
-    start(callbacks) {
-        this.callbacks = callbacks;
+    start({ onNegotiated, onFailed }) {
+        this.onNegotiated = onNegotiated;
+        this.onFailed = onFailed;
         this.ws = new this.WebSocketClass(this.session.signalUrl, [
             'ppcdn-p2p-v1', `ppcdn-token.${this.session.token}`,
         ]);
@@ -148,6 +91,13 @@ export class P2PPlaybackPath {
 
     async #onSignal(message) {
         if (this.stopped) return;
+        // Temporary diagnostic (2026-09-22): a P2P leg that simply times out
+        // reports no failure at all, so there is otherwise no way to tell
+        // "signaling never said ready" from "offered but no answer came" from
+        // "answer applied but no media". Remove with the rest of this
+        // investigation's logging.
+        console.log(`[P2P] p2p signal in: type=${message.type}` +
+            (message.sessionId ? ` sessionId=${message.sessionId === this.session.sessionId ? 'match' : 'MISMATCH'}` : ''));
         if (message.type === 'ready') {
             await this.#createOffer();
         } else if (message.type === 'answer' && message.sessionId === this.session.sessionId) {
@@ -170,9 +120,13 @@ export class P2PPlaybackPath {
             this.stream = event.streams[0] || this.stream;
             // Same as the Edge path: receivers exist only once a track lands.
             if (this.bufferMs !== null) applyPlayoutBuffer(this.pc, this.bufferMs);
-            if (!this.decodeSink) this.decodeSink = createDecodeSink(this.stream);
-            if (!this.cancelFrameWait) {
-                this.cancelFrameWait = waitForVideoFrame(() => this.pc, () => this.callbacks.onFirstFrame({ stream: this.stream }));
+            console.log(`[P2P] p2p onTrack: kind=${event.track?.kind} stream=${Boolean(this.stream)}`);
+            // The PeerConnection and stream now exist; hand off to the
+            // controller, which watches transport stats before deciding whether
+            // this leg is worth putting on screen. Fire once.
+            if (!this.negotiated) {
+                this.negotiated = true;
+                this.onNegotiated?.({ stream: this.stream });
             }
         };
         this.pc.onicecandidate = (event) => {
@@ -186,16 +140,15 @@ export class P2PPlaybackPath {
         this.#send({ type: 'offer', sdp: offer.sdp });
     }
 
-    // ppcenter's own STUN address (models.STUNConfig.URLs() server-side)
-    // rides in on session.stunServers, the same play-decision response
-    // everything else here comes from. Without it this PeerConnection can
-    // only gather `host` ICE candidates and never learns its own
-    // public-facing address - P2P is then structurally unable to connect
-    // for any viewer not on the publisher's LAN, regardless of NAT type.
-    // Filtered the same way ppobs's C++ client filters this field
-    // (ppcenter-signal.cpp/ppcenter-client.cpp): stun:/stuns: only, anything
-    // else silently dropped rather than handed to the browser and rejected
-    // at PeerConnection construction time.
+    // ppcenter's own STUN address (models.STUNConfig.URLs() server-side) rides
+    // in on session.stunServers, the same play-decision response everything
+    // else here comes from. Without it this PeerConnection can only gather
+    // `host` ICE candidates and never learns its own public-facing address -
+    // P2P is then structurally unable to connect for any viewer not on the
+    // publisher's LAN, regardless of NAT type. Filtered the same way ppobs's
+    // C++ client filters this field: stun:/stuns: only, anything else silently
+    // dropped rather than handed to the browser and rejected at PeerConnection
+    // construction time.
     #iceServersConfig() {
         const stunUrls = (this.session.stunServers ?? []).filter(
             (url) => typeof url === 'string' && (url.startsWith('stun:') || url.startsWith('stuns:')));
@@ -208,21 +161,15 @@ export class P2PPlaybackPath {
     }
 
     #fail(error) {
-        if (!this.stopped) this.callbacks?.onFailed(error);
+        if (!this.stopped) this.onFailed?.(error);
     }
 
-    // Called once this path has won the race and the visible element has
-    // taken over as the stream's consumer - see createDecodeSink.
-    releaseDecodeSink() {
-        destroyDecodeSink(this.decodeSink);
-        this.decodeSink = null;
-    }
+    // No-op, mirroring EdgeWHEPPath (see there) - kept for main.js onSelected.
+    releaseDecodeSink() {}
 
     stop(reason = 'stopped') {
         if (this.stopped) return;
         this.stopped = true;
-        this.cancelFrameWait?.();
-        this.releaseDecodeSink();
         if (this.ws?.readyState === this.WebSocketClass.OPEN) this.#send({ type: 'close', reason });
         this.ws?.close();
         this.pc?.close();

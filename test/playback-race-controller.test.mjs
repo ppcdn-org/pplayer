@@ -3,34 +3,28 @@ import test from 'node:test';
 
 import { PlaybackRaceController } from '../playback-race-controller.mjs';
 
+// The controller polls PeerConnection.getStats() (async) between fake-clock
+// timers. flush() drains those microtask chains; the fake clock drives the
+// deadline timers. All timers are fake (Map entries), so nothing keeps Node
+// alive between tests.
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
 class FakeClock {
-    constructor() {
-        this.time = 0;
-        this.nextId = 1;
-        this.timers = new Map();
-    }
-
+    constructor() { this.time = 0; this.nextId = 1; this.timers = new Map(); }
     now = () => this.time;
-
     setTimeout = (callback, delay) => {
         const id = this.nextId++;
         this.timers.set(id, { at: this.time + delay, callback });
         return id;
     };
-
-    clearTimeout = (id) => {
-        this.timers.delete(id);
-    };
-
+    clearTimeout = (id) => { this.timers.delete(id); };
     advance(ms) {
         const target = this.time + ms;
         while (true) {
             const due = [...this.timers.entries()]
-                .filter(([, timer]) => timer.at <= target)
+                .filter(([, t]) => t.at <= target)
                 .sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
-            if (!due) {
-                break;
-            }
+            if (!due) break;
             this.time = due[1].at;
             this.timers.delete(due[0]);
             due[1].callback();
@@ -39,33 +33,40 @@ class FakeClock {
     }
 }
 
-class FakePath {
-    starts = 0;
-    stops = [];
-    callbacks = null;
+class FakeEdgePath {
+    starts = 0; stops = []; cb = null;
+    stream = { id: 'edge-stream' };
+    start(cb) { this.starts++; this.cb = cb; }
+    stop() { this.stops.push('stopped'); }
+    ready() { this.cb.onReady({ stream: this.stream }); }
+    fail(error = new Error('edge failed')) { this.cb.onFailed(error); }
+    get pc() { return null; } // edge is never polled - it is shown, not probed
+}
 
-    start(callbacks) {
-        this.starts++;
-        this.callbacks = callbacks;
-    }
-
-    stop(reason) {
-        this.stops.push(reason);
-    }
-
-    frame(info = {}) {
-        this.callbacks.onFirstFrame(info);
-    }
-
-    fail(error = new Error('failed')) {
-        this.callbacks.onFailed(error);
+class FakeP2PPath {
+    starts = 0; stops = []; cb = null;
+    stream = { id: 'p2p-stream' };
+    connectionState = 'connected';
+    _stats = { packetsReceived: 0, framesDecoded: 0 };
+    start(cb) { this.starts++; this.cb = cb; }
+    stop() { this.stops.push('stopped'); }
+    negotiate() { this.cb.onNegotiated({ stream: this.stream }); }
+    fail(error = new Error('p2p failed')) { this.cb.onFailed(error); }
+    setStats(patch) { Object.assign(this._stats, patch); }
+    get pc() {
+        const stats = this._stats;
+        const connectionState = this.connectionState;
+        return {
+            connectionState,
+            getStats: async () => new Map([['v', { type: 'inbound-rtp', kind: 'video', ...stats }]]),
+        };
     }
 }
 
 function setup(options = {}) {
     const clock = new FakeClock();
-    const edgePath = new FakePath();
-    const p2pPath = new FakePath();
+    const edgePath = new FakeEdgePath();
+    const p2pPath = new FakeP2PPath();
     const selections = [];
     const failures = [];
     const telemetry = [];
@@ -73,152 +74,156 @@ function setup(options = {}) {
         edgePath,
         p2pPath,
         clock,
-        onSelected: (selection) => selections.push(selection),
-        onFailed: (error) => failures.push(error),
-        onTelemetry: (event) => telemetry.push(event),
+        p2pConnectTimeoutMs: 5000,
+        p2pVerifyMs: 1000,
+        pollIntervalMs: 100,
+        onSelected: (s) => selections.push(s),
+        onFailed: (e) => failures.push(e),
+        onTelemetry: (e) => telemetry.push(e),
         ...options,
     });
     return { controller, clock, edgePath, p2pPath, selections, failures, telemetry };
 }
 
-test('starts Edge and P2P without awaiting either path', () => {
-    const context = setup();
-    context.controller.start();
-
-    assert.equal(context.edgePath.starts, 1);
-    assert.equal(context.p2pPath.starts, 1);
-    assert.equal(context.controller.getState().state, 'racing');
+test('starts both legs and reports connecting', () => {
+    const c = setup();
+    c.controller.start();
+    assert.equal(c.edgePath.starts, 1);
+    assert.equal(c.p2pPath.starts, 1);
+    assert.equal(c.controller.getState().state, 'connecting');
 });
 
-test('selects P2P when it produces the first frame within 500ms', () => {
-    const context = setup();
-    context.controller.start();
-    context.clock.advance(499);
-    context.p2pPath.frame({ timestamp: 100 });
-
-    assert.equal(context.controller.getState().selectedPath, 'p2p');
-    assert.deepEqual(context.edgePath.stops, ['p2p_selected']);
-    assert.equal(context.selections.length, 1);
+test('shows edge the moment it connects, without waiting on P2P', () => {
+    const c = setup();
+    c.controller.start();
+    c.edgePath.ready();
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.equal(c.controller.getState().selectedPath, 'edge');
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge']);
+    assert.deepEqual(c.p2pPath.stops, []); // P2P keeps running in the background
 });
 
-test('selects Edge immediately and keeps background P2P alive', () => {
-    const context = setup();
-    context.controller.start();
-    context.clock.advance(100);
-    context.edgePath.frame();
+test('upgrades to P2P once it delivers media AND decodes on-screen, dropping edge', async () => {
+    const c = setup();
+    c.controller.start();
+    c.edgePath.ready();
+    c.p2pPath.setStats({ packetsReceived: 20, framesDecoded: 8 });
+    c.p2pPath.negotiate();
+    await flush();
 
-    assert.equal(context.controller.getState().selectedPath, 'edge');
-    assert.deepEqual(context.p2pPath.stops, []);
+    assert.equal(c.controller.getState().state, 'playing_p2p');
+    assert.equal(c.controller.getState().selectedPath, 'p2p');
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge', 'p2p']);
+    assert.deepEqual(c.edgePath.stops, ['stopped']); // edge dropped => bandwidth saved
+    assert.deepEqual(c.p2pPath.stops, []);
 });
 
-test('continues racing when neither path has a frame at 500ms', () => {
-    const context = setup();
-    context.controller.start();
-    context.clock.advance(500);
+test('reverts to edge with no gap when P2P delivers media but never decodes', async () => {
+    const c = setup();
+    c.controller.start();
+    c.edgePath.ready();
+    c.p2pPath.setStats({ packetsReceived: 20, framesDecoded: 0 }); // packets flow, but no decode
+    c.p2pPath.negotiate();
+    await flush();
 
-    const state = context.controller.getState();
-    assert.equal(state.state, 'racing');
-    assert.equal(state.raceWindowElapsed, true);
+    assert.equal(c.controller.getState().state, 'p2p_trial'); // shown on trial
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge', 'p2p']);
+    assert.deepEqual(c.edgePath.stops, []); // edge was NOT stopped during the trial
 
-    context.clock.advance(100);
-    context.p2pPath.frame();
-    assert.equal(context.controller.getState().selectedPath, 'p2p');
+    c.clock.advance(1000); // p2pVerifyMs -> verify deadline fires -> revert
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.equal(c.controller.getState().selectedPath, 'edge');
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge', 'p2p', 'edge']);
+    assert.deepEqual(c.p2pPath.stops, ['stopped']);
 });
 
-test('rejects late P2P switching by default', () => {
-    const context = setup();
-    context.controller.start();
-    context.edgePath.frame();
-    context.clock.advance(700);
-    context.p2pPath.frame();
+test('symmetric-NAT viewer: P2P never delivers media, so edge is never disturbed', async () => {
+    const c = setup();
+    c.controller.start();
+    c.edgePath.ready();
+    c.p2pPath.setStats({ packetsReceived: 0, framesDecoded: 0 }); // ICE never connects -> no packets
+    c.p2pPath.negotiate();
+    await flush();
 
-    assert.equal(context.controller.getState().selectedPath, 'edge');
-    assert.deepEqual(context.p2pPath.stops, ['late_switch_rejected']);
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    c.clock.advance(5000); // p2pConnectTimeoutMs -> give up on P2P
+    await flush();
+
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge']);
+    assert.deepEqual(c.p2pPath.stops, ['stopped']);
+    assert.equal(c.failures.length, 0);
 });
 
-test('switches from Edge to late P2P when policy accepts it', () => {
-    const context = setup({ canSwitchToP2P: () => true });
-    context.controller.start();
-    context.edgePath.frame();
-    context.clock.advance(700);
-    context.p2pPath.frame();
+test('upgrades even if P2P media arrives before edge connects (order-independent)', async () => {
+    const c = setup();
+    c.controller.start();
+    c.p2pPath.setStats({ packetsReceived: 20, framesDecoded: 8 });
+    c.p2pPath.negotiate();
+    await flush(); // media flowing, but edge not ready yet -> no trial
+    assert.equal(c.controller.getState().state, 'connecting');
+    assert.deepEqual(c.selections.map((s) => s.path), []);
 
-    assert.equal(context.controller.getState().selectedPath, 'p2p');
-    assert.deepEqual(context.edgePath.stops, ['p2p_selected']);
-    assert.equal(context.selections.length, 2);
-    assert.equal(context.selections[1].reason, 'late_p2p_switch');
+    c.edgePath.ready();
+    await flush(); // edge playing -> upgrade proceeds -> decode confirmed -> commit
+    assert.equal(c.controller.getState().state, 'playing_p2p');
+    assert.deepEqual(c.selections.map((s) => s.path), ['edge', 'p2p']);
 });
 
-test('times out background P2P without affecting selected Edge', () => {
-    const context = setup();
-    context.controller.start();
-    context.edgePath.frame();
-    context.clock.advance(2000);
-
-    assert.equal(context.controller.getState().selectedPath, 'edge');
-    assert.deepEqual(context.p2pPath.stops, ['connect_timeout']);
-    assert.equal(context.failures.length, 0);
+test('P2P failure never disturbs a playing edge', () => {
+    const c = setup();
+    c.controller.start();
+    c.edgePath.ready();
+    c.p2pPath.fail();
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.equal(c.controller.getState().selectedPath, 'edge');
+    assert.deepEqual(c.edgePath.stops, []);
+    assert.equal(c.failures.length, 0);
 });
 
-test('P2P failure never stops Edge', () => {
-    const context = setup();
-    context.controller.start();
-    context.p2pPath.fail();
-    context.edgePath.frame();
+test('P2P failure mid-trial falls back to the still-live edge', async () => {
+    const c = setup();
+    c.controller.start();
+    c.edgePath.ready();
+    c.p2pPath.setStats({ packetsReceived: 20, framesDecoded: 0 });
+    c.p2pPath.negotiate();
+    await flush(); // p2p_trial
+    assert.equal(c.controller.getState().state, 'p2p_trial');
 
-    assert.equal(context.controller.getState().selectedPath, 'edge');
-    assert.deepEqual(context.edgePath.stops, []);
+    c.p2pPath.fail(new Error('ice dropped'));
+    assert.equal(c.controller.getState().state, 'playing_edge');
+    assert.equal(c.selections.at(-1).path, 'edge');
+    assert.deepEqual(c.edgePath.stops, []);
 });
 
-test('restarts Edge when selected P2P later fails', () => {
-    const context = setup();
-    context.controller.start();
-    context.p2pPath.frame();
-    context.p2pPath.fail(new Error('connection lost'));
-
-    assert.equal(context.controller.getState().state, 'reconnecting_edge');
-    assert.equal(context.edgePath.starts, 2);
-
-    context.edgePath.frame();
-    assert.equal(context.controller.getState().selectedPath, 'edge');
-    assert.equal(context.selections.at(-1).reason, 'first_frame');
+test('reports failure when edge is unavailable and P2P has not taken over', () => {
+    const c = setup();
+    c.controller.start();
+    c.edgePath.fail();
+    assert.equal(c.controller.getState().state, 'failed');
+    assert.equal(c.failures.length, 1);
+    assert.match(c.failures[0].message, /edge playback path is unavailable/);
 });
 
-test('reports failure once when both paths are unavailable', () => {
-    const context = setup();
-    context.controller.start();
-    context.edgePath.fail();
-    context.p2pPath.fail();
-    context.p2pPath.fail();
+test('stop is idempotent and ignores late callbacks', async () => {
+    const c = setup();
+    c.controller.start();
+    c.controller.stop();
+    c.controller.stop();
+    c.edgePath.ready();
+    c.p2pPath.setStats({ packetsReceived: 20, framesDecoded: 8 });
+    c.p2pPath.negotiate();
+    await flush();
 
-    assert.equal(context.controller.getState().state, 'failed');
-    assert.equal(context.failures.length, 1);
+    assert.equal(c.controller.getState().state, 'stopped');
+    assert.deepEqual(c.edgePath.stops, ['stopped']);
+    assert.deepEqual(c.p2pPath.stops, ['stopped']);
+    assert.equal(c.selections.length, 0);
+    assert.equal(c.failures.length, 0);
 });
 
-test('stop is idempotent and ignores late callbacks', () => {
-    const context = setup();
-    context.controller.start();
-    context.controller.stop();
-    context.controller.stop();
-    context.edgePath.frame();
-    context.p2pPath.fail();
-
-    assert.deepEqual(context.edgePath.stops, ['player_stopped']);
-    assert.deepEqual(context.p2pPath.stops, ['player_stopped']);
-    assert.equal(context.controller.getState().state, 'stopped');
-    assert.equal(context.selections.length, 0);
-    assert.equal(context.failures.length, 0);
-});
-
-test('emits timing and final route telemetry', () => {
-    const context = setup();
-    context.controller.start();
-    context.clock.advance(120);
-    context.edgePath.frame();
-
-    const firstFrame = context.telemetry.find((entry) => entry.event === 'path_first_frame');
-    const selected = context.telemetry.find((entry) => entry.event === 'path_selected');
-    assert.equal(firstFrame.path, 'edge');
-    assert.equal(firstFrame.elapsedMs, 120);
-    assert.equal(selected.path, 'edge');
+test('can only be started once', () => {
+    const c = setup();
+    c.controller.start();
+    assert.throws(() => c.controller.start(), /can only be started once/);
 });

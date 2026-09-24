@@ -26,7 +26,7 @@ test('extracts Edge play URL from play decision', () => {
     assert.throws(() => getEdgeFallbackUrl({}), /playUrl/);
 });
 
-test('creates race controller using center-provided timing and paths', () => {
+test('wires the edge/P2P paths and callbacks into the controller', () => {
     const selected = () => {};
     const failed = () => {};
     const telemetry = () => {};
@@ -41,11 +41,13 @@ test('creates race controller using center-provided timing and paths', () => {
     assert.equal(playback.p2pPath.session, p2pDecision.p2p);
     assert.equal(playback.controller.options.edgePath, playback.edgePath);
     assert.equal(playback.controller.options.p2pPath, playback.p2pPath);
-    assert.equal(playback.controller.options.raceWindowMs, 750);
-    assert.equal(playback.controller.options.connectTimeoutMs, 2500);
     assert.equal(playback.controller.options.onSelected, selected);
     assert.equal(playback.controller.options.onFailed, failed);
     assert.equal(playback.controller.options.onTelemetry, telemetry);
+    // The old symmetric-race timings are no longer passed to the controller
+    // (it uses its own edge-primary timings).
+    assert.equal(playback.controller.options.raceWindowMs, undefined);
+    assert.equal(playback.controller.options.connectTimeoutMs, undefined);
 });
 
 test('rejects non-P2P decisions for race creation', () => {

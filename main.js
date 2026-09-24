@@ -2,18 +2,18 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260922-2';
-import { ABREngine } from './abr-engine.mjs?v=20260922-2';
-import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260922-2';
-import { selectPlaybackCodec } from './codec-capability.mjs?v=20260922-2';
-import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260922-2';
-import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260922-2';
-import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260922-2';
-import { probeNATAndSubmit } from './nat-probe.mjs?v=20260922-2';
-import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260922-2';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260922-2';
-import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260922-2';
-import { StallWatchdog } from './stall-watchdog.mjs?v=20260922-2';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260924-2';
+import { ABREngine } from './abr-engine.mjs?v=20260924-2';
+import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260924-2';
+import { selectPlaybackCodec } from './codec-capability.mjs?v=20260924-2';
+import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260924-2';
+import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260924-2';
+import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260924-2';
+import { probeNATAndSubmit } from './nat-probe.mjs?v=20260924-2';
+import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260924-2';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260924-2';
+import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260924-2';
+import { StallWatchdog } from './stall-watchdog.mjs?v=20260924-2';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
@@ -301,6 +301,34 @@ function reportP2PDelay(timestampMs, source) {
     if (timeSync && lastP2PDelayMs >= P2P_DELAY_CLOCK_SUSPECT_MS &&
         lastP2PDelayMs <= P2P_DELAY_MAX_PLAUSIBLE_MS) {
         timeSync.reportLatency({ path: activePlaybackPathName, delayMs: lastP2PDelayMs });
+    }
+}
+
+// One-shot report of which path actually played, so ppcenter can count the
+// true P2P penetration rate (P2P plays / total plays). Fired once per play:
+// 'edge' immediately for an edge-only decision, or - for a p2p-connect
+// decision - only once the controller settles ('p2p' if it committed to P2P,
+// 'edge' if it gave up or reverted), because a p2p-connect offer does NOT mean
+// P2P carried the media (a symmetric-NAT viewer falls back to edge). Reset per
+// play in startFromPpcenter. Best-effort and keepalive so a tab closing right
+// after it settles still delivers the beacon.
+let playOutcomeReported = false;
+function reportPlayOutcome(playConfig, path) {
+    if (playOutcomeReported || !playConfig) return;
+    playOutcomeReported = true;
+    const headers = { 'Content-Type': 'application/json' };
+    if (playConfig.txTime && playConfig.txSecret && playConfig.appId) {
+        headers['Authorization'] = `Bearer ${playConfig.appId}:${playConfig.txTime}:${playConfig.txSecret}`;
+    }
+    try {
+        fetch(new URL('/v1/play/outcome', playConfig.ppcenter).toString(), {
+            method: 'POST',
+            headers,
+            keepalive: true,
+            body: JSON.stringify({ appId: playConfig.appId, streamName: playConfig.streamName, path }),
+        }).catch(() => {});
+    } catch {
+        // Malformed ppcenter URL etc. - penetration reporting is best-effort.
     }
 }
 
@@ -846,6 +874,7 @@ function startTimeSync(ppcenter) {
 const NAT_PROBE_GRACE_MS = 800;
 
 async function startFromPpcenter(playConfig, generation) {
+    playOutcomeReported = false; // one penetration report per play
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Requesting playback route...</div>';
 
     // The NAT probe only matters for P2P; when the viewer unchecked it there
@@ -905,8 +934,12 @@ async function startFromPpcenter(playConfig, generation) {
         console.log(`[P2P] ppcenter decision: mode=${decision.mode}` +
             (decision.p2p ? `, stunServers=${JSON.stringify(decision.p2p.stunServers || [])}` : ' (no p2p block offered)'));
         startPlaybackFromDecision(decision, {
-            startDirectStream: (url) => startDirectStream(url, generation),
-            startRacedPlayback: (d) => startRacedPlayback(d, generation),
+            startDirectStream: (url) => {
+                startDirectStream(url, generation);
+                // An edge-only decision can only ever play on edge.
+                reportPlayOutcome(playConfig, 'edge');
+            },
+            startRacedPlayback: (d) => startRacedPlayback(d, generation, playConfig),
         });
     } catch (error) {
         if (error.name === 'AbortError' || generation !== readerGeneration) return;
@@ -943,7 +976,7 @@ async function startDirectStream(rawUrl, generation) {
 // no success guarantee on the public internet, so the point of the race is
 // that a failed direct attempt costs the viewer nothing - the Edge leg was
 // already connecting in parallel (see the architecture doc §6.3).
-function startRacedPlayback(decision, generation) {
+function startRacedPlayback(decision, generation, playConfig) {
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting P2P and Edge...</div>';
     lastStats.timestamp = Date.now();
     statsInterval = setInterval(updateStats, 1000);
@@ -982,7 +1015,22 @@ function startRacedPlayback(decision, generation) {
             console.error('Playback race failed:', error);
             statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${error.message}</div>`;
         },
-        onTelemetry: (event) => console.debug('[PlaybackRace]', event),
+        // console.log, not console.debug: Chrome files console.debug under
+        // the Verbose level, which its console hides by default - so every
+        // race event (race_started / path_first_frame / path_failed /
+        // path_timeout / race_failed) was being emitted but was invisible
+        // in practice, including while debugging this path in production on
+        // 2026-09-22. These are the only window into why a race picked what
+        // it picked; they need to be visible by default, and tagged [P2P]
+        // like the other P2P-lifecycle logs here.
+        onTelemetry: (event) => {
+            console.log('[P2P] race event:', JSON.stringify(event));
+            // Count the true outcome once the controller settles: P2P only if
+            // it actually committed to the P2P leg; edge if it gave up on P2P
+            // or reverted. reportPlayOutcome is guarded to fire once per play.
+            if (event.event === 'p2p_committed') reportPlayOutcome(playConfig, 'p2p');
+            else if (event.event === 'p2p_give_up' || event.event === 'p2p_reverted') reportPlayOutcome(playConfig, 'edge');
+        },
     });
     playbackRace = playback.controller;
     playbackRace.start();

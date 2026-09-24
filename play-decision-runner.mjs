@@ -1,5 +1,5 @@
-import { PlaybackRaceController } from './playback-race-controller.mjs?v=20260922-2';
-import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs?v=20260922-2';
+import { PlaybackRaceController } from './playback-race-controller.mjs?v=20260924-2';
+import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs?v=20260924-2';
 
 export function getEdgeFallbackUrl(decision) {
     if (!decision?.playUrl) {
@@ -12,7 +12,6 @@ export function createPlaybackRace(decision, {
     onSelected,
     onFailed,
     onTelemetry,
-    canSwitchToP2P,
     ReaderClass,
     WebSocketClass,
     PeerConnectionClass,
@@ -23,20 +22,20 @@ export function createPlaybackRace(decision, {
         throw new Error('play decision is not a P2P decision');
     }
 
-    // Both legs get the same buffer length: whichever wins the race, the
-    // viewer should see the latency they asked for, not one that depends on
-    // which path happened to connect first.
+    // Both legs get the same buffer length so the viewer sees the latency they
+    // asked for regardless of which path ends up on screen. Edge is the default
+    // and is shown immediately; P2P is a background upgrade the controller only
+    // switches to after verifying it decodes (see PlaybackRaceController). The
+    // decision's raceWindowMs/connectTimeoutMs described the old symmetric race
+    // and no longer apply - the controller uses its own edge-primary timings.
     const edgePath = new EdgeWHEPPath({ url: getEdgeFallbackUrl(decision), ReaderClass, bufferMs });
     const p2pPath = new P2PPlaybackPath({ session: decision.p2p, WebSocketClass, PeerConnectionClass, bufferMs });
     const controller = new ControllerClass({
         edgePath,
         p2pPath,
-        raceWindowMs: decision.p2p.raceWindowMs,
-        connectTimeoutMs: decision.p2p.connectTimeoutMs,
         onSelected,
         onFailed,
         onTelemetry,
-        canSwitchToP2P,
     });
     return { controller, edgePath, p2pPath };
 }

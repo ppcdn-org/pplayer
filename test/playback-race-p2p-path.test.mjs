@@ -4,6 +4,8 @@ import test from 'node:test';
 import { PlaybackRaceController } from '../playback-race-controller.mjs';
 import { P2PPlaybackPath } from '../playback-paths.mjs';
 
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
 class FakeClock {
     time = 0;
     nextId = 1;
@@ -23,15 +25,11 @@ class FakeEdgePath {
     callbacks = null;
     stream = { id: 'edge-stream' };
     sessionId = 'edge-session';
-    pc = { connectionState: 'connected', getStats: async () => new Map() };
-
-    start(callbacks) {
-        this.starts++;
-        this.callbacks = callbacks;
-    }
-
-    stop(reason) { this.stops.push(reason); }
-    frame() { this.callbacks.onFirstFrame({ stream: this.stream }); }
+    pc = null; // edge is shown, not polled
+    start(callbacks) { this.starts++; this.callbacks = callbacks; }
+    stop(reason) { this.stops.push(reason ?? 'stopped'); }
+    ready() { this.callbacks.onReady({ stream: this.stream }); }
+    fail(error = new Error('edge failed')) { this.callbacks.onFailed(error); }
 }
 
 class FakeWebSocket {
@@ -61,8 +59,9 @@ class FakePeerConnection {
     async setRemoteDescription(description) { this.remoteDescription = description; }
     async addIceCandidate() {}
     close() { this.connectionState = 'closed'; }
+    // Media is arriving AND decoding - a healthy P2P peer.
     async getStats() {
-        return new Map([['video', { type: 'inbound-rtp', kind: 'video', framesDecoded: 1 }]]);
+        return new Map([['video', { type: 'inbound-rtp', kind: 'video', packetsReceived: 100, framesDecoded: 5 }]]);
     }
 }
 
@@ -74,7 +73,7 @@ function createP2PPath(sessionId = 'session-1') {
     });
 }
 
-test('P2P adapter failure does not stop selected Edge path', () => {
+test('P2P signaling failure never disturbs the playing edge', () => {
     const edgePath = new FakeEdgePath();
     const p2pPath = createP2PPath();
     const selections = [];
@@ -86,7 +85,7 @@ test('P2P adapter failure does not stop selected Edge path', () => {
     });
 
     controller.start();
-    edgePath.frame();
+    edgePath.ready();
     FakeWebSocket.instance.error();
 
     assert.equal(selections[0].path, 'edge');
@@ -95,7 +94,7 @@ test('P2P adapter failure does not stop selected Edge path', () => {
     controller.stop();
 });
 
-test('selected P2P adapter failure restarts Edge fallback', async () => {
+test('a real P2P leg that delivers and decodes is committed, dropping edge', async () => {
     const edgePath = new FakeEdgePath();
     const p2pPath = createP2PPath('session-2');
     const selections = [];
@@ -107,18 +106,47 @@ test('selected P2P adapter failure restarts Edge fallback', async () => {
     });
 
     controller.start();
+    edgePath.ready();
     FakeWebSocket.instance.message({ v: 1, type: 'ready' });
-    await new Promise((resolve) => setImmediate(resolve));
+    await flush();
+    FakePeerConnection.instance.connectionState = 'connected';
     FakePeerConnection.instance.ontrack({ streams: [{ id: 'p2p-stream' }] });
-    await new Promise((resolve) => setImmediate(resolve));
+    await flush();
 
-    assert.equal(selections[0].path, 'p2p');
-    assert.deepEqual(edgePath.stops, ['p2p_selected']);
+    assert.equal(controller.getState().state, 'playing_p2p');
+    assert.deepEqual(selections.map((s) => s.path), ['edge', 'p2p']);
+    assert.deepEqual(edgePath.stops, ['stopped']);
+    controller.stop();
+});
+
+test('a committed P2P leg that later fails restarts the edge fallback', async () => {
+    const edgePath = new FakeEdgePath();
+    const p2pPath = createP2PPath('session-3');
+    const selections = [];
+    const controller = new PlaybackRaceController({
+        edgePath,
+        p2pPath,
+        clock: new FakeClock(),
+        onSelected: (selection) => selections.push(selection),
+    });
+
+    controller.start();
+    edgePath.ready();
+    FakeWebSocket.instance.message({ v: 1, type: 'ready' });
+    await flush();
+    FakePeerConnection.instance.connectionState = 'connected';
+    FakePeerConnection.instance.ontrack({ streams: [{ id: 'p2p-stream' }] });
+    await flush();
+    assert.equal(controller.getState().state, 'playing_p2p');
+    assert.equal(edgePath.starts, 1);
 
     FakePeerConnection.instance.connectionState = 'failed';
     FakePeerConnection.instance.onconnectionstatechange();
 
-    assert.equal(edgePath.starts, 2);
     assert.equal(controller.getState().state, 'reconnecting_edge');
+    assert.equal(edgePath.starts, 2); // edge restarted
+    edgePath.ready();
+    assert.equal(controller.getState().state, 'playing_edge');
+    assert.equal(controller.getState().selectedPath, 'edge');
     controller.stop();
 });
