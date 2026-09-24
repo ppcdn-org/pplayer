@@ -19,6 +19,12 @@
 // seconds" doesn't happen unattended.
 const DEFAULT_STALL_SECONDS = 8;
 
+// How long after a stream starts (reset) the watchdog waits before it starts
+// counting fps=0 toward a stall. The edge-primary model selects edge on WHEP
+// connection, before any frame has been decoded — the stall watchdog must not
+// fire during this cold-start window.
+const FIRST_FRAME_GRACE_SECONDS = 12;
+
 // Below this, "fps=0" is indistinguishable from no video track actually
 // being active (audio-only ABR mode, or the very first ticks before any
 // video byte has arrived) - not a stall.
@@ -30,11 +36,13 @@ const MIN_VIDEO_KBPS_TO_COUNT = 20;
 const COOLDOWN_SECONDS = 20;
 
 export class StallWatchdog {
-    constructor({ stallSeconds = DEFAULT_STALL_SECONDS, onStall } = {}) {
+    constructor({ stallSeconds = DEFAULT_STALL_SECONDS, firstFrameGraceSeconds = FIRST_FRAME_GRACE_SECONDS, onStall } = {}) {
         this.stallSeconds = stallSeconds;
+        this.firstFrameGraceSeconds = firstFrameGraceSeconds;
         this.onStall = onStall;
         this.zeroFpsStreak = 0;
         this.cooldownRemaining = 0;
+        this.startedAt = null;
     }
 
     // Called once a second from updateStats() with the same videoKbps/fps
@@ -57,6 +65,15 @@ export class StallWatchdog {
             return;
         }
 
+        // fps == 0, video is active, receiving data. The edge-primary model
+        // selects edge on WHEP connection (before any frame has been decoded),
+        // so during the initial grace window a fps=0/videoKbps>0 state is just
+        // the cold-start phase, not a stall.
+        if (this.startedAt && Date.now() - this.startedAt < this.firstFrameGraceSeconds * 1000) {
+            this.zeroFpsStreak = 0;
+            return;
+        }
+
         this.zeroFpsStreak++;
         if (this.zeroFpsStreak >= this.stallSeconds) {
             this.zeroFpsStreak = 0;
@@ -68,5 +85,6 @@ export class StallWatchdog {
     reset() {
         this.zeroFpsStreak = 0;
         this.cooldownRemaining = 0;
+        this.startedAt = Date.now();
     }
 }

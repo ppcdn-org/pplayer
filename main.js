@@ -13,7 +13,7 @@ import { probeNATAndSubmit } from './nat-probe.mjs?v=20260924-2';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260924-2';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260924-2';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260924-2';
-import { StallWatchdog } from './stall-watchdog.mjs?v=20260924-2';
+import { StallWatchdog } from './stall-watchdog.mjs?v=20260924-3';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
