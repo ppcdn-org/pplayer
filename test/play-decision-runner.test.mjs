@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createPlaybackRace, getEdgeFallbackUrl, startPlaybackFromDecision } from '../play-decision-runner.mjs';
+import { createDirectP2PPlayback, createPlaybackRace, getEdgeFallbackUrl, startPlaybackFromDecision } from '../play-decision-runner.mjs';
 
 class FakeController {
     constructor(options) {
@@ -54,24 +54,30 @@ test('rejects non-P2P decisions for race creation', () => {
     assert.throws(() => createPlaybackRace({ mode: 'edge-only', playUrl: p2pDecision.playUrl }, { ControllerClass: FakeController }), /not a P2P/);
 });
 
-test('starts Edge directly for edge-only decisions without creating race', () => {
+test('builds a direct (non-raced) P2P leg from a p2p-connect decision', () => {
+    const path = createDirectP2PPlayback(p2pDecision, {});
+    assert.equal(path.session, p2pDecision.p2p);
+    assert.throws(() => createDirectP2PPlayback({ mode: 'edge-only', playUrl: p2pDecision.playUrl }, {}), /not a P2P/);
+});
+
+test('starts Edge directly for edge-only decisions without touching P2P', () => {
     const calls = [];
     const mode = startPlaybackFromDecision({ mode: 'edge-only', playUrl: p2pDecision.playUrl }, {
         startDirectStream: (url) => calls.push(['edge', url]),
-        startRacedPlayback: () => calls.push(['race']),
+        startP2PPlayback: () => calls.push(['p2p']),
     });
 
     assert.equal(mode, 'edge-only');
     assert.deepEqual(calls, [['edge', p2pDecision.playUrl]]);
 });
 
-test('starts P2P race for p2p-connect decisions', () => {
+test('starts direct P2P (not a race) for p2p-connect decisions', () => {
     const calls = [];
     const mode = startPlaybackFromDecision(p2pDecision, {
         startDirectStream: (url) => calls.push(['edge', url]),
-        startRacedPlayback: (decision) => calls.push(['race', decision]),
+        startP2PPlayback: (decision) => calls.push(['p2p', decision]),
     });
 
     assert.equal(mode, 'p2p-connect');
-    assert.deepEqual(calls, [['race', p2pDecision]]);
+    assert.deepEqual(calls, [['p2p', p2pDecision]]);
 });

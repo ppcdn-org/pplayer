@@ -42,9 +42,24 @@ export function createPlaybackRace(decision, {
     return { controller, edgePath, p2pPath };
 }
 
-export function startPlaybackFromDecision(decision, { startDirectStream, startRacedPlayback }) {
+// Builds the direct (non-raced) P2P leg. Under the "ppcenter decides, no
+// client-side racing" rule, a p2p-connect decision means the API already
+// judged this pair traversable AND the publisher has a free slot, so playback
+// connects P2P alone; the edge URL rides along only as a sequential
+// failure fallback.
+export function createDirectP2PPlayback(decision, { WebSocketClass, PeerConnectionClass, bufferMs = null } = {}) {
+    if (decision?.mode !== 'p2p-connect' || !decision.p2p) {
+        throw new Error('play decision is not a P2P decision');
+    }
+    return new P2PPlaybackPath({ session: decision.p2p, WebSocketClass, PeerConnectionClass, bufferMs });
+}
+
+export function startPlaybackFromDecision(decision, { startDirectStream, startP2PPlayback }) {
     if (decision?.mode === 'p2p-connect') {
-        startRacedPlayback(decision);
+        if (!startP2PPlayback) {
+            throw new Error('p2p-connect decision requires startP2PPlayback');
+        }
+        startP2PPlayback(decision);
         return 'p2p-connect';
     }
     if (decision?.mode === 'edge-only') {

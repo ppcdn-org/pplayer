@@ -8,7 +8,7 @@ import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260925-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';
 import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260925-1';
-import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260925-1';
+import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260925-2';
 import { probeNATAndSubmit } from './nat-probe.mjs?v=20260925-1';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260925-1';
@@ -95,7 +95,7 @@ let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bu
 // playback. All P2P code below and in playback-paths.mjs /
 // playback-race-controller.mjs / nat-probe.mjs is retained; flip this to true
 // to re-enable once P2P playback is proven end-to-end.
-const P2P_CONNECTION_ENABLED = false;
+const P2P_CONNECTION_ENABLED = true;
 
 const p2pCheckbox = document.getElementById('p2pCheckbox');
 (() => {
@@ -327,6 +327,9 @@ function reportP2PDelay(timestampMs, source) {
 // play in startFromPpcenter. Best-effort and keepalive so a tab closing right
 // after it settles still delivers the beacon.
 let playOutcomeReported = false;
+// Set from the play decision so the outcome row carries the network condition
+// (eligibility verdict + observed NAT types), not just the settled path.
+let playOutcomeCondition = null;
 function reportPlayOutcome(playConfig, path) {
     if (playOutcomeReported || !playConfig) return;
     playOutcomeReported = true;
@@ -334,12 +337,20 @@ function reportPlayOutcome(playConfig, path) {
     if (playConfig.txTime && playConfig.txSecret && playConfig.appId) {
         headers['Authorization'] = `Bearer ${playConfig.appId}:${playConfig.txTime}:${playConfig.txSecret}`;
     }
+    const body = {
+        appId: playConfig.appId,
+        streamName: playConfig.streamName,
+        path,
+        reason: playOutcomeCondition?.reason,
+        publisherNat: playOutcomeCondition?.publisherNat,
+        playerNat: playOutcomeCondition?.playerNat,
+    };
     try {
         fetch(new URL('/v1/play/outcome', playConfig.ppcenter).toString(), {
             method: 'POST',
             headers,
             keepalive: true,
-            body: JSON.stringify({ appId: playConfig.appId, streamName: playConfig.streamName, path }),
+            body: JSON.stringify(body),
         }).catch(() => {});
     } catch {
         // Malformed ppcenter URL etc. - penetration reporting is best-effort.
@@ -895,6 +906,7 @@ const NAT_PROBE_GRACE_MS = 800;
 
 async function startFromPpcenter(playConfig, generation) {
     playOutcomeReported = false; // one penetration report per play
+    playOutcomeCondition = null;
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Requesting playback route...</div>';
 
     // The NAT probe only matters for P2P; when the viewer unchecked it there
@@ -952,14 +964,22 @@ async function startFromPpcenter(playConfig, generation) {
         if (playRequestAbortController !== abortController || generation !== readerGeneration) return;
         playRequestAbortController = null;
         console.log(`[P2P] ppcenter decision: mode=${decision.mode}` +
-            (decision.p2p ? `, stunServers=${JSON.stringify(decision.p2p.stunServers || [])}` : ' (no p2p block offered)'));
+            (decision.p2p ? `, stunServers=${JSON.stringify(decision.p2p.stunServers || [])}` : ' (no p2p block offered)') +
+            (decision.reason ? `, reason=${decision.reason}` : '') +
+            (decision.publisherNat ? `, publisherNat=${decision.publisherNat}` : '') +
+            (decision.playerNat ? `, playerNat=${decision.playerNat}` : ''));
+        playOutcomeCondition = {
+            reason: decision.reason,
+            publisherNat: decision.publisherNat,
+            playerNat: decision.playerNat,
+        };
         startPlaybackFromDecision(decision, {
             startDirectStream: (url) => {
                 startDirectStream(url, generation);
                 // An edge-only decision can only ever play on edge.
                 reportPlayOutcome(playConfig, 'edge');
             },
-            startRacedPlayback: (d) => startRacedPlayback(d, generation, playConfig),
+            startP2PPlayback: (d) => startP2PPlayback(d, generation, playConfig),
         });
     } catch (error) {
         if (error.name === 'AbortError' || generation !== readerGeneration) return;
@@ -991,11 +1011,75 @@ async function startDirectStream(rawUrl, generation) {
     statsInterval = setInterval(updateStats, 1000);
 }
 
-// PLY-005/006: race a direct P2P connection to ppobs against the Edge WHEP
-// URL and keep whichever produces a decodable frame first. NAT traversal has
-// no success guarantee on the public internet, so the point of the race is
-// that a failed direct attempt costs the viewer nothing - the Edge leg was
-// already connecting in parallel (see the architecture doc §6.3).
+// ppcenter decides the path - there is no client-side racing. A p2p-connect
+// decision means ppcenter judged this pair traversable AND the publisher has a
+// free P2P slot, so playback connects P2P alone; the edge URL carried in the
+// same decision is used only as a SEQUENTIAL fallback if P2P fails or never
+// decodes, never in parallel.
+function startP2PPlayback(decision, generation, playConfig) {
+    statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting P2P...</div>';
+    lastStats.timestamp = Date.now();
+    statsInterval = setInterval(updateStats, 1000);
+
+    const path = createDirectP2PPlayback(decision, {
+        bufferMs,
+        WebSocketClass: WebSocket,
+        PeerConnectionClass: RTCPeerConnection,
+    });
+    activePlaybackPath = path;
+    activePlaybackPathName = 'p2p';
+    if (layerSelect) layerSelect.disabled = true;
+    playbackRace = null;
+
+    let settled = false;
+    let verifyTimer = null;
+
+    const fallbackToEdge = (reason) => {
+        if (settled || generation !== readerGeneration) return;
+        settled = true;
+        if (verifyTimer) clearTimeout(verifyTimer);
+        if (statsInterval) clearInterval(statsInterval);
+        console.warn('[P2P] direct P2P did not play, falling back to edge:', reason);
+        try { path.stop('p2p_failed'); } catch { /* best-effort */ }
+        activePlaybackPath = null;
+        activePlaybackPathName = 'edge';
+        startDirectStream(decision.playUrl, generation);
+        reportPlayOutcome(playConfig, 'edge');
+    };
+
+    path.start({
+        onNegotiated: ({ stream }) => {
+            if (generation !== readerGeneration) return;
+            video.srcObject = stream;
+            video.play().catch((err) => {
+                if (err && err.name === 'AbortError') return;
+                console.warn('[P2P] play() after srcObject failed:', err);
+            });
+            markBufferSupport(applyPlayoutBuffer(path.pc, bufferMs));
+            statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Playing via P2P</div>';
+            // Report p2p only once a frame is actually presented - a
+            // connected-but-never-decoding P2P must count as edge in the
+            // penetration metric (same rule as the old race controller).
+            if (typeof video.requestVideoFrameCallback === 'function') {
+                video.requestVideoFrameCallback(() => {
+                    if (settled || generation !== readerGeneration) return;
+                    settled = true;
+                    if (verifyTimer) clearTimeout(verifyTimer);
+                    reportPlayOutcome(playConfig, 'p2p');
+                });
+            } else {
+                settled = true;
+                reportPlayOutcome(playConfig, 'p2p');
+            }
+            const graceMs = Math.max(4000, Number(decision.p2p?.connectTimeoutMs || 0) + 2000);
+            verifyTimer = setTimeout(() => fallbackToEdge('no frame within grace window'), graceMs);
+        },
+        onFailed: (error) => fallbackToEdge(error),
+    });
+}
+
+// Kept for rollback: the previous edge-primary + background-P2P upgrade. No
+// longer wired to the play decision (see startPlaybackFromDecision).
 function startRacedPlayback(decision, generation, playConfig) {
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting P2P and Edge...</div>';
     lastStats.timestamp = Date.now();
