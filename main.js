@@ -1502,18 +1502,6 @@ async function updateStats() {
         }
 
         if (networkStats) {
-            // availableIncomingBitrate is a non-standard candidate-pair
-            // field Chromium leaves at 0/undefined, so prefer it but fall
-            // back to the server-side estimate the ABR controller already
-            // sends (BANDWIDTH_ESTIMATE -> abrEngine.lastBandwidthEstimate)
-            // rather than showing N/A on a working connection.
-            let bw = 'N/A';
-            if (networkStats.availableIncomingBitrate) {
-                bw = `${(networkStats.availableIncomingBitrate / 1000).toFixed(0)} kbps`;
-            } else if (abrEngine && abrEngine.lastBandwidthEstimate !== null) {
-                bw = `${(abrEngine.lastBandwidthEstimate / 1000).toFixed(0)} kbps (server)`;
-            }
-            
             const p2pFresh = lastP2PDelayMs !== null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS;
             // A fresh measurement outside [SUSPECT, MAX_PLAUSIBLE] is a clock
             // artifact rather than a real delay (see the const comments
@@ -1538,9 +1526,13 @@ async function updateStats() {
             // apart.
             catchUpController.update(p2pFresh && !p2pImplausible ? lastP2PDelayMs : null);
 
+            // No "Est. Bandwidth" row: the server no longer decides ABR from a
+            // bandwidth estimate (it uses loss/RTT), and GCC's send-side
+            // estimate is unreliable here (it needs a pacer the deployment
+            // skips for latency), so it read 100kbps..20000kbps at random.
+            // The real throughput is already shown per track as "Recv Bitrate".
             const netRows = {
                 'RTT': `${(networkStats.currentRoundTripTime * 1000).toFixed(1)} ms`,
-                'Est. Bandwidth': bw,
                 'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ` (catching up ${video.playbackRate}x)` : '')
             };
             html += renderStatGroup('Network', netRows);
@@ -1572,7 +1564,6 @@ function renderStatGroup(title, data) {
     for (const [key, value] of Object.entries(data)) {
         let valClass = '';
         if (key === 'Packet Loss' && parseInt(value) > 0) valClass = 'warn';
-        if (key === 'Est. Bandwidth') valClass = 'good';
         rows += `<div class="stat-row"><span class="stat-key">${key}:</span><span class="stat-val ${valClass}">${value}</span></div>`;
     }
     return `<div class="stat-group"><div class="stat-title">${title}</div>${rows}</div>`;
