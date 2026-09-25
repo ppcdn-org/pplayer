@@ -130,6 +130,47 @@ test('P2P path reports onNegotiated once its media track lands', async () => {
     path.stop('done');
 });
 
+test('P2P path synthesizes a MediaStream when the publisher omits a media-level msid', async () => {
+    // libdatachannel can answer with only the SSRC-level msid, so some browsers
+    // hand back an empty event.streams. Attaching that to <video> is a silent
+    // black screen, so the path must build a MediaStream from the track.
+    const negotiated = [];
+    class FakeMediaStream {
+        constructor() { this.tracks = []; }
+        getTracks() { return this.tracks; }
+        addTrack(track) { this.tracks.push(track); }
+    }
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'MediaStream');
+    Object.defineProperty(globalThis, 'MediaStream', { value: FakeMediaStream, configurable: true, writable: true });
+    try {
+        const path = new P2PPlaybackPath({
+            session: { sessionId: 'session-msid', signalUrl: 'wss://center.example/v1/p2p/signal', token: 'secret' },
+            WebSocketClass: FakeWebSocket,
+            PeerConnectionClass: FakePeerConnection,
+        });
+        path.start({ onNegotiated: (info) => negotiated.push(info), onFailed(error) { throw error; } });
+        FakeWebSocket.instance.message({ v: 1, type: 'ready' });
+        await new Promise((resolve) => setImmediate(resolve));
+
+        const track = { kind: 'video' };
+        FakePeerConnection.instance.ontrack({ track, streams: [] });
+
+        assert.equal(negotiated.length, 1);
+        assert.ok(negotiated[0].stream instanceof FakeMediaStream);
+        assert.deepEqual(negotiated[0].stream.getTracks(), [track]);
+
+        // A later track (audio) joins the same synthesized stream.
+        const audio = { kind: 'audio' };
+        FakePeerConnection.instance.ontrack({ track: audio, streams: [] });
+        assert.deepEqual(negotiated[0].stream.getTracks(), [track, audio]);
+        assert.equal(negotiated.length, 1);
+        path.stop('done');
+    } finally {
+        if (original) Object.defineProperty(globalThis, 'MediaStream', original);
+        else delete globalThis.MediaStream;
+    }
+});
+
 test('P2P path buffers remote ICE until answer is applied', async () => {
     const path = new P2PPlaybackPath({
         session: { sessionId: 'session-2', signalUrl: 'wss://center.example/v1/p2p/signal', token: 'secret' },

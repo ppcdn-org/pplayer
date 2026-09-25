@@ -1011,6 +1011,31 @@ async function startDirectStream(rawUrl, generation) {
     statsInterval = setInterval(updateStats, 1000);
 }
 
+// Compact, copy-friendly trace of the P2P handshake (absorbed from p2player's
+// logSignal). Per-candidate events are dropped as too chatty; the states that
+// decide whether a direct connection forms are kept.
+function logP2PSignal(m, expectedSessionId) {
+    const idNote = m.sessionId ? ` sessionId=${m.sessionId === expectedSessionId ? 'match' : 'MISMATCH'}` : '';
+    const tag = '[P2P]';
+    switch (m.type) {
+        case 'ws-connecting': console.log(`${tag} signaling: connecting to ${m.url}`); break;
+        case 'ws-open': console.log(`${tag} signaling: WebSocket open`); break;
+        case 'ready': console.log(`${tag} signaling: publisher ready; creating offer`); break;
+        case 'pc-created': console.log(`${tag} RTCPeerConnection created; iceServers=${JSON.stringify(m.iceServers || [])}`); break;
+        case 'offer-created': console.log(`${tag} local offer created (sdp ${m.sdpLength}B); sent to publisher`); break;
+        case 'remote-description-set': console.log(`${tag} remote description (answer) applied`); break;
+        case 'answer': console.log(`${tag} answer received (sdp ${(m.sdp || '').length}B)${idNote}`); break;
+        case 'track': console.log(`${tag} media track received: ${m.kind}`); break;
+        case 'iceconnectionstate':
+        case 'connectionstate':
+        case 'signalingstate':
+        case 'icegatheringstate':
+            console.log(`${tag} ${m.type}=${m.value}`); break;
+        case 'error': console.log(`${tag} signaling error: ${m.reason || 'rejected'}`); break;
+        default: break; // local-candidate / ice are per-candidate, too chatty
+    }
+}
+
 // ppcenter decides the path - there is no client-side racing. A p2p-connect
 // decision means ppcenter judged this pair traversable AND the publisher has a
 // free P2P slot, so playback connects P2P alone; the edge URL carried in the
@@ -1048,6 +1073,7 @@ function startP2PPlayback(decision, generation, playConfig) {
     };
 
     path.start({
+        onSignal: (message) => logP2PSignal(message, decision.p2p.sessionId),
         onNegotiated: ({ stream }) => {
             if (generation !== readerGeneration) return;
             video.srcObject = stream;

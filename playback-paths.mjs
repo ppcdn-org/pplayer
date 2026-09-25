@@ -76,18 +76,22 @@ export class P2PPlaybackPath {
         this.stream = null;
         this.onNegotiated = null;
         this.onFailed = null;
+        this.onSignal = null;
         this.negotiated = false;
         this.pendingCandidates = [];
         this.stopped = false;
         this.seq = 0;
     }
 
-    start({ onNegotiated, onFailed }) {
+    start({ onNegotiated, onFailed, onSignal }) {
         this.onNegotiated = onNegotiated;
         this.onFailed = onFailed;
+        this.onSignal = onSignal;
+        this.onSignal?.({ type: 'ws-connecting', url: this.session.signalUrl });
         this.ws = new this.WebSocketClass(this.session.signalUrl, [
             'ppcdn-p2p-v1', `ppcdn-token.${this.session.token}`,
         ]);
+        this.ws.onopen = () => this.onSignal?.({ type: 'ws-open' });
         this.ws.onmessage = (event) => this.#onSignal(JSON.parse(event.data));
         this.ws.onerror = () => this.#fail(new Error('P2P signaling failed'));
         this.ws.onclose = () => { if (!this.stopped) this.#fail(new Error('P2P signaling closed')); };
@@ -95,17 +99,15 @@ export class P2PPlaybackPath {
 
     async #onSignal(message) {
         if (this.stopped) return;
-        // Temporary diagnostic (2026-09-22): a P2P leg that simply times out
-        // reports no failure at all, so there is otherwise no way to tell
-        // "signaling never said ready" from "offered but no answer came" from
-        // "answer applied but no media". Remove with the rest of this
-        // investigation's logging.
-        console.log(`[P2P] p2p signal in: type=${message.type}` +
-            (message.sessionId ? ` sessionId=${message.sessionId === this.session.sessionId ? 'match' : 'MISMATCH'}` : ''));
+        // Every inbound signaling message is forwarded to onSignal (as-is) so
+        // the caller can log/trace the handshake; the method only acts on the
+        // ones that drive negotiation.
+        this.onSignal?.(message);
         if (message.type === 'ready') {
             await this.#createOffer();
         } else if (message.type === 'answer' && message.sessionId === this.session.sessionId) {
             await this.pc.setRemoteDescription({ type: 'answer', sdp: message.sdp });
+            this.onSignal?.({ type: 'remote-description-set' });
             for (const candidate of this.pendingCandidates) await this.pc.addIceCandidate(candidate);
             this.pendingCandidates = [];
         } else if (message.type === 'ice' && message.sessionId === this.session.sessionId) {
@@ -117,14 +119,29 @@ export class P2PPlaybackPath {
     }
 
     async #createOffer() {
-        this.pc = new this.PeerConnectionClass(this.#iceServersConfig());
+        const iceConfig = this.#iceServersConfig();
+        this.pc = new this.PeerConnectionClass(iceConfig);
+        this.onSignal?.({ type: 'pc-created', iceServers: (iceConfig?.iceServers ?? []).map((s) => s.urls) });
         this.pc.addTransceiver('video', { direction: 'recvonly' });
         this.pc.addTransceiver('audio', { direction: 'recvonly' });
         this.pc.ontrack = (event) => {
-            this.stream = event.streams[0] || this.stream;
+            // The publisher (libdatachannel) may negotiate the track without a
+            // media-level msid and emit only the SSRC-level msid, so some
+            // browsers surface an empty event.streams and `event.streams[0]`
+            // is undefined. Attaching that to <video> leaves it permanently
+            // black with no error, so fall back to a MediaStream built from
+            // the track (absorbed from p2player's p2p-path.mjs).
+            if (event.streams[0]) {
+                this.stream = event.streams[0];
+            } else if (event.track && typeof globalThis.MediaStream === 'function') {
+                if (!this.stream) this.stream = new globalThis.MediaStream();
+                if (!this.stream.getTracks().includes(event.track)) {
+                    this.stream.addTrack(event.track);
+                }
+            }
+            this.onSignal?.({ type: 'track', kind: event.track?.kind, streamId: event.streams[0]?.id || null });
             // Same as the Edge path: receivers exist only once a track lands.
             if (this.bufferMs !== null) applyPlayoutBuffer(this.pc, this.bufferMs);
-            console.log(`[P2P] p2p onTrack: kind=${event.track?.kind} stream=${Boolean(this.stream)}`);
             // The PeerConnection and stream now exist; hand off to the
             // controller, which watches transport stats before deciding whether
             // this leg is worth putting on screen. Fire once.
@@ -134,13 +151,23 @@ export class P2PPlaybackPath {
             }
         };
         this.pc.onicecandidate = (event) => {
-            if (event.candidate) this.#send({ type: 'ice', candidate: event.candidate.toJSON() });
+            if (event.candidate) {
+                this.onSignal?.({ type: 'local-candidate', candidate: event.candidate.candidate });
+                this.#send({ type: 'ice', candidate: event.candidate.toJSON() });
+            } else {
+                this.onSignal?.({ type: 'local-candidate', candidate: null });
+            }
         };
+        this.pc.oniceconnectionstatechange = () => this.onSignal?.({ type: 'iceconnectionstate', value: this.pc.iceConnectionState });
+        this.pc.onicegatheringstatechange = () => this.onSignal?.({ type: 'icegatheringstate', value: this.pc.iceGatheringState });
+        this.pc.onsignalingstatechange = () => this.onSignal?.({ type: 'signalingstate', value: this.pc.signalingState });
         this.pc.onconnectionstatechange = () => {
+            this.onSignal?.({ type: 'connectionstate', value: this.pc.connectionState });
             if (this.pc.connectionState === 'failed' || this.pc.connectionState === 'closed') this.#fail(new Error('P2P connection failed'));
         };
         const offer = await this.pc.createOffer();
         await this.pc.setLocalDescription(offer);
+        this.onSignal?.({ type: 'offer-created', sdpLength: offer.sdp?.length ?? 0 });
         this.#send({ type: 'offer', sdp: offer.sdp });
     }
 
