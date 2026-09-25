@@ -2,18 +2,18 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260924-8';
-import { ABREngine } from './abr-engine.mjs?v=20260924-8';
-import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260924-8';
-import { selectPlaybackCodec } from './codec-capability.mjs?v=20260924-8';
-import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260924-8';
-import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260924-8';
-import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260924-8';
-import { probeNATAndSubmit } from './nat-probe.mjs?v=20260924-8';
-import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260924-8';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260924-8';
-import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260924-8';
-import { StallWatchdog } from './stall-watchdog.mjs?v=20260924-8';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260925-1';
+import { ABREngine } from './abr-engine.mjs?v=20260925-1';
+import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260925-1';
+import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';
+import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260925-1';
+import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260925-1';
+import { createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260925-1';
+import { probeNATAndSubmit } from './nat-probe.mjs?v=20260925-1';
+import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260925-1';
+import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260925-1';
+import { StallWatchdog } from './stall-watchdog.mjs?v=20260925-1';
 
 const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
@@ -1493,12 +1493,6 @@ async function updateStats() {
                 bw = `${(abrEngine.lastBandwidthEstimate / 1000).toFixed(0)} kbps (server)`;
             }
             
-            // "Auto" now means the server is choosing; see abr-engine.mjs.
-            let abrStatus = (abrEngine && abrEngine.isAutoMode) ? 'Auto (server)' : 'Manual';
-            if (abrEngine && abrEngine.lastBandwidthEstimate !== null) {
-                abrStatus += ` · est ${(abrEngine.lastBandwidthEstimate / 1000).toFixed(0)}k`;
-            }
-
             const p2pFresh = lastP2PDelayMs !== null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS;
             // A fresh measurement outside [SUSPECT, MAX_PLAUSIBLE] is a clock
             // artifact rather than a real delay (see the const comments
@@ -1506,11 +1500,13 @@ async function updateStats() {
             // showing a misleadingly tiny, negative, or absurdly large number.
             const p2pImplausible = p2pFresh &&
                 (lastP2PDelayMs < P2P_DELAY_CLOCK_SUSPECT_MS || lastP2PDelayMs > P2P_DELAY_MAX_PLAUSIBLE_MS);
-            const p2pLabel = !p2pFresh
-                ? (timeSync && !timeSync.isReady() ? 'syncing clock...' : 'N/A')
-                : p2pImplausible
-                    ? `~${estimatedP2PDelayMs.toFixed(0)} ms (est.)`
-                    : `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`;
+            // Never show N/A: when there is no fresh/plausible SEI or
+            // DataChannel measurement yet (or the clock has not been
+            // calibrated), the RTT + jitter-buffer estimate is still a
+            // meaningful reading and is preferred over an empty placeholder.
+            const p2pLabel = !p2pFresh || p2pImplausible
+                ? `~${estimatedP2PDelayMs.toFixed(0)} ms (est.)`
+                : `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`;
 
             // Only chase a measurement that's both fresh and plausible - the
             // same gate the displayed label uses. The RTT/jitter-buffer
@@ -1524,14 +1520,8 @@ async function updateStats() {
             const netRows = {
                 'RTT': `${(networkStats.currentRoundTripTime * 1000).toFixed(1)} ms`,
                 'Est. Bandwidth': bw,
-                'ABR State': abrStatus,
                 'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ` (catching up ${video.playbackRate}x)` : '')
             };
-            // Surface the calibration itself: a large offset or RTT is the
-            // first thing to look at when a delay reading looks wrong.
-            if (timeSync && timeSync.isReady()) {
-                netRows['Clock Offset'] = `${timeSync.offsetMs.toFixed(0)} ms (rtt ${timeSync.lastSyncRttMs.toFixed(0)})`;
-            }
             html += renderStatGroup('Network', netRows);
         }
 
