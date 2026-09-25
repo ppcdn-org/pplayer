@@ -117,7 +117,13 @@ export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, cli
             body: JSON.stringify(body),
         });
         if (!resp.ok) return null;
-        return await resp.json();
+        const data = await resp.json();
+        // Attach the client's public IPv4 (from the srflx candidate) so the
+        // caller can include it in its pull-stream report. Kept alongside the
+        // ppcenter response fields (probeId etc.) so existing callers are
+        // unaffected.
+        const publicIpv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(chosen.ip || '') ? chosen.ip : '';
+        return Object.assign({}, data, { ipv4: publicIpv4 });
     } catch {
         return null;
     }

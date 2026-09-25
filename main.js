@@ -9,7 +9,7 @@ import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';
 import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260925-1';
 import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260925-2';
-import { probeNATAndSubmit } from './nat-probe.mjs?v=20260925-1';
+import { probeNATAndSubmit } from './nat-probe.mjs?v=20260925-2';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260925-1';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260925-1';
@@ -330,18 +330,41 @@ let playOutcomeReported = false;
 // Set from the play decision so the outcome row carries the network condition
 // (eligibility verdict + observed NAT types), not just the settled path.
 let playOutcomeCondition = null;
-function reportPlayOutcome(playConfig, path) {
+// Pull-stream reporting state: playStartedAt is set when the play request goes
+// out, firstFrameAt when the first video frame is decoded, so costTime is the
+// ms from requesting the connection to receiving video data.
+let playStartedAt = null;
+let firstFrameAt = null;
+let activePlayConfig = null;
+let playReportIpv4 = '';
+
+function currentQualityLevel() {
+    const h = (typeof video !== 'undefined' && video && video.videoHeight) || 0;
+    return h > 0 ? `${h}p` : '';
+}
+
+// One connection report per play attempt (success or failure), sent to
+// POST /v1/play/outcome. connType is p2p|edge, costTime is ms to first video,
+// isOK says whether it connected, and reason carries the failure reason when
+// isOK is false (or the eligibility verdict on success).
+function reportPlayOutcome(playConfig, path, { isOK = true, reason = '' } = {}) {
     if (playOutcomeReported || !playConfig) return;
     playOutcomeReported = true;
     const headers = { 'Content-Type': 'application/json' };
     if (playConfig.txTime && playConfig.txSecret && playConfig.appId) {
         headers['Authorization'] = `Bearer ${playConfig.appId}:${playConfig.txTime}:${playConfig.txSecret}`;
     }
+    const costTime = (isOK && firstFrameAt && playStartedAt) ? Math.max(0, firstFrameAt - playStartedAt) : 0;
     const body = {
         appId: playConfig.appId,
         streamName: playConfig.streamName,
-        path,
-        reason: playOutcomeCondition?.reason,
+        connType: path,
+        path, // legacy name for the same value
+        isOK,
+        costTime,
+        ipv4: playReportIpv4 || undefined,
+        qualityLevel: isOK ? currentQualityLevel() : '',
+        reason: (isOK ? playOutcomeCondition?.reason : reason) || undefined,
         publisherNat: playOutcomeCondition?.publisherNat,
         playerNat: playOutcomeCondition?.playerNat,
     };
@@ -353,7 +376,7 @@ function reportPlayOutcome(playConfig, path) {
             body: JSON.stringify(body),
         }).catch(() => {});
     } catch {
-        // Malformed ppcenter URL etc. - penetration reporting is best-effort.
+        // Malformed ppcenter URL etc. - reporting is best-effort.
     }
 }
 
@@ -716,6 +739,8 @@ function negotiateAndConnect(generation, url, codecType) {
             }
 
             statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${err}</div>`;
+            // Report the failed connection (no frame ever arrived on this path).
+            reportPlayOutcome(activePlayConfig, activePlaybackPathName || 'edge', { isOK: false, reason: String(err) });
             // Force audio-only on connection failure to save bandwidth
             if (abrEngine && abrEngine.audioTrackId && abrEngine.currentTrackId !== abrEngine.audioTrackId) {
                 console.warn("[Main] Connection lost, forcing audio-only mode");
@@ -905,8 +930,13 @@ function startTimeSync(ppcenter) {
 const NAT_PROBE_GRACE_MS = 800;
 
 async function startFromPpcenter(playConfig, generation) {
-    playOutcomeReported = false; // one penetration report per play
+    playOutcomeReported = false; // one connection report per play
     playOutcomeCondition = null;
+    // Pull-stream measures: costTime is from here to the first decoded frame.
+    playStartedAt = Date.now();
+    firstFrameAt = null;
+    activePlayConfig = playConfig;
+    playReportIpv4 = '';
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Requesting playback route...</div>';
 
     // The NAT probe only matters for P2P; when the viewer unchecked it there
@@ -933,7 +963,11 @@ async function startFromPpcenter(playConfig, generation) {
             clientId: playConfig.clientId,
             streamName: playConfig.streamName,
             kind: 'player',
-        }).then((probe) => probe?.probeId || null).catch(() => null);
+        }).then((probe) => {
+            // Keep the probe's public IPv4 for the pull-stream report.
+            if (probe?.ipv4) playReportIpv4 = probe.ipv4;
+            return probe?.probeId || null;
+        }).catch(() => null);
         // Logged unconditionally, even when it resolves after the grace
         // window below has already moved on - a probeId that shows up here
         // but never made it into a play/requests call is exactly the
@@ -975,9 +1009,9 @@ async function startFromPpcenter(playConfig, generation) {
         };
         startPlaybackFromDecision(decision, {
             startDirectStream: (url) => {
+                // Edge-only: no immediate report - the first decoded frame
+                // triggers the success report with a real costTime.
                 startDirectStream(url, generation);
-                // An edge-only decision can only ever play on edge.
-                reportPlayOutcome(playConfig, 'edge');
             },
             startP2PPlayback: (d) => startP2PPlayback(d, generation, playConfig),
         });
@@ -985,6 +1019,7 @@ async function startFromPpcenter(playConfig, generation) {
         if (error.name === 'AbortError' || generation !== readerGeneration) return;
         console.error('Play request failed:', error);
         statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${error.message}</div>`;
+        reportPlayOutcome(playConfig, 'edge', { isOK: false, reason: error.message });
     }
 }
 
@@ -1068,8 +1103,9 @@ function startP2PPlayback(decision, generation, playConfig) {
         try { path.stop('p2p_failed'); } catch { /* best-effort */ }
         activePlaybackPath = null;
         activePlaybackPathName = 'edge';
+        // No report here: the edge first frame will report the success with a
+        // real costTime, or negotiateAndConnect's onError reports the failure.
         startDirectStream(decision.playUrl, generation);
-        reportPlayOutcome(playConfig, 'edge');
     };
 
     path.start({
@@ -1090,11 +1126,13 @@ function startP2PPlayback(decision, generation, playConfig) {
                 video.requestVideoFrameCallback(() => {
                     if (settled || generation !== readerGeneration) return;
                     settled = true;
+                    if (firstFrameAt === null) firstFrameAt = Date.now();
                     if (verifyTimer) clearTimeout(verifyTimer);
                     reportPlayOutcome(playConfig, 'p2p');
                 });
             } else {
                 settled = true;
+                if (firstFrameAt === null) firstFrameAt = Date.now();
                 reportPlayOutcome(playConfig, 'p2p');
             }
             const graceMs = Math.max(4000, Number(decision.p2p?.connectTimeoutMs || 0) + 2000);
@@ -1552,7 +1590,17 @@ async function updateStats() {
         // before any frame arrives, so fps=0 during the cold-start window is
         // expected — not a stall. Once normal playback is established, the
         // watchdog detects the real stuck-while-receiving scenario.
-        if (fps > 0) firstFrameDecoded = true;
+        if (fps > 0) {
+            firstFrameDecoded = true;
+            // First decoded video frame: report the connection success (with a
+            // real costTime) once, for whichever path is on screen. Covers the
+            // edge path and the P2P fallback; the P2P leg also reports from its
+            // own requestVideoFrameCallback (the report is once-guarded).
+            if (firstFrameAt === null) {
+                firstFrameAt = Date.now();
+                reportPlayOutcome(activePlayConfig, activePlaybackPathName || 'edge');
+            }
+        }
         if (firstFrameDecoded) stallWatchdog.update(videoKbps, fps, isVideoActive);
 
         // No client-side ABR decision here any more: the layer is chosen
