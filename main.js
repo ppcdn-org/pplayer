@@ -1371,12 +1371,30 @@ async function updateStats() {
         let audioStats = null;
         let networkStats = null;
         // [新增] 用于查找 codec 名称
-        const codecs = new Map(); 
+        const codecs = new Map();
+
+        // Candidate pairs: a browser keeps every pair that ever reached
+        // "succeeded" - e.g. the UDP media path plus a backup TCP/IPv6 one -
+        // and only the pair the transport actually selected carries media.
+        // Taking the last succeeded pair reported by forEach showed that
+        // backup's RTT (a 377ms pair) instead of the ~36ms path in use.
+        // Resolve the selected pair explicitly, in order of trust.
+        let selectedPairId = null;
+        let selectedPair = null;
+        let nominatedPair = null;
+        let anySucceededPair = null;
 
         stats.forEach(report => {
             if (report.type === 'inbound-rtp' && report.kind === 'video') videoStats = report;
             if (report.type === 'inbound-rtp' && report.kind === 'audio') audioStats = report;
-            if (report.type === 'candidate-pair' && report.state === 'succeeded') networkStats = report;
+            if (report.type === 'transport' && report.selectedCandidatePairId) {
+                selectedPairId = report.selectedCandidatePairId;
+            }
+            if (report.type === 'candidate-pair') {
+                if (report.selected === true) selectedPair = report;
+                if (report.nominated === true && report.state === 'succeeded') nominatedPair = report;
+                if (report.state === 'succeeded') anySucceededPair = report;
+            }
             // [新增] 收集 codec 信息
             // Only present once media has flowed on that track; see
             // negotiatedCodecs above for why that isn't enough on its own.
@@ -1384,6 +1402,9 @@ async function updateStats() {
                 codecs.set(report.id, report.mimeType); // e.g. "video/H264"
             }
         });
+
+        networkStats = (selectedPairId && stats.get(selectedPairId)) ||
+            selectedPair || nominatedPair || anySucceededPair;
 
         // --- 计算实时指标 ---
         let videoKbps = 0;
