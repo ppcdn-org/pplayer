@@ -66,11 +66,21 @@ export class EdgeWHEPPath {
 }
 
 export class P2PPlaybackPath {
-    constructor({ session, WebSocketClass = globalThis.WebSocket, PeerConnectionClass = globalThis.RTCPeerConnection, bufferMs = null }) {
+    constructor({ session, WebSocketClass = globalThis.WebSocket, PeerConnectionClass = globalThis.RTCPeerConnection, bufferMs = null, insertableStreams = false, onVideoReceiver = null }) {
         this.session = session;
         this.WebSocketClass = WebSocketClass;
         this.PeerConnectionClass = PeerConnectionClass;
         this.bufferMs = bufferMs;
+        // Opt-in encoded transform. The P2P leg carries the same OBS
+        // abs-timestamp SEI the edge path reads: ppobs stamps it into every
+        // encoded packet before obs-webrtc's Data() forwards packet->data
+        // verbatim, so enabling this and letting onVideoReceiver consume it
+        // turns the displayed P2P Delay from an RTT/jitter estimate into a
+        // real measurement. Enabling it WITHOUT a consumer freezes decode, so
+        // the caller must pass onVideoReceiver whenever this is true - see
+        // ppplayer.mjs's encodedInsertableStreams comment.
+        this.insertableStreams = insertableStreams;
+        this.onVideoReceiver = onVideoReceiver;
         this.ws = null;
         this.pc = null;
         this.stream = null;
@@ -120,7 +130,13 @@ export class P2PPlaybackPath {
 
     async #createOffer() {
         const iceConfig = this.#iceServersConfig();
-        this.pc = new this.PeerConnectionClass(iceConfig);
+        // Keep passing `undefined` when there is neither a STUN config nor an
+        // encoded transform, so the default PeerConnection dictionary is used
+        // (and the existing "no config" contract holds).
+        const pcConfig = this.insertableStreams
+            ? { ...(iceConfig || {}), encodedInsertableStreams: true }
+            : iceConfig;
+        this.pc = new this.PeerConnectionClass(pcConfig);
         this.onSignal?.({ type: 'pc-created', iceServers: (iceConfig?.iceServers ?? []).map((s) => s.urls) });
         this.pc.addTransceiver('video', { direction: 'recvonly' });
         this.pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -140,6 +156,12 @@ export class P2PPlaybackPath {
                 }
             }
             this.onSignal?.({ type: 'track', kind: event.track?.kind, streamId: event.streams[0]?.id || null });
+            // Hand the video receiver to the caller so it can attach the
+            // encoded-streams consumer (the OBS abs-timestamp SEI reader) that
+            // insertableStreams requires - see ppplayer.mjs.
+            if (event.track?.kind === 'video' && event.receiver) {
+                this.onVideoReceiver?.(event.receiver);
+            }
             // Same as the Edge path: receivers exist only once a track lands.
             if (this.bufferMs !== null) applyPlayoutBuffer(this.pc, this.bufferMs);
             // The PeerConnection and stream now exist; hand off to the

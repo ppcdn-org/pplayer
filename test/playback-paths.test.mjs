@@ -291,6 +291,54 @@ test('P2P path reports PeerConnection failure', async () => {
     assert.match(failures[0].message, /P2P connection failed/);
 });
 
+test('P2P path enables the encoded transform and hands the video receiver to onVideoReceiver', async () => {
+    const receivers = [];
+    const path = new P2PPlaybackPath({
+        session: { sessionId: 'session-sei', signalUrl: 'wss://center.example/v1/p2p/signal', token: 'secret' },
+        WebSocketClass: FakeWebSocket,
+        PeerConnectionClass: FakePeerConnection,
+        insertableStreams: true,
+        onVideoReceiver: (receiver) => receivers.push(receiver),
+    });
+    path.start({ onNegotiated() {}, onFailed(error) { throw error; } });
+    FakeWebSocket.instance.message({ v: 1, type: 'ready' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // The encoded transform must be negotiated, otherwise the SEI reader never
+    // gets a frame to inspect (and the P2P Delay stays an estimate).
+    assert.equal(FakePeerConnection.instance.config.encodedInsertableStreams, true);
+
+    const receiver = { createEncodedStreams() {} };
+    FakePeerConnection.instance.ontrack({ track: { kind: 'video' }, receiver, streams: [{ id: 'p2p-stream' }] });
+    assert.deepEqual(receivers, [receiver]);
+
+    // Audio receivers must not trigger the SEI consumer.
+    FakePeerConnection.instance.ontrack({ track: { kind: 'audio' }, receiver: {}, streams: [{ id: 'p2p-stream' }] });
+    assert.equal(receivers.length, 1);
+    path.stop('done');
+});
+
+test('P2P path keeps the STUN config while enabling the encoded transform', async () => {
+    const path = new P2PPlaybackPath({
+        session: {
+            sessionId: 'session-sei-stun', signalUrl: 'wss://center.example/v1/p2p/signal', token: 'secret',
+            stunServers: ['stun:api.pp-cdn.org:3478'],
+        },
+        WebSocketClass: FakeWebSocket,
+        PeerConnectionClass: FakePeerConnection,
+        insertableStreams: true,
+    });
+    path.start({ onNegotiated() {}, onFailed(error) { throw error; } });
+    FakeWebSocket.instance.message({ v: 1, type: 'ready' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(FakePeerConnection.instance.config, {
+        iceServers: [{ urls: 'stun:api.pp-cdn.org:3478' }],
+        encodedInsertableStreams: true,
+    });
+    path.stop('done');
+});
+
 test('paths tolerate having no DOM (Node) and no decode-sink machinery', () => {
     assert.equal(typeof globalThis.document, 'undefined');
     const path = new EdgeWHEPPath({ url: 'https://edge.example/app/live/whep', ReaderClass: FakeReader });

@@ -8,7 +8,7 @@ import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260925-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';
 import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260925-1';
-import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260925-2';
+import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260927-1';
 import { probeNATAndSubmit } from './nat-probe.mjs?v=20260925-2';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260925-1';
@@ -192,6 +192,7 @@ function stripCodecTypeSegment(whepUrl) {
 let reader = null;
 let readerGeneration = 0;
 let seiReaderAttached = false;
+let p2pSeiReaderAttached = false;
 let controlClient = null;
 let statsInterval = null;
 // Set once a playback path is actually carrying media. In direct mode this
@@ -271,9 +272,16 @@ let lastP2PDelayMs = null;
 let lastP2PDelayAt = 0;
 let lastP2PDelaySource = null; // 'sei' | 'datachannel'
 const P2P_DELAY_STALE_MS = 5000;
-// Measured delay is a floor (rounding always trends it low, never high) -
-// pad it so displayed numbers don't read as falsely great.
-const P2P_DELAY_ERROR_MARGIN_MS = 50;
+// Fixed compensation added to every delay reading, on BOTH the P2P and the
+// Edge path (they share reportP2PDelay below, so there is no per-path
+// branch). The in-band OBS SEI timestamp is stamped after encoding and read
+// when the encoded frame reaches the receiver, so the raw subtraction stops
+// short of the true end-to-end delay: it misses the encode time already spent
+// before the stamp, and the decoder + compositor/render time after reception.
+// +100ms stands in for that overhead so the displayed "P2P Delay" reflects
+// what a viewer actually experiences. One shared constant keeps the two paths
+// directly comparable.
+const P2P_DELAY_FIXED_COMPENSATION_MS = 100;
 // Both ends of the subtraction must share a clock base: the timestamp comes
 // from ppobs's NTP-disciplined clock, so the local side has to be corrected
 // by the ppcenter offset (see time-sync.js) before subtracting. Until that
@@ -282,15 +290,17 @@ const P2P_DELAY_ERROR_MARGIN_MS = 50;
 let timeSync = null;
 // Even with calibration, a badly wrong clock (or a stale offset after
 // ppcenter has been unreachable for a while) can still produce impossible
-// values. Real p2p delay is never under ~100ms - encode, network and jitter
-// buffer alone exceed that - and never anywhere near 60s, since no WebRTC
-// jitter buffer holds minutes of media. Anything outside this band is a
-// clock artifact, not a delay, so fall back to the RTT/jitter-buffer
-// estimate rather than showing a nonsensical number. The upper bound
-// matters: without it, positive skew (e.g. the ~145s seen when ppobs
-// anchored its timestamps to a drifting monotonic clock) got printed
-// verbatim while negative skew was correctly caught.
-const P2P_DELAY_CLOCK_SUSPECT_MS = 100;
+// values. A negative reading is always a clock artifact (media cannot arrive
+// before it was sent), and anything near 60s is not a delay either since no
+// WebRTC jitter buffer holds minutes of media. Only values outside this band
+// fall back to the RTT/jitter-buffer estimate. The floor is deliberately 0,
+// not ~100ms: a direct P2P hop (same LAN/datacenter, small jitter buffer) can
+// legitimately measure well under 100ms, and the old ~100ms floor silently
+// discarded those real readings and replaced them with an estimate. The upper
+// bound matters: without it, positive skew (e.g. the ~145s seen when ppobs
+// anchored its timestamps to a drifting monotonic clock) got printed verbatim
+// while negative skew was correctly caught.
+const P2P_DELAY_MIN_PLAUSIBLE_MS = 0;
 const P2P_DELAY_MAX_PLAUSIBLE_MS = 60000;
 
 function reportP2PDelay(timestampMs, source) {
@@ -306,13 +316,13 @@ function reportP2PDelay(timestampMs, source) {
     const correctedNow = timeSync ? timeSync.now() : null;
     if (correctedNow === null) return;
 
-    lastP2PDelayMs = correctedNow - Number(timestampMs) + P2P_DELAY_ERROR_MARGIN_MS;
+    lastP2PDelayMs = correctedNow - Number(timestampMs) + P2P_DELAY_FIXED_COMPENSATION_MS;
     lastP2PDelayAt = Date.now();
     lastP2PDelaySource = source;
 
     // Only report plausible values upstream; see the bounds above. The path
     // dimension lets ppcenter compare Edge against P2P (PLY-011).
-    if (timeSync && lastP2PDelayMs >= P2P_DELAY_CLOCK_SUSPECT_MS &&
+    if (timeSync && lastP2PDelayMs >= P2P_DELAY_MIN_PLAUSIBLE_MS &&
         lastP2PDelayMs <= P2P_DELAY_MAX_PLAUSIBLE_MS) {
         timeSync.reportLatency({ path: activePlaybackPathName, delayMs: lastP2PDelayMs });
     }
@@ -770,6 +780,7 @@ function resetSessionState() {
     lastP2PDelayAt = 0;
     lastP2PDelaySource = null;
     seiReaderAttached = false;
+    p2pSeiReaderAttached = false;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
     lastStats = { videoBytes: 0, audioBytes: 0, videoPacketsLost: 0, audioPacketsLost: 0, timestamp: 0 };
@@ -1085,6 +1096,20 @@ function startP2PPlayback(decision, generation, playConfig) {
         bufferMs,
         WebSocketClass: WebSocket,
         PeerConnectionClass: RTCPeerConnection,
+        // The P2P publisher sends the same OBS abs-timestamp SEI the edge
+        // path reads, so the P2P leg can report a real end-to-end delay
+        // instead of the RTT/jitter estimate. Enabling the encoded transform
+        // requires a consumer or decode freezes, so onVideoReceiver attaches
+        // the SEI reader immediately. P2P is H264-only (PLY-009), so the
+        // reader is pinned to 'h264'.
+        insertableStreams: true,
+        onVideoReceiver: (receiver) => {
+            if (p2pSeiReaderAttached) return;
+            p2pSeiReaderAttached = attachSeiTimestampReader(receiver, (ts) => {
+                reportP2PDelay(ts, 'sei');
+            }, 'h264');
+            if (p2pSeiReaderAttached) console.log('[SEI] abs-timestamp reader attached (P2P)');
+        },
     });
     activePlaybackPath = path;
     activePlaybackPathName = 'p2p';
@@ -1607,15 +1632,24 @@ async function updateStats() {
         // server-side from the bandwidth estimate. fps/loss below are
         // reported for statistics and drive the stall watchdog only.
 
-        // RTT/jitter-buffer-based rough p2p delay estimate. Used both as
-        // the LATENCY_REPORT payload's estimated_e2e_ms and, when the
-        // SEI/DataChannel measurement looks clock-skewed (see
-        // P2P_DELAY_CLOCK_SUSPECT_MS), as the displayed P2P Delay fallback.
-        const rttMs = networkStats?.currentRoundTripTime ? networkStats.currentRoundTripTime * 1000 : 0;
+        // currentRoundTripTime is in seconds and only appears once the
+        // selected candidate pair has RTCP SR/RR samples; before that it is
+        // undefined. Keep it null rather than coercing to 0, which used to
+        // display a bogus "0.0 ms" (or "NaN ms" once toFixed ran on
+        // undefined) instead of "no sample yet".
+        const rttSeconds = networkStats?.currentRoundTripTime;
+        const rttMs = Number.isFinite(rttSeconds) ? rttSeconds * 1000 : null;
         const jitterBufferMs = videoStats?.jitterBufferDelay && videoStats?.jitterBufferEmittedCount
             ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) * 1000
             : 0;
-        const estimatedP2PDelayMs = rttMs / 2 + jitterBufferMs + 10;
+        // Fallback only. Both playback legs now read the OBS SEI (the P2P
+        // leg via insertableStreams - see startP2PPlayback), so a real
+        // measurement is preferred whenever it is fresh and plausible; this
+        // RTT/jitter estimate covers the cold-start window and browsers
+        // without encoded insertable streams, and is labelled "(est.)". It
+        // carries the same fixed compensation as a real measurement so the
+        // two are on the same scale.
+        const estimatedP2PDelayMs = (rttMs ?? 0) / 2 + jitterBufferMs + P2P_DELAY_FIXED_COMPENSATION_MS;
 
         // --- 渲染 UI ---
         let html = '';
@@ -1661,16 +1695,18 @@ async function updateStats() {
 
         if (networkStats) {
             const p2pFresh = lastP2PDelayMs !== null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS;
-            // A fresh measurement outside [SUSPECT, MAX_PLAUSIBLE] is a clock
-            // artifact rather than a real delay (see the const comments
+            // A fresh measurement outside [MIN_PLAUSIBLE, MAX_PLAUSIBLE] is a
+            // clock artifact rather than a real delay (see the const comments
             // above) - fall back to the RTT/jitter-buffer estimate instead of
-            // showing a misleadingly tiny, negative, or absurdly large number.
+            // showing a negative or absurdly large number.
             const p2pImplausible = p2pFresh &&
-                (lastP2PDelayMs < P2P_DELAY_CLOCK_SUSPECT_MS || lastP2PDelayMs > P2P_DELAY_MAX_PLAUSIBLE_MS);
-            // Never show N/A: when there is no fresh/plausible SEI or
-            // DataChannel measurement yet (or the clock has not been
-            // calibrated), the RTT + jitter-buffer estimate is still a
-            // meaningful reading and is preferred over an empty placeholder.
+                (lastP2PDelayMs < P2P_DELAY_MIN_PLAUSIBLE_MS || lastP2PDelayMs > P2P_DELAY_MAX_PLAUSIBLE_MS);
+            // The real measurement (SEI whenever encoded streams are
+            // available, otherwise the DataChannel relay) wins whenever it is
+            // fresh and plausible; the RTT + jitter-buffer estimate only
+            // covers the cold-start window / unsupported browsers and is
+            // always labelled "(est.)" so it is never mistaken for a
+            // measurement.
             const p2pLabel = !p2pFresh || p2pImplausible
                 ? `~${estimatedP2PDelayMs.toFixed(0)} ms (est.)`
                 : `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`;
@@ -1690,7 +1726,9 @@ async function updateStats() {
             // skips for latency), so it read 100kbps..20000kbps at random.
             // The real throughput is already shown per track as "Recv Bitrate".
             const netRows = {
-                'RTT': `${(networkStats.currentRoundTripTime * 1000).toFixed(1)} ms`,
+                // rttMs is null until the selected pair has RTCP samples -
+                // show that explicitly rather than 0.0/NaN.
+                'RTT': rttMs === null ? 'no sample yet' : `${rttMs.toFixed(1)} ms`,
                 'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ` (catching up ${video.playbackRate}x)` : '')
             };
             html += renderStatGroup('Network', netRows);
@@ -1704,7 +1742,7 @@ async function updateStats() {
             const fpsVal = videoStats?.framesPerSecond || 0;
 
             controlClient.sendLatencyReport({
-                rtt_ms: rttMs,
+                rtt_ms: rttMs ?? 0,
                 jitter_buffer_ms: jitterBufferMs,
                 packets_lost: loss,
                 fps: fpsVal,

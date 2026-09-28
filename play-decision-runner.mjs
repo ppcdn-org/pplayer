@@ -1,5 +1,5 @@
 import { PlaybackRaceController } from './playback-race-controller.mjs?v=20260924-8';
-import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs?v=20260925-3';
+import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs?v=20260927-1';
 
 export function getEdgeFallbackUrl(decision) {
     if (!decision?.playUrl) {
@@ -47,11 +47,24 @@ export function createPlaybackRace(decision, {
 // judged this pair traversable AND the publisher has a free slot, so playback
 // connects P2P alone; the edge URL rides along only as a sequential
 // failure fallback.
-export function createDirectP2PPlayback(decision, { WebSocketClass, PeerConnectionClass, bufferMs = null } = {}) {
+export function createDirectP2PPlayback(decision, {
+    WebSocketClass,
+    PeerConnectionClass,
+    bufferMs = null,
+    insertableStreams = false,
+    onVideoReceiver = null,
+} = {}) {
     if (decision?.mode !== 'p2p-connect' || !decision.p2p) {
         throw new Error('play decision is not a P2P decision');
     }
-    return new P2PPlaybackPath({ session: decision.p2p, WebSocketClass, PeerConnectionClass, bufferMs });
+    return new P2PPlaybackPath({
+        session: decision.p2p,
+        WebSocketClass,
+        PeerConnectionClass,
+        bufferMs,
+        insertableStreams,
+        onVideoReceiver,
+    });
 }
 
 export function startPlaybackFromDecision(decision, { startDirectStream, startP2PPlayback }) {
