@@ -319,3 +319,51 @@ test('NAT probe times out gracefully without candidates', async () => {
     assert.ok(timedOut);
     globalThis.setTimeout = orig;
 });
+
+test('gatherNatProbe returns the picked candidate without submitting anything', async () => {
+    const { gatherNatProbe } = await import('../nat-probe.mjs');
+    globalThis.RTCPeerConnection = FakeRTCPeerConnection;
+    let fetched = false;
+    globalThis.fetch = async () => { fetched = true; return { ok: true, status: 200, json: async () => ({}) }; };
+
+    const promise = gatherNatProbe('https://center.example');
+    await new Promise(r => setTimeout(r, 10));
+    FakeRTCPeerConnection.latest.gather([{ type: 'srflx', address: '203.0.113.9', port: 4242, candidate: '' }]);
+    const gathered = await promise;
+
+    assert.deepEqual(gathered, {
+        natType: 'restricted', publicIp: '203.0.113.9', publicPort: 4242, ipv4: '203.0.113.9',
+    });
+    assert.equal(fetched, false);
+});
+
+test('submitNatProbe posts a pre-gathered candidate and attaches its ipv4', async () => {
+    const { submitNatProbe } = await import('../nat-probe.mjs');
+    globalThis.fetch = mockFetch;
+
+    const result = await submitNatProbe({
+        ppcenter: 'https://center.example', appId: 'app123', txTime: 'abc', txSecret: 'sig',
+        clientId: 'viewer', streamName: 'live', kind: 'player',
+        gathered: { natType: 'restricted', publicIp: '203.0.113.9', publicPort: 4242, ipv4: '203.0.113.9' },
+    });
+
+    assert.equal(capturedURL, 'https://center.example/v1/nat/probe');
+    assert.equal(capturedBody.publicIp, '203.0.113.9');
+    assert.equal(capturedBody.publicPort, 4242);
+    assert.equal(capturedBody.kind, 'player');
+    assert.equal(capturedHeaders.Authorization, 'Bearer app123:abc:sig');
+    assert.equal(result.ipv4, '203.0.113.9');
+});
+
+test('submitNatProbe is a no-op when nothing was gathered', async () => {
+    const { submitNatProbe } = await import('../nat-probe.mjs');
+    let fetched = false;
+    globalThis.fetch = async () => { fetched = true; return { ok: true, status: 200, json: async () => ({}) }; };
+
+    const result = await submitNatProbe({
+        ppcenter: 'https://center.example', appId: 'a', clientId: 'c', gathered: null,
+    });
+
+    assert.equal(result, null);
+    assert.equal(fetched, false);
+});

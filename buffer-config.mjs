@@ -7,11 +7,12 @@
 export const MIN_BUFFER_MS = 100;
 export const MAX_BUFFER_MS = 1000;
 
-// Used when no buffer length was requested explicitly. Setting this at all
-// opts out of the browser's own continuously-adapting jitter buffer, so the
-// default is deliberately on the generous side: 200ms rides out ordinary
-// jitter while staying well under the ~500ms race window the P2P/Edge
-// controller works with.
+// Where the UI slider parks when nothing was requested explicitly. It is NOT
+// applied in that case: setting a playout buffer at all opts the browser out
+// of its own continuously-adapting jitter buffer - for every receiver,
+// audio included - so "not requested" means "let the browser adapt", not
+// "apply this number" (see main.js's bufferMs). This value only decides where
+// the slider starts if a viewer does decide to pin one.
 export const DEFAULT_BUFFER_MS = 100;
 
 // parseBufferMs reads the raw "bufferMs" query value and clamps it into the
@@ -46,9 +47,13 @@ export function bufferMsToPlayoutDelaySeconds(bufferMs) {
 // Chromium-based browsers support at least one; browsers that expose
 // neither keep their own adaptive buffer and this returns null. Returns
 // null too when pc has no receivers yet - tracks arrive asynchronously, so
-// callers apply this on the track event rather than right after connecting.
+// callers apply this on the track event rather than right after connecting -
+// and when bufferMs is null/undefined, i.e. no length was requested: that is
+// "leave the browser's adaptive buffer alone", and must not be confused with
+// clampBufferMs's floor of 100.
 export function applyPlayoutBuffer(pc, bufferMs) {
     if (!pc || typeof pc.getReceivers !== 'function') return null;
+    if (bufferMs === null || bufferMs === undefined) return null;
     const clamped = clampBufferMs(bufferMs);
     let usedStandard = false;
     let usedLegacy = false;

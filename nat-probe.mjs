@@ -39,7 +39,13 @@ function deriveStunIceServers(ppcenter) {
     return servers;
 }
 
-export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, clientId, streamName, kind }) {
+// Local half of the probe: gather ICE candidates against ppcenter's STUN and
+// pick the best one. Needs no token and sends nothing, so the caller can start
+// it as early as possible - in parallel with minting a viewer token or
+// requesting the play decision - and submit only once the token is in hand
+// (see submitNatProbe). Returns null when no usable (non-mDNS) candidate is
+// found.
+export async function gatherNatProbe(ppcenter) {
     const pc = new RTCPeerConnection({
         iceServers: deriveStunIceServers(ppcenter),
         iceTransportPolicy: 'all',
@@ -89,16 +95,33 @@ export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, cli
     // the browser cannot see (it can't tell full-cone from port-restricted),
     // so report the conservative "restricted". A real (non-mDNS) host address
     // means the machine is directly reachable.
-    const natType = chosen.type === 'srflx' ? 'restricted' : 'public';
+    return {
+        natType: chosen.type === 'srflx' ? 'restricted' : 'public',
+        publicIp: chosen.ip,
+        publicPort: chosen.port,
+        // The client's public IPv4 (empty for IPv6) so the caller can include
+        // it in its pull-stream report without re-deriving it from the
+        // candidate.
+        ipv4: /^\d{1,3}(\.\d{1,3}){3}$/.test(chosen.ip || '') ? chosen.ip : '',
+    };
+}
+
+// Remote half of the probe: report a gathered candidate to ppcenter and return
+// its probe handle. Needs the viewer token for the Authorization header, so it
+// runs after the token is available (gatherNatProbe itself does not). Returns
+// null when there was nothing usable to report or the submission failed.
+export async function submitNatProbe({ ppcenter, appId, txTime, txSecret, clientId, streamName, kind, gathered }) {
+    if (!gathered) return null;
+
     const body = {
         // kind is explicit: the viewer's probe is a "player" observation even
         // though it still carries streamName, which ppcenter needs only to
         // verify the viewer token (the token is signed over appId/streamName).
         kind: kind || (streamName ? 'publisher' : 'player'),
         clientId,
-        natType,
-        publicIp: chosen.ip,
-        publicPort: chosen.port,
+        natType: gathered.natType,
+        publicIp: gathered.publicIp,
+        publicPort: gathered.publicPort,
     };
     if (streamName) body.streamName = streamName;
     if (appId) body.appId = appId;
@@ -118,15 +141,19 @@ export async function probeNATAndSubmit({ ppcenter, appId, txTime, txSecret, cli
         });
         if (!resp.ok) return null;
         const data = await resp.json();
-        // Attach the client's public IPv4 (from the srflx candidate) so the
-        // caller can include it in its pull-stream report. Kept alongside the
-        // ppcenter response fields (probeId etc.) so existing callers are
-        // unaffected.
-        const publicIpv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(chosen.ip || '') ? chosen.ip : '';
-        return Object.assign({}, data, { ipv4: publicIpv4 });
+        // Carry the client's public IPv4 alongside the ppcenter response
+        // fields (probeId etc.) so existing callers are unaffected.
+        return Object.assign({}, data, { ipv4: gathered.ipv4 });
     } catch {
         return null;
     }
+}
+
+// Convenience wrapper preserving the original one-call shape (gather, then
+// submit). Kept for callers that don't need to overlap the two halves.
+export async function probeNATAndSubmit(opts) {
+    const gathered = await gatherNatProbe(opts.ppcenter);
+    return submitNatProbe({ ...opts, gathered });
 }
 
 // Chrome mDNS-obfuscates host candidates to "<uuid>.local" - a name the

@@ -2,18 +2,18 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260925-1';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260929-2';
 import { ABREngine } from './abr-engine.mjs?v=20260925-1';
 import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260925-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';
 import { TimeSync } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260925-1';
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
-import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260929-1';
-import { probeNATAndSubmit } from './nat-probe.mjs?v=20260925-2';
+import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260929-2';
+import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260925-1';
-import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260925-1';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260929-2';
+import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260929-2';
 import { StallWatchdog } from './stall-watchdog.mjs?v=20260925-1';
 import { LagTracker } from './lag-tracker.mjs?v=20260929-1';
 
@@ -59,17 +59,43 @@ function newClientId() {
     return globalThis.crypto?.randomUUID ? crypto.randomUUID() : `pplayer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-// Live-edge catch-up (see catchup-controller.mjs): nudges playbackRate up
-// while measured delay sits above targetMs, draining buffer that has
-// already built up rather than just limiting how fast new delay accrues.
+// Live-edge catch-up (see catchup-controller.mjs): drains delay that has
+// already built up, rather than just limiting how fast new delay accrues.
 // "catchupTargetMs" lets a deployment tune this the same way "bufferMs"
 // tunes the playout buffer.
+//
+// It only has anything to actuate when a playout buffer was explicitly pinned:
+// draining then means temporarily lowering that pinned target so the jitter
+// buffer plays out ahead. With the default (no bufferMs), the browser's own
+// adaptive jitter buffer already shrinks back down on its own, so the
+// controller is deliberately left without an actuator and reports itself
+// unavailable instead of pretending. The previous playbackRate actuator never
+// worked at all - the rate is ignored for a MediaStream-backed element.
 const catchupTargetMs = (() => {
     const raw = new URLSearchParams(window.location.search).get('catchupTargetMs');
     const parsed = raw !== null ? Number(raw) : NaN;
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_TARGET_MS;
 })();
-const catchUpController = new CatchUpController(video, { targetMs: catchupTargetMs });
+
+// How far below the pinned buffer to drop while catching up. Small enough that
+// draining stays gradual rather than forcing an audible skip, and clamped by
+// applyPlayoutBuffer to MIN_BUFFER_MS anyway.
+const CATCHUP_BUFFER_DRAIN_MS = 50;
+
+function applyCatchUpBuffer(engaged) {
+    // No pinned buffer means the browser's adaptive one is in charge and
+    // already drains excess delay - there is nothing here to lower. Returning
+    // false keeps the controller (and the on-screen label) honest about that.
+    if (bufferMs === null) return false;
+    const pc = activePlaybackPath?.pc || reader?.pc;
+    if (!pc) return false;
+    return applyPlayoutBuffer(pc, engaged ? bufferMs - CATCHUP_BUFFER_DRAIN_MS : bufferMs) !== null;
+}
+
+const catchUpController = new CatchUpController(video, {
+    targetMs: catchupTargetMs,
+    onCatchUp: applyCatchUpBuffer,
+});
 
 // Auto-recovers the "receiving bytes but decoding nothing" stall (see
 // stall-watchdog.mjs) by doing exactly what a manual Start click does -
@@ -93,13 +119,21 @@ const lagTracker = new LagTracker();
 
 // Playout buffer length: how much media the jitter buffer holds before
 // rendering, trading latency against resilience to jitter. Purely local -
-// nothing is negotiated with the server. A "bufferMs" query parameter wins
-// over the default so a deployment can pin a value without touching the UI;
-// the slider then starts from whatever is in effect and can override it live.
+// nothing is negotiated with the server. A "bufferMs" query parameter pins a
+// value without touching the UI; moving the slider overrides it live.
+//
+// null means "not requested", and is deliberately the default: pinning
+// jitterBufferTarget/playoutDelayHint opts the browser out of its own
+// continuously-adapting jitter buffer, and it does so for *every* receiver
+// including audio. The old unconditional 100ms therefore replaced Chrome's
+// adaptive buffer with a fixed one while Safari - which exposes neither API -
+// kept adapting, which is one reason the two browsers' audio stats were never
+// comparable. Let the browser adapt unless a deployment explicitly asks
+// otherwise.
 const bufferRange = document.getElementById('bufferRange');
 const bufferValue = document.getElementById('bufferValue');
 const bufferControl = document.getElementById('bufferControl');
-let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs')) ?? DEFAULT_BUFFER_MS;
+let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs'));
 
 // Normally P2P is opt-out for signed links: checked, playback asks ppcenter
 // for a direct connection and races it against the edge leg, falling back to
@@ -133,8 +167,11 @@ function preferP2P() {
 
 (() => {
     if (!bufferRange) return;
-    bufferRange.value = String(bufferMs);
-    if (bufferValue) bufferValue.textContent = `${bufferMs} ms`;
+    // With no explicit request the slider still has to sit somewhere: park it
+    // on DEFAULT_BUFFER_MS and label the value "auto", so the readout says
+    // "the browser is adapting" rather than claiming a length nothing set.
+    bufferRange.value = String(bufferMs ?? DEFAULT_BUFFER_MS);
+    if (bufferValue) bufferValue.textContent = bufferMs === null ? 'auto' : `${bufferMs} ms`;
     bufferRange.addEventListener('input', () => {
         bufferMs = Number(bufferRange.value);
         if (bufferValue) bufferValue.textContent = `${bufferMs} ms`;
@@ -150,6 +187,12 @@ function preferP2P() {
 // otherwise look like "unsupported".
 function markBufferSupport(applied) {
     if (!bufferControl) return;
+    if (bufferMs === null) {
+        bufferControl.classList.remove('unsupported');
+        bufferControl.title = "Auto: the browser's own adaptive jitter buffer is in charge. " +
+            'Move the slider (or pass ?bufferMs=) to pin a length instead.';
+        return;
+    }
     if (applied) {
         bufferControl.classList.remove('unsupported');
         bufferControl.title = `Playout buffer via ${applied}. Higher = smoother under jitter, more latency.`;
@@ -228,6 +271,30 @@ let activePlaybackPathName = 'edge'; // 'edge' | 'p2p', for latency reporting
 let playbackRace = null;
 let playRequestAbortController = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
+
+// Loss has to be read as a RATE, not as a packet count. Audio runs at ~50
+// packets/s and video at several hundred, so the two cumulative counters the
+// stats panel used to print are an order of magnitude apart before a single
+// packet is lost - which is how "audio loses far more than video" got read off
+// a panel that was really showing "audio and video have different packet
+// rates". These accumulate the per-tick deltas over the session for the
+// per-kind loss RATE reported to ppcenter on LATENCY_REPORT (audio_loss_pct/
+// video_loss_pct). The panel itself no longer prints either the raw counts or
+// the rate: neither survives being read as "audio is worse", so the row is
+// deliberately gone from the Video/Audio groups.
+let lossTotals = { videoLost: 0, videoRecv: 0, audioLost: 0, audioRecv: 0 };
+
+function resetLossTotals() {
+    lossTotals = { videoLost: 0, videoRecv: 0, audioLost: 0, audioRecv: 0 };
+}
+
+// null when nothing has been expected yet (no packet of that kind has arrived),
+// which the caller must show as "no reading" rather than as 0%.
+function lossRatePct(lost, received) {
+    const expected = lost + received;
+    if (expected <= 0) return null;
+    return (lost / expected) * 100;
+}
 let previousTrackType = null; // Track if we were in audio-only mode
 let firstFrameDecoded = false; // Set when fps>0 is first seen; only then does the stall watchdog start monitoring
 let lastVideoTrackId = null;
@@ -816,15 +883,29 @@ function updatePlaybackCodecStatus(codecType) {
     console.log(`[Main] Playback codec: ${codecType}`);
 }
 
+// Codec detection (codec-capability.mjs) is local and cached for the page
+// lifetime, but it is still async (mediaCapabilities.decodingInfo). Kick it
+// off as soon as startStream can - before the token mint / NAT probe / play
+// decision round trips - so it overlaps them instead of being one more serial
+// step between the play decision and the WHEP handshake. A failed detection
+// resolves to h264, the same conservative default selectPlaybackCodec uses.
+let playbackCodecPromise = null;
+function ensurePlaybackCodec() {
+    if (!playbackCodecPromise) {
+        playbackCodecPromise = Promise.resolve()
+            .then(selectPlaybackCodec)
+            .catch((e) => {
+                console.warn('[Main] Codec capability detection failed, defaulting to h264:', e && e.message);
+                return 'h264';
+            });
+    }
+    return playbackCodecPromise;
+}
+
 // Picks the codec from local decode capability (codec-capability.mjs) and
 // returns the full WHEP URL for the edge stream base.
 async function resolveEdgeWhepUrl(edgeStreamUrl) {
-    let codecType = 'h264';
-    try {
-        codecType = await selectPlaybackCodec();
-    } catch (e) {
-        console.warn('[Main] Codec capability detection failed, defaulting to h264:', e && e.message);
-    }
+    const codecType = await ensurePlaybackCodec();
     return { url: buildEdgeWhepUrl(edgeStreamUrl, codecType), codecType };
 }
 
@@ -941,7 +1022,13 @@ function resetSessionState() {
     p2pSeiReaderAttached = false;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
-    lastStats = { videoBytes: 0, audioBytes: 0, videoPacketsLost: 0, audioPacketsLost: 0, timestamp: 0 };
+    lastStats = {
+        videoBytes: 0, audioBytes: 0,
+        videoPacketsLost: 0, audioPacketsLost: 0,
+        videoPacketsReceived: 0, audioPacketsReceived: 0,
+        timestamp: 0,
+    };
+    resetLossTotals();
     catchUpController.reset();
     stallWatchdog.reset();
     lagTracker.reset();
@@ -993,6 +1080,9 @@ async function startStream() {
     const ppcenter = (params.get('ppcenter') || '').trim() || DEFAULT_PPCENTER;
 
     resetSessionState();
+    // Local and cached: start it now so it runs in parallel with the token /
+    // probe / decision round trips below (see ensurePlaybackCodec).
+    ensurePlaybackCodec();
     if (playConfig) {
         startTimeSync(playConfig.ppcenter);
         await startFromPpcenter(playConfig, generation);
@@ -1010,6 +1100,11 @@ async function startStream() {
     const appId = (params.get('appId') || '').trim() || DEFAULT_APP_ID;
     const streamName = (params.get('streamName') || '').trim() || DEFAULT_STREAM_NAME;
     console.log(`[Main] no playback params; defaulting to ${appId}/${streamName} @ ${ppcenter}`);
+    // The STUN half of the NAT probe needs no token - only its ppcenter
+    // submission does (see submitNatProbe) - so start it before the token
+    // round trip and overlap the two instead of paying them back to back.
+    const natProbeStartedAt = performance.now();
+    const natGatherPromise = preferP2P() ? gatherNatProbe(ppcenter) : null;
     try {
         const { txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName);
         if (generation !== readerGeneration) return;
@@ -1017,7 +1112,7 @@ async function startStream() {
         await startFromPpcenter({
             ppcenter, appId, streamName, txTime, txSecret,
             clientId: newClientId(), requestRegion: '', natProbeId: '',
-        }, generation);
+        }, generation, { natGatherPromise, natProbeStartedAt });
     } catch (error) {
         console.warn('[Main] default playback failed:', error);
         showLinkNotice(`could not start the default stream (${error.message}); open with ?url= or a signed link`);
@@ -1057,13 +1152,17 @@ function startTimeSync(ppcenter) {
 // finished. The probe is capped here at NAT_PROBE_GRACE_MS instead: if it
 // hasn't resolved by then, the play request goes out with whatever
 // natProbeId is (or isn't) available, and the probe keeps running
-// unawaited - probeNATAndSubmit posts its result to ppcenter itself, so a
+// unawaited - submitNatProbe posts its result to ppcenter itself, so a
 // late resolution still lands in ppcenter's observation store for a future
 // attempt (a retry, or the next stream switch), it is just too late to help
 // this one. See docs/test/ppcdn-debug-log.md's 2026-09-22 entry.
+//
+// Note the probe is gather (token-free, local) + submit (needs the token): the
+// gather half can therefore be started before the viewer token is even minted,
+// which the bare-page path does to overlap the two - see startStream.
 const NAT_PROBE_GRACE_MS = 800;
 
-async function startFromPpcenter(playConfig, generation) {
+async function startFromPpcenter(playConfig, generation, { natGatherPromise = null, natProbeStartedAt = 0 } = {}) {
     playOutcomeReported = false; // one connection report per play
     playOutcomeCondition = null;
     // Pull-stream measures: costTime is from here to the first decoded frame.
@@ -1088,8 +1187,15 @@ async function startFromPpcenter(playConfig, generation) {
         // eligibility as an identity mismatch). streamName is still sent
         // because the viewer token is signed over appId/streamName and
         // ppcenter verifies it from this field.
-        const probeStartedAt = performance.now();
-        const probePromise = probeNATAndSubmit({
+        //
+        // Gather and submit are split so the (token-free) gather can already
+        // be running by the time this function is entered - the bare-page
+        // path starts it before minting the viewer token (see startStream).
+        // natGatherPromise is that pre-started gather, if any; otherwise the
+        // gather starts here.
+        const probeStartedAt = natProbeStartedAt || performance.now();
+        const gather = natGatherPromise || gatherNatProbe(playConfig.ppcenter);
+        const probePromise = gather.then((gathered) => submitNatProbe({
             ppcenter: playConfig.ppcenter,
             appId: playConfig.appId,
             txTime: playConfig.txTime,
@@ -1097,7 +1203,8 @@ async function startFromPpcenter(playConfig, generation) {
             clientId: playConfig.clientId,
             streamName: playConfig.streamName,
             kind: 'player',
-        }).then((probe) => {
+            gathered,
+        })).then((probe) => {
             // Keep the probe's public IPv4 for the pull-stream report.
             if (probe?.ipv4) playReportIpv4 = probe.ipv4;
             return probe?.probeId || null;
@@ -1733,21 +1840,36 @@ async function updateStats() {
         let fps = 0;
         let currentPacketLoss = 0;
 
+        let videoLoss = 0;
+        let audioLoss = 0;
+
         if (videoStats) {
             videoKbps = ((videoStats.bytesReceived - lastStats.videoBytes) * 8 / deltaTime / 1000);
             fps = videoStats.framesPerSecond || 0;
             const vLoss = (videoStats.packetsLost || 0) - (lastStats.videoPacketsLost || 0);
-            if (vLoss > 0) currentPacketLoss += vLoss;
+            const vRecv = (videoStats.packetsReceived || 0) - (lastStats.videoPacketsReceived || 0);
+            // packetsLost can go backwards (a retransmit filling a gap the
+            // browser had already counted), and both counters reset on the
+            // internal WHEP reconnect - clamp instead of feeding a negative
+            // delta into the totals.
+            if (vLoss > 0) { videoLoss = vLoss; currentPacketLoss += vLoss; }
+            if (vRecv > 0) lossTotals.videoRecv += vRecv;
+            lossTotals.videoLost += videoLoss;
             lastStats.videoBytes = videoStats.bytesReceived;
             lastStats.videoPacketsLost = videoStats.packetsLost || 0;
+            lastStats.videoPacketsReceived = videoStats.packetsReceived || 0;
         }
 
         if (audioStats) {
             audioKbps = ((audioStats.bytesReceived - lastStats.audioBytes) * 8 / deltaTime / 1000);
             const aLoss = (audioStats.packetsLost || 0) - (lastStats.audioPacketsLost || 0);
-            if (aLoss > 0) currentPacketLoss += aLoss;
+            const aRecv = (audioStats.packetsReceived || 0) - (lastStats.audioPacketsReceived || 0);
+            if (aLoss > 0) { audioLoss = aLoss; currentPacketLoss += aLoss; }
+            if (aRecv > 0) lossTotals.audioRecv += aRecv;
+            lossTotals.audioLost += audioLoss;
             lastStats.audioBytes = audioStats.bytesReceived;
             lastStats.audioPacketsLost = audioStats.packetsLost || 0;
+            lastStats.audioPacketsReceived = audioStats.packetsReceived || 0;
         }
 
         lastStats.timestamp = now;
@@ -1835,8 +1957,7 @@ async function updateStats() {
                 'Codec': vCodec, // [显示]
                 'Resolution': `${displayW}x${displayH}`,
                 'Recv Bitrate': `${videoKbps.toFixed(0)} kbps`,
-                'FPS': fps.toFixed(1),
-                'Packet Loss': `${videoStats.packetsLost} pkts`
+                'FPS': fps.toFixed(1)
             });
         }
 
@@ -1848,7 +1969,6 @@ async function updateStats() {
             html += renderStatGroup('Audio', {
                 'Codec': aCodec, // [显示]
                 'Recv Bitrate': `${audioKbps.toFixed(0)} kbps`,
-                'Packet Loss': `${audioStats.packetsLost} pkts`,
                 'Jitter': `${(audioStats.jitter * 1000).toFixed(1)} ms`
             });
         }
@@ -1890,7 +2010,7 @@ async function updateStats() {
                 // "0.0 ms" (which reads as "broken"), and "—" only when no
                 // pair has produced a positive sample at all.
                 'RTT': rttMs === null ? '—' : (rttMs < 1 ? '<1 ms' : `${rttMs.toFixed(1)} ms`),
-                'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ` (catching up ${video.playbackRate}x)` : '')
+                'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ' (catching up)' : '')
             };
             html += renderStatGroup('Network', netRows);
         }
@@ -1905,7 +2025,16 @@ async function updateStats() {
             controlClient.sendLatencyReport({
                 rtt_ms: rttMs ?? 0,
                 jitter_buffer_ms: jitterBufferMs,
+                // packets_lost stays the audio+video sum for wire compat; the
+                // split is what is actually diagnostic. Audio is forwarded as
+                // raw RTP end-to-end while video is re-packetized (and NACK-
+                // repaired) on every hop, so the two numbers answer different
+                // questions - summing them hides which leg is lossy.
                 packets_lost: loss,
+                audio_packets_lost: audioLoss,
+                video_packets_lost: videoLoss,
+                audio_loss_pct: lossRatePct(lossTotals.audioLost, lossTotals.audioRecv) ?? 0,
+                video_loss_pct: lossRatePct(lossTotals.videoLost, lossTotals.videoRecv) ?? 0,
                 fps: fpsVal,
                 estimated_e2e_ms: estimatedP2PDelayMs
             });
@@ -1919,9 +2048,7 @@ async function updateStats() {
 function renderStatGroup(title, data) {
     let rows = '';
     for (const [key, value] of Object.entries(data)) {
-        let valClass = '';
-        if (key === 'Packet Loss' && parseInt(value) > 0) valClass = 'warn';
-        rows += `<div class="stat-row"><span class="stat-key">${key}:</span><span class="stat-val ${valClass}">${value}</span></div>`;
+        rows += `<div class="stat-row"><span class="stat-key">${key}:</span><span class="stat-val">${value}</span></div>`;
     }
     return `<div class="stat-group"><div class="stat-title">${title}</div>${rows}</div>`;
 }

@@ -1,17 +1,25 @@
-// Live-edge catch-up: speeds video.playbackRate up slightly whenever the
-// measured end-to-end delay (see main.js's lastP2PDelayMs/reportP2PDelay)
-// sits above a target, and returns to normal speed once it drains back
-// down. This is what actually pulls accumulated delay back down after a
-// network hiccup or a slow start - lowering SRTLatency/DEFAULT_BUFFER_MS
-// (see ppmmx's conf.go and buffer-config.mjs) only shrinks how much delay
-// gets added going forward, it does nothing about delay that has already
-// built up in a buffer.
+// Live-edge catch-up: decides when the measured end-to-end delay (see
+// main.js's lastP2PDelayMs/reportP2PDelay) has drifted far enough above a
+// target that the player should actively drain it, rather than only shrinking
+// how much delay gets added going forward (which is all lowering SRTLatency or
+// the playout buffer does).
 //
-// Deliberately playbackRate, not seeking or dropping frames: a small rate
-// bump (1.03-1.08x) is inaudible on the pitch-corrected audio track modern
-// browsers already apply by default (HTMLMediaElement.preservesPitch), and
-// it drains the buffer smoothly over several seconds instead of a visible
-// jump/stutter.
+// This used to actuate through video.playbackRate, which does not work: the
+// element's source is a MediaStream, and for a MediaStream the rate is
+// ignored. Measured in Chromium - assigning 2.0 leaves playbackRate reading
+// back as 1, and currentTime keeps advancing at exactly wall clock - so every
+// "catching up 1.05x" this reported was cosmetic and no delay was ever
+// drained. Seeking and frame-dropping are equally unavailable for the same
+// reason: a live MediaStream has no seekable timeline to move within.
+//
+// The one lever a browser does expose is the jitter buffer's target delay
+// (jitterBufferTarget / playoutDelayHint), so the controller no longer
+// actuates anything itself: it decides, and the caller supplies an `onCatchUp`
+// actuator that lowers the pinned playout buffer while catch-up is engaged and
+// restores it afterwards. With no actuator - which is the default, because a
+// browser left on its own adaptive jitter buffer already drains excess delay
+// by itself (see buffer-config.mjs) - the controller reports itself
+// unavailable instead of claiming to be catching up.
 
 // Hysteresis band: only speed up once delay exceeds target+HIGH, only
 // return to 1.0x once it drops back under target+LOW. The gap between the
@@ -20,8 +28,6 @@
 export const DEFAULT_TARGET_MS = 500;
 const HIGH_MARGIN_MS = 150; // engage catch-up above target+150ms
 const LOW_MARGIN_MS = 50; // disengage below target+50ms
-const CATCHUP_RATE = 1.05;
-const NORMAL_RATE = 1.0;
 
 // A delay reading over this far above target would need several minutes of
 // 1.05x to drain - almost certainly a stale/misdetected value (e.g. right
@@ -31,9 +37,16 @@ const NORMAL_RATE = 1.0;
 const MAX_CHASEABLE_EXCESS_MS = 5000;
 
 export class CatchUpController {
-    constructor(video, { targetMs = DEFAULT_TARGET_MS } = {}) {
+    // onCatchUp(engaged) is the actuator: called only when the decision
+    // changes, with true to start draining and false to stop. It must return
+    // true from an engage call when it actually did something; anything else
+    // means "nothing to drain right now" and leaves the controller
+    // disengaged. Leave it unset and the controller is inert - see the module
+    // comment for why that is the right default.
+    constructor(video, { targetMs = DEFAULT_TARGET_MS, onCatchUp = null } = {}) {
         this.video = video;
         this.targetMs = targetMs;
+        this.onCatchUp = onCatchUp;
         this.catchingUp = false;
         this.enabled = true;
     }
@@ -44,7 +57,7 @@ export class CatchUpController {
 
     setEnabled(enabled) {
         this.enabled = enabled;
-        if (!enabled) this._setRate(NORMAL_RATE);
+        if (!enabled) this._setCatchUp(false);
     }
 
     // Called once a second from main.js's updateStats() with the same
@@ -60,34 +73,44 @@ export class CatchUpController {
         // here doesn't help and fights whatever recovery it's doing on its
         // own once it resumes.
         if (this.video.paused || this.video.seeking || this.video.readyState < 2) {
-            this._setRate(NORMAL_RATE);
+            this._setCatchUp(false);
             return;
         }
 
         const excess = delayMs - this.targetMs;
 
         if (excess > MAX_CHASEABLE_EXCESS_MS) {
-            this._setRate(NORMAL_RATE);
+            this._setCatchUp(false);
             return;
         }
 
         if (!this.catchingUp && excess > HIGH_MARGIN_MS) {
-            this._setRate(CATCHUP_RATE);
+            this._setCatchUp(true);
         } else if (this.catchingUp && excess < LOW_MARGIN_MS) {
-            this._setRate(NORMAL_RATE);
+            this._setCatchUp(false);
         }
     }
 
-    // Called on stopStream()/new session so a leftover 1.05x doesn't carry
-    // into the next play click before the first update() tick corrects it.
+    // Called on stopStream()/new session so a leftover engaged state doesn't
+    // carry into the next play click before the first update() tick corrects it.
     reset() {
-        this._setRate(NORMAL_RATE);
+        this._setCatchUp(false);
     }
 
-    _setRate(rate) {
-        if (this.video.playbackRate !== rate) {
-            this.video.playbackRate = rate;
+    _setCatchUp(engaged) {
+        if (this.catchingUp === engaged) return;
+
+        if (engaged) {
+            // Engage only once the actuator confirms it did something. An
+            // absent or declining actuator must leave catchingUp false:
+            // reporting a state with no effect behind it is exactly what the
+            // playbackRate version did for its whole life.
+            if (!this.onCatchUp || this.onCatchUp(true) !== true) return;
+            this.catchingUp = true;
+            return;
         }
-        this.catchingUp = rate !== NORMAL_RATE;
+
+        this.catchingUp = false;
+        if (this.onCatchUp) this.onCatchUp(false);
     }
 }

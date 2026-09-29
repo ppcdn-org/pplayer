@@ -259,6 +259,14 @@ class MMXControlClient {
                 rtt_ms: stats.rtt_ms || 0,
                 jitter_buffer_ms: stats.jitter_buffer_ms || 0,
                 packets_lost: stats.packets_lost || 0,
+                // Per-kind split (see main.js's updateStats): audio is
+                // forwarded as raw RTP end-to-end and has no NACK repair,
+                // video is re-packetized and repaired on every hop, so only
+                // the split tells upstream loss apart from last-hop loss.
+                audio_packets_lost: stats.audio_packets_lost || 0,
+                video_packets_lost: stats.video_packets_lost || 0,
+                audio_loss_pct: stats.audio_loss_pct || 0,
+                video_loss_pct: stats.video_loss_pct || 0,
                 fps: stats.fps || 0,
                 estimated_e2e_ms: stats.estimated_e2e_ms || 0
             }

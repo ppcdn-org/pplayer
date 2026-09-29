@@ -68,6 +68,17 @@ test('applyPlayoutBuffer sets every receiver, not just the first', () => {
     assert.equal(audio.jitterBufferTarget, 300);
 });
 
+test('applyPlayoutBuffer leaves the browser alone when no length was requested', () => {
+    // "not requested" must not collapse into clampBufferMs's 100ms floor:
+    // pinning a target opts every receiver, audio included, out of the
+    // browser's own adaptive jitter buffer, so null has to stay a no-op.
+    const receiver = { jitterBufferTarget: null, playoutDelayHint: null };
+    assert.equal(applyPlayoutBuffer(fakePc([receiver]), null), null);
+    assert.equal(applyPlayoutBuffer(fakePc([receiver]), undefined), null);
+    assert.equal(receiver.jitterBufferTarget, null);
+    assert.equal(receiver.playoutDelayHint, null);
+});
+
 test('applyPlayoutBuffer clamps before assigning, so the receiver never sees an out-of-range value', () => {
     const receiver = { jitterBufferTarget: null };
     applyPlayoutBuffer(fakePc([receiver]), 99999);
