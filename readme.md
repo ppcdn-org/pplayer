@@ -311,10 +311,10 @@ offset = ((T2 - T1) + (T3 - T4)) / 2   ≈ ppcenter 时钟 - 本地时钟
 
 ### 6.2 集成方式
 
-ppcenter 地址与 WHEP URL 一样由手工输入，默认 `http://127.0.0.1:18000`。也支持 URL 参数：
+ppcenter 地址来自签名链接的 `?ppcenter=` 参数，缺省时用内置默认值 `http://127.0.0.1:18000`。页面上不再有手工输入框：
 
 ```
-index.html?url=<WHEP URL>&ppcenter=http://10.0.0.5:18000
+index.html?ppcenter=http://10.0.0.5:18000&appId=...&streamName=...&txTime=...&txSecret=...
 ```
 
 代码中的用法：
@@ -389,18 +389,14 @@ const codecType = await selectPlaybackCodec(); // "hevc" | "h264"
 
 ### 7.3 main.js 的接入方式
 
-`main.js` 在 `startStream()` 里，于建立 WHEP 连接**之前**完成 codec 选择，并把 codecType 作为 URL path segment 插入到 WHEP URL 中（插入位置固定在 `whep` 段之前，与设计文档 §3.1 一致）：
+`main.js` 在建立 WHEP 连接**之前**完成 codec 选择，并把 codecType 作为 URL path segment 拼到 ppcenter 决策返回的 `edgeStreamUrl`（裸流地址基址）之后（codec 段固定在 `whep` 段之前，与设计文档 §3.1 一致）：
 
 ```
-http://edge:8889/{appId}/{stream}/whep          →  .../{stream}/hevc/whep   (检测到支持 HEVC)
-http://edge:8889/{appId}/{stream}/whep          →  .../{stream}/h264/whep  (不支持，或未加载 codec-capability.js)
+https://edge-1.edge.pp-cdn.org/{appId}/{stream}  →  .../{stream}/hevc/whep   (检测到支持 HEVC)
+https://edge-1.edge.pp-cdn.org/{appId}/{stream}  →  .../{stream}/h264/whep  (不支持，或未加载 codec-capability.js)
 ```
 
-若输入的 WHEP URL 本身已经带有 `/h264/whep` 或 `/hevc/whep`，则视为显式指定，跳过浏览器能力检测直接使用。也可以通过 URL 查询参数强制指定（等价于手工在 WHEP URL 里写死 codec 段）：
-
-```
-index.html?url=<WHEP URL>&codecType=hevc
-```
+`edgeStreamUrl` 不含 codec 段、不含 `/whep`，但带 `txTime`/`txSecret` 签名（对裸路径签名，两种 codec 通用，追加 codec 段时 query 原样保留）；codec 完全由本机解码能力决定，页面不再接受手工填写 WHEP URL 或 `codecType`。Edge 开启 `webrtcPlaybackAuthEnable` 后会强制校验该签名。
 
 ### 7.4 协商失败降级
 
@@ -505,11 +501,11 @@ NAT 穿透在公网上没有成功保证——对称型 NAT、运营商级 CGNAT
 index.html?ppcenter=http://center:18000&appId=xxx&streamName=live/s1&txTime=<hex>&txSecret=<hmac>
 ```
 
-流程：播放器先做 NAT 探测并上报，再向 ppcenter `POST /v1/play/requests` 请求决策；ppcenter 返回 `edge-only`（只给 WHEP URL）或 `p2p-connect`（额外给 P2P 会话参数）。是否走 P2P 完全由服务端判定。
+流程：播放器先做 NAT 探测并上报，再向 ppcenter `POST /v1/play/requests` 请求决策；ppcenter 返回 `p2pAvailable`（P2P 资源是否可用）和 `edgeStreamUrl`（Edge 裸流地址基址）。`p2pAvailable` 为 true 时走 P2P connect；否则用 `edgeStreamUrl` 拼 WHEP 地址——本机支持 HEVC 追加 `/hevc/whep`，否则追加 `/h264/whep`。
 
-**分享链接**：上面这个带齐五参数的 URL 就是一条可分享的签名播放链接，打开即自动起播（无需再点 Start）。若五参数只给了一部分，页面会在统计区给出明确报错并列出缺失的参数（不会静默退回直连）。
+**分享链接**：上面这个带齐五参数的 URL 就是一条可分享的签名播放链接，打开即自动起播（无需再点 Start）。若五参数只给了一部分，页面会在统计区给出明确报错并列出缺失的参数；五个都不给时页面无法播放（没有手工输入 URL 的直接播放模式）。
 
-**不带这些参数时**，播放器直接使用输入框里的 WHEP URL，整套 P2P 代码不会执行——这是只做边缘播放的集成方式。`txTime`/`txSecret` 由 `appSecret` 派生（`POST /auth/generate`，需 appId+appSecret），**不要**把 appSecret 放进播放页或链接。
+`txTime`/`txSecret` 由 `appSecret` 派生（`POST /auth/generate`，需 appId+appSecret），**不要**把 appSecret 放进播放页或链接。
 
 ### 10.3 单独使用竞速控制器
 

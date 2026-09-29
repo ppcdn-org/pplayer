@@ -1,11 +1,11 @@
 import { PlaybackRaceController } from './playback-race-controller.mjs?v=20260924-8';
 import { EdgeWHEPPath, P2PPlaybackPath } from './playback-paths.mjs?v=20260927-1';
 
-export function getEdgeFallbackUrl(decision) {
-    if (!decision?.playUrl) {
-        throw new Error('play decision does not include a playUrl');
+export function getEdgeStreamUrl(decision) {
+    if (!decision?.edgeStreamUrl) {
+        throw new Error('play decision does not include an edgeStreamUrl');
     }
-    return decision.playUrl;
+    return decision.edgeStreamUrl;
 }
 
 export function createPlaybackRace(decision, {
@@ -29,7 +29,7 @@ export function createPlaybackRace(decision, {
     // switches to after verifying it decodes (see PlaybackRaceController). The
     // decision's raceWindowMs/connectTimeoutMs described the old symmetric race
     // and no longer apply - the controller uses its own edge-primary timings.
-    const edgePath = new EdgeWHEPPath({ url: getEdgeFallbackUrl(decision), ReaderClass, bufferMs });
+    const edgePath = new EdgeWHEPPath({ url: getEdgeStreamUrl(decision), ReaderClass, bufferMs });
     const p2pPath = new P2PPlaybackPath({ session: decision.p2p, WebSocketClass, PeerConnectionClass, bufferMs });
     const controller = new ControllerClass({
         edgePath,
@@ -68,15 +68,20 @@ export function createDirectP2PPlayback(decision, {
 }
 
 export function startPlaybackFromDecision(decision, { startDirectStream, startP2PPlayback }) {
-    if (decision?.mode === 'p2p-connect') {
+    // p2pAvailable is ppcenter's explicit "a P2P leg can actually be served
+    // right now" flag (traversable pair AND a publisher slot reserved). Trust
+    // it over mode: an older ppcenter omits it (undefined), which keeps the
+    // previous mode-only behaviour; an explicit false means skip the P2P
+    // handshake window and go straight to edge.
+    if (decision?.mode === 'p2p-connect' && decision.p2pAvailable !== false) {
         if (!startP2PPlayback) {
             throw new Error('p2p-connect decision requires startP2PPlayback');
         }
         startP2PPlayback(decision);
         return 'p2p-connect';
     }
-    if (decision?.mode === 'edge-only') {
-        startDirectStream(getEdgeFallbackUrl(decision));
+    if (decision?.mode === 'edge-only' || decision?.p2pAvailable === false) {
+        startDirectStream(getEdgeStreamUrl(decision));
         return 'edge-only';
     }
     throw new Error('unsupported play decision mode');

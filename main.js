@@ -6,25 +6,21 @@ import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } fro
 import { ABREngine } from './abr-engine.mjs?v=20260925-1';
 import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260925-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';
-import { TimeSync, DEFAULT_PPCENTER_URL } from './time-sync.mjs?v=20260925-1';
+import { TimeSync } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260925-1';
-import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260927-1';
+import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
+import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260929-1';
 import { probeNATAndSubmit } from './nat-probe.mjs?v=20260925-2';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260925-1';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260925-1';
 import { StallWatchdog } from './stall-watchdog.mjs?v=20260925-1';
+import { LagTracker } from './lag-tracker.mjs?v=20260929-1';
 
-const urlInput = document.getElementById('webrtc') || document.getElementById('urlInput');
 const video = document.getElementById('player-container-id') || document.getElementById('video');
 const statsContainer = document.querySelector('#local-video .stat ul') || document.getElementById('stats');
 const layerSelect = document.getElementById('quality-select') || document.getElementById('layerSelect');
 const wsStatusDot = document.getElementById('wsStatus');
-// ppcenter base URL, entered by hand like the WHEP URL. Used only for clock
-// calibration (see time-sync.js); playback works without it, just without a
-// trustworthy P2P Delay reading.
-const PPCENTER_DEFAULT_URL = 'http://127.0.0.1:18000';
-const ppcenterInput = document.getElementById('ppcenterInput');
 (() => {
     if (!wsStatusDot) {
         const dot = document.createElement('span');
@@ -32,19 +28,35 @@ const ppcenterInput = document.getElementById('ppcenterInput');
         dot.style.cssText = 'position:fixed;top:10px;right:10px;width:12px;height:12px;border-radius:50%;z-index:9999';
         document.body.appendChild(dot);
     }
-    if (!urlInput) {
-        const inp = document.createElement('input');
-        inp.id = 'webrtc';
-        inp.type = 'text';
-        inp.value = 'http://localhost:8889/live/table1-fwv/whep';
-        inp.style.display = 'none';
-        document.body.appendChild(inp);
-    }
 })();
 
-function ppcenterUrl() {
-    const v = ppcenterInput && ppcenterInput.value ? ppcenterInput.value.trim() : '';
-    return v || PPCENTER_DEFAULT_URL;
+// Defaults for the "opened with no parameters" case - the console homepage's
+// "open demo" button links to the bare page (HomePage.tsx). These match the old
+// pre-filled demo URL, so opening the player with nothing in the query still
+// plays the demo stream. Overridable with ?ppcenter=&appId=&streamName=.
+const DEFAULT_PPCENTER = 'https://api.pp-cdn.org';
+const DEFAULT_APP_ID = 'appbd4cd2aa7be8';
+const DEFAULT_STREAM_NAME = 'B01-frontView';
+
+// Mints a short-lived viewer token from appId+streamName via ppcenter's open
+// POST /v1/play/link (no appSecret in the browser), so a bare/`?appId=` page
+// can go through the normal ppcenter -> P2P/edge flow.
+async function mintViewerToken(ppcenter, appId, streamName) {
+    const resp = await fetch(new URL('/v1/play/link', ppcenter).toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appId, streamName }),
+    });
+    let body = null;
+    try { body = await resp.json(); } catch { /* handled below */ }
+    if (!resp.ok || !body?.txTime || !body?.txSecret) {
+        throw new Error(body?.message || `token request failed (status ${resp.status})`);
+    }
+    return { txTime: body.txTime, txSecret: body.txSecret };
+}
+
+function newClientId() {
+    return globalThis.crypto?.randomUUID ? crypto.randomUUID() : `pplayer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 // Live-edge catch-up (see catchup-controller.mjs): nudges playbackRate up
@@ -73,6 +85,11 @@ const stallWatchdog = new StallWatchdog({
         startStream();
     }
 });
+
+// Rebuffering (卡顿) accounting for the pull stats. A pause longer than the
+// threshold counts as one lag event; the totals ride along on the viewer
+// session (start/heartbeat/stop) so ppcenter can derive a rebuffering rate.
+const lagTracker = new LagTracker();
 
 // Playout buffer length: how much media the jitter buffer holds before
 // rendering, trading latency against resilience to jitter. Purely local -
@@ -191,7 +208,15 @@ function stripCodecTypeSegment(whepUrl) {
 
 let reader = null;
 let readerGeneration = 0;
-let seiReaderAttached = false;
+// The RTCRtpReceiver the Edge SEI reader is currently attached to, not a
+// boolean. MediaMTXWebRTCReader reconnects a failed WHEP session internally
+// (new PeerConnection, new receiver) without going through startStream, so a
+// plain "already attached" flag would stay true across that retry and the new
+// receiver - whose PeerConnection also sets encodedInsertableStreams - would
+// never get a consumer. Every encoded frame would then be held at the transform
+// insertion point forever (received/assembled, framesDecoded 0, black/2x2
+// video) exactly when a first WHEP attempt fails and the retry succeeds.
+let seiReaderReceiver = null;
 let p2pSeiReaderAttached = false;
 let controlClient = null;
 let statsInterval = null;
@@ -278,10 +303,10 @@ const P2P_DELAY_STALE_MS = 5000;
 // when the encoded frame reaches the receiver, so the raw subtraction stops
 // short of the true end-to-end delay: it misses the encode time already spent
 // before the stamp, and the decoder + compositor/render time after reception.
-// +100ms stands in for that overhead so the displayed "P2P Delay" reflects
+// +50ms stands in for that overhead so the displayed "P2P Delay" reflects
 // what a viewer actually experiences. One shared constant keeps the two paths
 // directly comparable.
-const P2P_DELAY_FIXED_COMPENSATION_MS = 100;
+const P2P_DELAY_FIXED_COMPENSATION_MS = 50;
 // Both ends of the subtraction must share a clock base: the timestamp comes
 // from ppobs's NTP-disciplined clock, so the local side has to be corrected
 // by the ppcenter offset (see time-sync.js) before subtracting. Until that
@@ -388,7 +413,111 @@ function reportPlayOutcome(playConfig, path, { isOK = true, reason = '' } = {}) 
     } catch {
         // Malformed ppcenter URL etc. - reporting is best-effort.
     }
+    // A successful outcome means playback started: open the viewer session so
+    // the console can list it as online (see startPlaySession). Pass the same
+    // video-load time the outcome reports.
+    if (isOK) startPlaySession(playConfig, path, costTime);
 }
+
+// ── Viewer session tracking (console "online pull" list) ──────────────────
+// A session opens once playback actually starts (same moment the success
+// outcome is reported), is kept alive by a ~20s heartbeat, and closes on
+// teardown or page unload. ppcenter lists sessions whose last heartbeat is
+// still fresh, so a viewer that vanishes without a stop report ages out.
+let playSessionId = null;
+let playSessionHeartbeatTimer = null;
+// When the current session opened (ms). P2P delay is only reported once
+// playback has settled (see startPlaySession's heartbeat).
+let playSessionStartedAt = 0;
+
+function playSessionAuthFields(playConfig) {
+    return {
+        appId: playConfig.appId,
+        streamName: playConfig.streamName,
+        txTime: playConfig.txTime,
+        txSecret: playConfig.txSecret,
+    };
+}
+
+function postPlaySession(path, body, { beacon = false } = {}) {
+    if (!activePlayConfig) return;
+    const url = new URL(path, activePlayConfig.ppcenter).toString();
+    const payload = JSON.stringify(body);
+    if (beacon && typeof navigator !== 'undefined' && navigator.sendBeacon) {
+        // text/plain is CORS-safelisted, so the unload beacon is not
+        // preflighted; ppcenter parses the body as JSON regardless of type.
+        navigator.sendBeacon(url, new Blob([payload], { type: 'text/plain' }));
+        return;
+    }
+    try {
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            keepalive: true,
+            body: payload,
+        }).catch(() => {});
+    } catch { /* best-effort */ }
+}
+
+function startPlaySession(playConfig, path, costTimeMs = 0) {
+    if (!playConfig || playSessionId) return;
+    playSessionId = globalThis.crypto?.randomUUID
+        ? crypto.randomUUID()
+        : `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    postPlaySession('/v1/play/session/start', {
+        sessionId: playSessionId,
+        ...playSessionAuthFields(playConfig),
+        path,
+        ipv4: playReportIpv4 || undefined,
+        qualityLevel: currentQualityLevel(),
+        costTime: costTimeMs > 0 ? costTimeMs : undefined,
+    });
+    playSessionStartedAt = Date.now();
+    if (playSessionHeartbeatTimer) clearInterval(playSessionHeartbeatTimer);
+    playSessionHeartbeatTimer = setInterval(() => {
+        if (!playSessionId || !activePlayConfig) return;
+        const body = {
+            sessionId: playSessionId,
+            ...playSessionAuthFields(activePlayConfig),
+            // Reflects a P2P->edge fallback since the session opened.
+            path: activePlaybackPathName || 'edge',
+            // Running rebuffering totals for this session.
+            lagCount: lagTracker.count,
+            lagDurationMs: Math.round(lagTracker.durationMs),
+        };
+        // Start reporting the measured P2P delay only after playback has run
+        // for a minute - the first readings are noisy while the jitter buffer
+        // and clock sync settle. ppcenter keeps the last non-zero value, so a
+        // heartbeat without one does not clear it.
+        if (playSessionStartedAt && Date.now() - playSessionStartedAt > 60000 &&
+            lastP2PDelayMs != null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS) {
+            body.p2pDelayMs = Math.round(lastP2PDelayMs);
+        }
+        postPlaySession('/v1/play/session/heartbeat', body);
+    }, 20000);
+}
+
+function stopPlaySession(reason = 'client_stopped', { beacon = false } = {}) {
+    if (playSessionHeartbeatTimer) {
+        clearInterval(playSessionHeartbeatTimer);
+        playSessionHeartbeatTimer = null;
+    }
+    if (playSessionId && activePlayConfig) {
+        postPlaySession('/v1/play/session/stop', {
+            sessionId: playSessionId,
+            ...playSessionAuthFields(activePlayConfig),
+            endReason: reason,
+            lagCount: lagTracker.count,
+            lagDurationMs: Math.round(lagTracker.durationMs),
+        }, { beacon });
+    }
+    playSessionId = null;
+    playSessionStartedAt = 0;
+}
+
+// A tab closing without going through stopStream still delivers a stop via
+// the unload beacon, so the online list doesn't linger on a closed tab.
+window.addEventListener('pagehide', () => stopPlaySession('client_stopped', { beacon: true }));
 
 // Layer bookkeeping. The layer *choice* is made server-side from the
 // bandwidth estimate (see abr_controller.go in ppmmx); this side tracks what
@@ -462,14 +591,23 @@ video.addEventListener('waiting', () => {
     // out of the catch-up controller's hands - don't fight browser-side
     // recovery with a stale 1.05x once it resumes.
     catchUpController.reset();
+    // Only count buffering after playback was actually established (a
+    // cold-start waiting before the first frame is not a rebuffer) and while
+    // video is meant to be showing (a deliberate pause is not a stall).
+    if (firstFrameDecoded && !videoPaused) lagTracker.beginStall();
 });
 
 video.addEventListener('playing', () => {
     console.log('[Video] State: PLAYING');
+    if (lagTracker.endStall()) {
+        console.log(`[Lag] Rebuffering: ${lagTracker.count} event(s), ${Math.round(lagTracker.durationMs)} ms total`);
+    }
 });
 
 video.addEventListener('pause', () => {
     console.log('[Video] State: PAUSED');
+    // A deliberate pause (or teardown) is not a stall.
+    lagTracker.cancelStall();
 });
 
 function showToast(text) {
@@ -678,24 +816,16 @@ function updatePlaybackCodecStatus(codecType) {
     console.log(`[Main] Playback codec: ${codecType}`);
 }
 
-// Determines which codec to request, given the raw WHEP URL the user (or
-// index.html's ?url= param) provided. A URL that already spells out a
-// codecType segment is treated as an explicit override and used as-is
-// (matching the design doc's example URLs in §2.2); otherwise this player
-// detects HEVC support itself and inserts the segment - see
-// insertCodecTypeSegment / codec-capability.js.
-async function resolveWhepUrlAndCodec(rawUrl) {
-    const explicitMatch = rawUrl.match(/\/(h264|hevc)\/whep(\?|$)/);
-    if (explicitMatch) {
-        return { url: rawUrl, codecType: explicitMatch[1] };
-    }
+// Picks the codec from local decode capability (codec-capability.mjs) and
+// returns the full WHEP URL for the edge stream base.
+async function resolveEdgeWhepUrl(edgeStreamUrl) {
     let codecType = 'h264';
     try {
         codecType = await selectPlaybackCodec();
     } catch (e) {
         console.warn('[Main] Codec capability detection failed, defaulting to h264:', e && e.message);
     }
-    return { url: insertCodecTypeSegment(rawUrl, codecType), codecType };
+    return { url: buildEdgeWhepUrl(edgeStreamUrl, codecType), codecType };
 }
 
 // Builds and connects a single WHEP session for the given (url, codecType)
@@ -722,11 +852,13 @@ function negotiateAndConnect(generation, url, codecType) {
                     video.srcObject = evt.streams[0];
                 }
             }
-            if (evt.track.kind === 'video' && !seiReaderAttached && evt.receiver) {
-                seiReaderAttached = attachSeiTimestampReader(evt.receiver, (ts) => {
+            if (evt.track.kind === 'video' && evt.receiver && evt.receiver !== seiReaderReceiver) {
+                if (attachSeiTimestampReader(evt.receiver, (ts) => {
                     reportP2PDelay(ts, 'sei');
-                }, activePlaybackCodec);
-                if (seiReaderAttached) console.log('[SEI] abs-timestamp reader attached');
+                }, activePlaybackCodec)) {
+                    seiReaderReceiver = evt.receiver;
+                    console.log('[SEI] abs-timestamp reader attached');
+                }
             }
         },
         onError: (err) => {
@@ -767,10 +899,36 @@ function negotiateAndConnect(generation, url, codecType) {
             console.log(`[Glue] WHEP Connected. SessionID: ${sessionId}`);
             if (window.parent) window.parent.postMessage('mmxplayer-connected', '*');
             if (sessionId) {
-                initControlClient(url, sessionId);
+                openControlClientWhenConnected(reader, url, sessionId, generation);
             }
         }
     });
+}
+
+// mmx only accepts the ABR control WebSocket once the WHEP session's own
+// ICE/DTLS handshake has finished (session.abrReady), and it holds the request
+// in a poll for up to abrReadyWaitTimeout (5s) before answering 409 if it hasn't.
+// onConnected fires as soon as the WHEP answer is applied - well before that -
+// so dialing the control WS there races mmx's handshake and, on every loss,
+// costs a 5s server-side hold plus the client's 3s reconnect backoff before the
+// session is even usable. Wait for the reader's peer connection to actually
+// report 'connected' (the same event that flips mmx's abrReady), then dial once.
+function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) {
+    const pc = reader.pc;
+    const open = () => {
+        if (generation !== readerGeneration || reader !== activePlaybackPath) return;
+        initControlClient(whepUrl, sessionId);
+    };
+    if (!pc || pc.connectionState === 'connected') {
+        open();
+        return;
+    }
+    const onState = () => {
+        if (pc.connectionState !== 'connected') return;
+        pc.removeEventListener('connectionstatechange', onState);
+        open();
+    };
+    pc.addEventListener('connectionstatechange', onState);
 }
 
 function resetSessionState() {
@@ -779,13 +937,14 @@ function resetSessionState() {
     lastP2PDelayMs = null;
     lastP2PDelayAt = 0;
     lastP2PDelaySource = null;
-    seiReaderAttached = false;
+    seiReaderReceiver = null;
     p2pSeiReaderAttached = false;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
     lastStats = { videoBytes: 0, audioBytes: 0, videoPacketsLost: 0, audioPacketsLost: 0, timestamp: 0 };
     catchUpController.reset();
     stallWatchdog.reset();
+    lagTracker.reset();
 }
 
 // A signed P2P link is a URL that carries all five ppcenter params (see
@@ -806,65 +965,17 @@ function showLinkNotice(message) {
         '</div>';
 }
 
-// The pplayer page can build its own signed P2P link: ppcenter's public
-// POST /v1/play/link turns appId+streamName into a short-lived viewer token
-// without the appSecret ever reaching the browser. appId and streamName are
-// the first two path segments of any edge WHEP URL
-// (https://edge-1.edge.pp-cdn.org/{appId}/{streamName}[/{codec}]/whep).
-function parseStreamFromWhepUrl(rawUrl) {
-    let parsed;
-    try {
-        parsed = new URL(rawUrl, window.location.href);
-    } catch {
-        return null;
-    }
-    const parts = parsed.pathname.split('/').filter(Boolean);
-    const whepIndex = parts.lastIndexOf('whep');
-    if (whepIndex < 2) return null;
-    return { appId: parts[0], streamName: parts[1] };
-}
-
-async function buildPlayConfigFromLinkGenerator(appId, streamName) {
-    const base = ppcenterUrl();
-    const response = await fetch(new URL('/v1/play/link', base).toString(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ appId, streamName }),
-    });
-    let body = null;
-    try { body = await response.json(); } catch { /* the error below covers it */ }
-    if (!response.ok) {
-        throw new Error(body?.message || `play link request failed with status ${response.status}`);
-    }
-    if (!body?.txTime || !body?.txSecret) {
-        throw new Error('ppcenter returned an invalid play link');
-    }
-    if (body.pplayerUrl) console.log('[Main] generated P2P link:', body.pplayerUrl);
-    return {
-        ppcenter: base,
-        appId,
-        streamName,
-        txTime: body.txTime,
-        txSecret: body.txSecret,
-        clientId: crypto.randomUUID(),
-        requestRegion: '',
-        natProbeId: '',
-    };
-}
-
-// Two ways in, deliberately kept side by side:
-//
-//  - With the five ppcenter parameters in the query string (PLY-001), the
-//    player asks ppcenter where to play from and honours the decision it
-//    gets back: "edge-only" is a plain WHEP URL, "p2p-connect" additionally
-//    races a direct connection to ppobs against that URL.
-//  - Without them, the WHEP URL in the input box is used directly. This is
-//    the integration path for a customer who already knows their edge URL,
-//    and the debugging path here; no ppcenter involvement at all.
+// The player has two entry points, both from the URL (there is no URL box any
+// more):
+//  - the five ppcenter params (signed link): ppcenter's decision names the edge
+//    stream base (edgeStreamUrl) + whether P2P is available, and the codec is
+//    chosen locally (see startDirectStream).
+//  - ?url=<complete WHEP URL>: a direct preview URL (the console's live preview
+//    uses this - see PublishSessionsPanel). It is already codec-specific and
+//    signed, so it is played verbatim.
 //
 // parsePlayRequest enforces all-or-nothing on the five parameters, so a
-// half-filled query string is a hard error rather than a silent fallback to
-// the input box.
+// half-filled query string is a hard error rather than a silent fallback.
 async function startStream() {
     stopStream();
     const generation = ++readerGeneration;
@@ -877,41 +988,53 @@ async function startStream() {
         return;
     }
 
-    resetSessionState();
-    startTimeSync(playConfig ? playConfig.ppcenter : ppcenterUrl());
+    const params = new URLSearchParams(window.location.search);
+    const directUrl = playConfig ? null : (params.get('url') || '').trim();
+    const ppcenter = (params.get('ppcenter') || '').trim() || DEFAULT_PPCENTER;
 
+    resetSessionState();
     if (playConfig) {
+        startTimeSync(playConfig.ppcenter);
         await startFromPpcenter(playConfig, generation);
         return;
     }
-
-    const rawUrl = urlInput.value.trim();
-    if (!rawUrl) return alert('Please enter a WHEP URL');
-
-    if (preferP2P()) {
-        // Checked, with no signed page params: derive appId/streamName from
-        // the entered WHEP URL and mint a short-lived link from ppcenter so
-        // P2P works without pasting a token. Falls back to the edge node when
-        // the URL has no stream path or the generator is unavailable.
-        const stream = parseStreamFromWhepUrl(rawUrl);
-        if (stream) {
-            try {
-                const generated = await buildPlayConfigFromLinkGenerator(stream.appId, stream.streamName);
-                if (generation !== readerGeneration) return;
-                await startFromPpcenter(generated, generation);
-                return;
-            } catch (error) {
-                console.warn('[Main] P2P link generation failed, using the edge node:', error);
-                showToast('P2P link failed — using edge node');
-            }
-        } else {
-            console.warn('[Main] P2P is checked but the WHEP URL has no appId/streamName path; using edge.');
-            showToast('P2P needs appId/streamName in the URL — using edge node');
-        }
-        if (generation !== readerGeneration) return;
+    if (directUrl) {
+        startTimeSync(ppcenter);
+        await startDirectWhepUrl(directUrl, generation);
+        return;
     }
 
-    await startDirectStream(rawUrl, generation);
+    // Nothing in the query (the console homepage links here bare, or the page
+    // was opened directly): play the default demo stream via a freshly minted
+    // viewer token, so the player works with no parameters at all.
+    const appId = (params.get('appId') || '').trim() || DEFAULT_APP_ID;
+    const streamName = (params.get('streamName') || '').trim() || DEFAULT_STREAM_NAME;
+    console.log(`[Main] no playback params; defaulting to ${appId}/${streamName} @ ${ppcenter}`);
+    try {
+        const { txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName);
+        if (generation !== readerGeneration) return;
+        startTimeSync(ppcenter);
+        await startFromPpcenter({
+            ppcenter, appId, streamName, txTime, txSecret,
+            clientId: newClientId(), requestRegion: '', natProbeId: '',
+        }, generation);
+    } catch (error) {
+        console.warn('[Main] default playback failed:', error);
+        showLinkNotice(`could not start the default stream (${error.message}); open with ?url= or a signed link`);
+    }
+}
+
+// Plays a complete WHEP URL verbatim (the console's ?url= preview). It is
+// already codec-specific and signed, so the codec is read off the URL and the
+// URL is NOT rewritten - rewriting the codec segment would invalidate its
+// signature.
+async function startDirectWhepUrl(rawUrl, generation) {
+    const explicitCodec = String(rawUrl).match(/\/(h264|hevc)\/whep(?:\?|$)/);
+    const codecType = explicitCodec ? explicitCodec[1] : 'h264';
+    statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
+    negotiateAndConnect(generation, rawUrl, codecType);
+    lastStats.timestamp = Date.now();
+    statsInterval = setInterval(updateStats, 1000);
 }
 
 // Clock calibration runs for every playback mode: the delay figures are
@@ -1008,7 +1131,11 @@ async function startFromPpcenter(playConfig, generation) {
         });
         if (playRequestAbortController !== abortController || generation !== readerGeneration) return;
         playRequestAbortController = null;
+        const availability = decision.p2pAvailability;
         console.log(`[P2P] ppcenter decision: mode=${decision.mode}` +
+            `, p2pAvailable=${decision.p2pAvailable !== false}` +
+            (availability ? `, publisherConnected=${availability.publisherConnected}` +
+                `, slotsFree=${availability.publisherSlotsFree}/${availability.publisherSlotsMax}` : '') +
             (decision.p2p ? `, stunServers=${JSON.stringify(decision.p2p.stunServers || [])}` : ' (no p2p block offered)') +
             (decision.reason ? `, reason=${decision.reason}` : '') +
             (decision.publisherNat ? `, publisherNat=${decision.publisherNat}` : '') +
@@ -1034,22 +1161,12 @@ async function startFromPpcenter(playConfig, generation) {
     }
 }
 
-async function startDirectStream(rawUrl, generation) {
-    // Publish (WHIP) and read (WHEP) URLs differ by one letter and are easy
-    // to swap by mistake. Sending a WHIP URL here silently registers this
-    // recvonly connection as a publish session: no error is returned, but
-    // no media ever flows and the control WebSocket is rejected as "not a
-    // reader session" a moment later. Fail loudly instead.
-    const lastSegment = rawUrl.split('?')[0].split('/').filter(Boolean).pop();
-    if (lastSegment === 'whip') {
-        const fixedUrl = rawUrl.replace(/\/whip(\?|$)/, '/whep$1');
-        alert(`This is a WHIP (publish) URL, not a WHEP (read) URL.\nUse:\n${fixedUrl}`);
-        return;
-    }
-
+// edgeStreamUrl is ppcenter's bare stream base. The codec (and therefore the
+// full WHEP URL) is decided here, from the browser's own HEVC capability.
+async function startDirectStream(edgeStreamUrl, generation) {
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
 
-    const { url, codecType } = await resolveWhepUrlAndCodec(rawUrl);
+    const { url, codecType } = await resolveEdgeWhepUrl(edgeStreamUrl);
     if (generation !== readerGeneration) return; // superseded while awaiting codec detection
     negotiateAndConnect(generation, url, codecType);
 
@@ -1087,6 +1204,14 @@ function logP2PSignal(m, expectedSessionId) {
 // free P2P slot, so playback connects P2P alone; the edge URL carried in the
 // same decision is used only as a SEQUENTIAL fallback if P2P fails or never
 // decodes, never in parallel.
+//
+// How long to wait for the publisher's answer before giving up on the P2P leg.
+// Fixed (not derived from connectTimeoutMs, which bounds the ICE connect after
+// an answer): the moment the offer is handed to ppcenter the publisher is
+// either going to answer promptly or not at all, and a viewer staring at
+// "Connecting P2P..." cares about this window, not the transport's.
+const P2P_HANDSHAKE_TIMEOUT_MS = 5000;
+
 function startP2PPlayback(decision, generation, playConfig) {
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting P2P...</div>';
     lastStats.timestamp = Date.now();
@@ -1118,11 +1243,13 @@ function startP2PPlayback(decision, generation, playConfig) {
 
     let settled = false;
     let verifyTimer = null;
+    let handshakeTimer = null;
 
     const fallbackToEdge = (reason) => {
         if (settled || generation !== readerGeneration) return;
         settled = true;
         if (verifyTimer) clearTimeout(verifyTimer);
+        if (handshakeTimer) clearTimeout(handshakeTimer);
         if (statsInterval) clearInterval(statsInterval);
         console.warn('[P2P] direct P2P did not play, falling back to edge:', reason);
         try { path.stop('p2p_failed'); } catch { /* best-effort */ }
@@ -1130,13 +1257,29 @@ function startP2PPlayback(decision, generation, playConfig) {
         activePlaybackPathName = 'edge';
         // No report here: the edge first frame will report the success with a
         // real costTime, or negotiateAndConnect's onError reports the failure.
-        startDirectStream(decision.playUrl, generation);
+        startDirectStream(decision.edgeStreamUrl, generation);
     };
+
+    // Bound the P2P handshake itself (offer -> publisher answer -> first track).
+    // onNegotiated fires as soon as the answer's remote track is applied, which
+    // is well before ICE finishes, so this timer only catches "the publisher
+    // never answered". On timeout fallbackToEdge() stops the path, which sends a
+    // close to the publisher through ppcenter and then closes the signaling
+    // WebSocket - so a publisher that accepted the offer and went silent frees
+    // its slot immediately instead of the viewer waiting for the server's own
+    // session TTL. The edge URL in the same decision is the sequential fallback.
+    handshakeTimer = setTimeout(
+        () => fallbackToEdge(`no P2P answer within ${P2P_HANDSHAKE_TIMEOUT_MS}ms; closing signaling`),
+        P2P_HANDSHAKE_TIMEOUT_MS);
 
     path.start({
         onSignal: (message) => logP2PSignal(message, decision.p2p.sessionId),
         onNegotiated: ({ stream }) => {
             if (generation !== readerGeneration) return;
+            if (handshakeTimer) {
+                clearTimeout(handshakeTimer);
+                handshakeTimer = null;
+            }
             video.srcObject = stream;
             video.play().catch((err) => {
                 if (err && err.name === 'AbortError') return;
@@ -1217,7 +1360,7 @@ function startRacedPlayback(decision, generation, playConfig) {
             // ABR layer control only exists on the Edge leg: the first-phase
             // P2P link carries a single video layer (PLY-009).
             if (path === 'edge' && selected.sessionId) {
-                initControlClient(decision.playUrl, selected.sessionId);
+                initControlClient(decision.edgeStreamUrl, selected.sessionId);
             } else {
                 layerSelect.disabled = true;
             }
@@ -1477,6 +1620,10 @@ function updateLayerSelectUI(tracks, activeId) {
 }
 
 function stopStream() {
+    // Close the online viewer session before tearing down the connection, so
+    // the console list updates immediately instead of after the heartbeat
+    // window. Uses the config captured when the session opened.
+    stopPlaySession('client_stopped');
     if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
     }
@@ -1511,6 +1658,7 @@ function stopStream() {
     video.srcObject = null;
     catchUpController.reset();
     stallWatchdog.reset();
+    lagTracker.reset();
     statsContainer.innerHTML = '<div style="color: #888; text-align: center;">Stopped</div>';
     
     wsStatusDot.classList.remove('ws-connected');
@@ -1632,13 +1780,25 @@ async function updateStats() {
         // server-side from the bandwidth estimate. fps/loss below are
         // reported for statistics and drive the stall watchdog only.
 
-        // currentRoundTripTime is in seconds and only appears once the
-        // selected candidate pair has RTCP SR/RR samples; before that it is
-        // undefined. Keep it null rather than coercing to 0, which used to
-        // display a bogus "0.0 ms" (or "NaN ms" once toFixed ran on
-        // undefined) instead of "no sample yet".
-        const rttSeconds = networkStats?.currentRoundTripTime;
-        const rttMs = Number.isFinite(rttSeconds) ? rttSeconds * 1000 : null;
+        // currentRoundTripTime is in seconds. The selected media pair can
+        // report 0 (or omit it) even while media flows - a recvonly P2P leg
+        // often has no RTCP round-trip sample - and printing that as "0.0 ms"
+        // is wrong: 0 is "no sample", not a 0ms path. So fall back to the
+        // smallest positive RTT any succeeded candidate pair reports (that is
+        // the media path; a backup pair is normally higher-latency), and only
+        // when nothing positive exists treat RTT as unknown.
+        const pairRttSeconds = networkStats?.currentRoundTripTime;
+        let rttSeconds = Number.isFinite(pairRttSeconds) && pairRttSeconds > 0 ? pairRttSeconds : null;
+        if (rttSeconds === null) {
+            let best = null;
+            stats.forEach((r) => {
+                if (r.type !== 'candidate-pair' || r.state !== 'succeeded') return;
+                const v = r.currentRoundTripTime;
+                if (Number.isFinite(v) && v > 0 && (best === null || v < best)) best = v;
+            });
+            rttSeconds = best;
+        }
+        const rttMs = rttSeconds === null ? null : rttSeconds * 1000;
         const jitterBufferMs = videoStats?.jitterBufferDelay && videoStats?.jitterBufferEmittedCount
             ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) * 1000
             : 0;
@@ -1726,9 +1886,10 @@ async function updateStats() {
             // skips for latency), so it read 100kbps..20000kbps at random.
             // The real throughput is already shown per track as "Recv Bitrate".
             const netRows = {
-                // rttMs is null until the selected pair has RTCP samples -
-                // show that explicitly rather than 0.0/NaN.
-                'RTT': rttMs === null ? 'no sample yet' : `${rttMs.toFixed(1)} ms`,
+                // Show sub-millisecond paths as "<1 ms" rather than a rounded
+                // "0.0 ms" (which reads as "broken"), and "—" only when no
+                // pair has produced a positive sample at all.
+                'RTT': rttMs === null ? '—' : (rttMs < 1 ? '<1 ms' : `${rttMs.toFixed(1)} ms`),
                 'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ` (catching up ${video.playbackRate}x)` : '')
             };
             html += renderStatGroup('Network', netRows);
@@ -1792,16 +1953,15 @@ function updateMediaState(state) {
     layerSelect.disabled = videoPaused && !audioOnly;
 }
 
-// A signed P2P link should just play: opening it must not require finding the
-// Start button first. A partial query string is surfaced as a link error; a
-// page with none of the five params stays in the normal manual/direct mode.
-(function autoStartFromSignedLink() {
-    let playConfig = null;
+// The page should just play on open: a signed link, a console ?url= preview,
+// ?appId=&streamName=, or the bare demo page (the console homepage links here
+// with no params). A partial query string is surfaced as a link error instead.
+(function autoStartFromQuery() {
     try {
-        playConfig = parsePlayRequest(window.location.search);
+        parsePlayRequest(window.location.search);
     } catch (error) {
         showLinkNotice(error.message);
         return;
     }
-    if (playConfig) startStream();
+    startStream();
 })();

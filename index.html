@@ -73,16 +73,10 @@
 <body>
 
 <div id="controls">
-    <!-- Row 1: endpoints - authCenter first, then the webrtc (WHEP) URL. -->
-    <div class="controls-row">
-        <label for="ppcenterInput">authCenter:</label>
-        <input type="text" id="ppcenterInput" value="https://api.pp-cdn.org" placeholder="Authentication Center base URL (clock sync)" style="flex:0 0 240px;" title="Used to calibrate the local clock so P2P Delay is meaningful">
-
-        <label for="urlInput">webrtc:</label>
-        <input type="text" id="urlInput" value="https://edge-1.edge.pp-cdn.org/appbd4cd2aa7be8/B01-frontView/hevc/whep" placeholder="Enter Edge WebRTC URL (http://edge:8890/live/whep)">
-    </div>
-
-    <!-- Row 2: playback controls. -->
+    <!-- The player is driven entirely by the signed link's query parameters
+         (ppcenter/appId/streamName/txTime/txSecret); there is no authCenter or
+         webrtc URL input - ppcenter hands back the edge stream address and the
+         player appends the codec itself. -->
     <div class="controls-row">
         <div style="display: flex; align-items: center; gap: 5px;">
             <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
@@ -122,41 +116,6 @@
 
 <script>
 (function() {
-  var params = new URLSearchParams(window.location.search);
-  var host = params.get('whep_host');
-  var url = params.get('url');
-  var input = document.getElementById('urlInput');
-  if (url) input.value = url;
-  else if (host) input.value = 'http://' + host + '/live/table-view/whep';
-
-  // Optional explicit codecType override (HEVC/H264 multitrack - see
-  // docs/design/whip-hevc-h264-multitrack-simulcast-design.zh-CN.md §4.4).
-  // Inserted as a URL path segment the same way main.js's
-  // insertCodecTypeSegment() does, so a manually-typed codecType=hevc
-  // parameter behaves identically to a WHEP URL that already spells out
-  // ".../hevc/whep" - main.js treats either as an explicit override and
-  // skips its own browser capability detection.
-  var codecType = params.get('codecType');
-  if (codecType === 'h264' || codecType === 'hevc') {
-    try {
-      var u = new URL(input.value);
-      var parts = u.pathname.split('/');
-      var whepIndex = parts.lastIndexOf('whep');
-      if (whepIndex > 0) {
-        if (whepIndex >= 2 && (parts[whepIndex - 1] === 'h264' || parts[whepIndex - 1] === 'hevc')) {
-          parts[whepIndex - 1] = codecType;
-        } else {
-          parts.splice(whepIndex, 0, codecType);
-        }
-        u.pathname = parts.join('/');
-        input.value = u.toString();
-      }
-    } catch (e) { /* not a valid absolute URL yet - leave it for the user to fix */ }
-  }
-
-  var ppcenter = params.get('ppcenter');
-  if (ppcenter) document.getElementById('ppcenterInput').value = ppcenter;
-
   // Collapse/expand the playback statistics overlay.
   var statsToggle = document.getElementById('statsToggleBtn');
   var statsPanel = document.getElementById('stats');
@@ -171,7 +130,7 @@
 <!-- ES modules: main.js imports everything else, so only the entry point is
      listed here. Module scripts are deferred and run after parsing, so the
      DOM lookups at the top of main.js are safe. -->
-<script type="module" src="main.js?v=20260927-1"></script>
+<script type="module" src="main.js?v=20260929-7"></script>
 
 </body>
 </html>

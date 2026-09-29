@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createDirectP2PPlayback, createPlaybackRace, getEdgeFallbackUrl, startPlaybackFromDecision } from '../play-decision-runner.mjs';
+import { createDirectP2PPlayback, createPlaybackRace, getEdgeStreamUrl, startPlaybackFromDecision } from '../play-decision-runner.mjs';
 
 class FakeController {
     constructor(options) {
@@ -11,7 +11,7 @@ class FakeController {
 
 const p2pDecision = {
     mode: 'p2p-connect',
-    playUrl: 'https://edge.example/app/live/whep?txTime=1&txSecret=2',
+    edgeStreamUrl: 'https://edge.example/app/live',
     p2p: {
         sessionId: 'session-1',
         signalUrl: 'wss://center.example/v1/p2p/signal',
@@ -21,9 +21,9 @@ const p2pDecision = {
     },
 };
 
-test('extracts Edge play URL from play decision', () => {
-    assert.equal(getEdgeFallbackUrl(p2pDecision), p2pDecision.playUrl);
-    assert.throws(() => getEdgeFallbackUrl({}), /playUrl/);
+test('extracts the Edge stream URL from a play decision', () => {
+    assert.equal(getEdgeStreamUrl(p2pDecision), p2pDecision.edgeStreamUrl);
+    assert.throws(() => getEdgeStreamUrl({}), /edgeStreamUrl/);
 });
 
 test('wires the edge/P2P paths and callbacks into the controller', () => {
@@ -37,7 +37,7 @@ test('wires the edge/P2P paths and callbacks into the controller', () => {
         onTelemetry: telemetry,
     });
 
-    assert.equal(playback.edgePath.url, p2pDecision.playUrl);
+    assert.equal(playback.edgePath.url, p2pDecision.edgeStreamUrl);
     assert.equal(playback.p2pPath.session, p2pDecision.p2p);
     assert.equal(playback.controller.options.edgePath, playback.edgePath);
     assert.equal(playback.controller.options.p2pPath, playback.p2pPath);
@@ -51,24 +51,24 @@ test('wires the edge/P2P paths and callbacks into the controller', () => {
 });
 
 test('rejects non-P2P decisions for race creation', () => {
-    assert.throws(() => createPlaybackRace({ mode: 'edge-only', playUrl: p2pDecision.playUrl }, { ControllerClass: FakeController }), /not a P2P/);
+    assert.throws(() => createPlaybackRace({ mode: 'edge-only', edgeStreamUrl: p2pDecision.edgeStreamUrl }, { ControllerClass: FakeController }), /not a P2P/);
 });
 
 test('builds a direct (non-raced) P2P leg from a p2p-connect decision', () => {
     const path = createDirectP2PPlayback(p2pDecision, {});
     assert.equal(path.session, p2pDecision.p2p);
-    assert.throws(() => createDirectP2PPlayback({ mode: 'edge-only', playUrl: p2pDecision.playUrl }, {}), /not a P2P/);
+    assert.throws(() => createDirectP2PPlayback({ mode: 'edge-only', edgeStreamUrl: p2pDecision.edgeStreamUrl }, {}), /not a P2P/);
 });
 
 test('starts Edge directly for edge-only decisions without touching P2P', () => {
     const calls = [];
-    const mode = startPlaybackFromDecision({ mode: 'edge-only', playUrl: p2pDecision.playUrl }, {
+    const mode = startPlaybackFromDecision({ mode: 'edge-only', edgeStreamUrl: p2pDecision.edgeStreamUrl }, {
         startDirectStream: (url) => calls.push(['edge', url]),
         startP2PPlayback: () => calls.push(['p2p']),
     });
 
     assert.equal(mode, 'edge-only');
-    assert.deepEqual(calls, [['edge', p2pDecision.playUrl]]);
+    assert.deepEqual(calls, [['edge', p2pDecision.edgeStreamUrl]]);
 });
 
 test('starts direct P2P (not a race) for p2p-connect decisions', () => {

@@ -12,9 +12,10 @@ export function parsePlayRequest(search, randomUUID = () => crypto.randomUUID())
     };
     const required = ['ppcenter', 'appId', 'streamName', 'txTime', 'txSecret'];
     const missing = required.filter((key) => !config[key]);
-    // None supplied is the manual/direct-play page; all five is a signed P2P
-    // link. Anything in between is a malformed link, and listing exactly
-    // which params are absent makes it fixable instead of a guessing game.
+    // All five is a signed link; a partial one is a malformed link, and listing
+    // exactly which params are absent makes it fixable instead of a guessing
+    // game. None at all is still reported as null so the caller can surface a
+    // link notice (there is no manual/direct-play mode any more).
     if (missing.length !== 0 && missing.length !== required.length) {
         throw new Error(
             'ppcenter, appId, streamName, txTime and txSecret must be provided together' +
@@ -52,7 +53,7 @@ export async function requestPlayDecision(config, { fetchImpl = fetch, signal, n
     if (!response.ok) {
         throw new Error(body?.message || `play request failed with status ${response.status}`);
     }
-    if ((body?.mode !== 'edge-only' && body?.mode !== 'p2p-connect') || !body?.playUrl) {
+    if ((body?.mode !== 'edge-only' && body?.mode !== 'p2p-connect') || !body?.edgeStreamUrl) {
         throw new Error('ppcenter returned an unsupported play decision');
     }
     // stunServers is optional (ppcenter omits it when its own STUN server
@@ -63,9 +64,9 @@ export async function requestPlayDecision(config, { fetchImpl = fetch, signal, n
         (body.p2p.stunServers !== undefined && !Array.isArray(body.p2p.stunServers)))) {
         throw new Error('ppcenter returned an invalid P2P decision');
     }
-    const playUrl = new URL(body.playUrl);
-    if (playUrl.protocol !== 'http:' && playUrl.protocol !== 'https:') {
-        throw new Error('ppcenter returned an invalid WHEP URL');
+    const edgeStreamUrl = new URL(body.edgeStreamUrl);
+    if (edgeStreamUrl.protocol !== 'http:' && edgeStreamUrl.protocol !== 'https:') {
+        throw new Error('ppcenter returned an invalid edge stream URL');
     }
     return body;
 }

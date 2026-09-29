@@ -19,7 +19,7 @@ test('returns null for direct WHEP mode', () => {
 
 test('requests edge-only WHEP decision with exact authorization', async () => {
     let captured;
-    const decision = { mode: 'edge-only', playUrl: 'https://edge.example/app/live/whep?txTime=1&txSecret=2' };
+    const decision = { mode: 'edge-only', edgeStreamUrl: 'https://edge.example/app/live' };
     const result = await requestPlayDecision({
         ppcenter: 'https://center.example/base', appId: 'app1', streamName: 'live',
         txTime: 'abc', txSecret: 'sig', clientId: 'viewer', requestRegion: 'Sydney', natProbeId: 'probe-1',
@@ -32,7 +32,7 @@ test('requests edge-only WHEP decision with exact authorization', async () => {
     assert.deepEqual(JSON.parse(captured.options.body), {
         streamName: 'live', clientId: 'viewer', requestRegion: 'Sydney', capabilities: ['whep', 'p2p-h264-opus'], natProbeId: 'probe-1',
     });
-    assert.equal(result.playUrl, decision.playUrl);
+    assert.equal(result.edgeStreamUrl, decision.edgeStreamUrl);
 });
 
 test('edge-only request drops the p2p capability when P2P is off', async () => {
@@ -42,7 +42,7 @@ test('edge-only request drops the p2p capability when P2P is off', async () => {
         txTime: 'abc', txSecret: 'sig', clientId: 'viewer', requestRegion: '',
     }, { preferP2P: false, fetchImpl: async (url, options) => {
         captured = { url, options };
-        return { ok: true, status: 200, json: async () => ({ mode: 'edge-only', playUrl: 'https://edge.example/app/live/whep' }) };
+        return { ok: true, status: 200, json: async () => ({ mode: 'edge-only', edgeStreamUrl: 'https://edge.example/app/live' }) };
     }});
     assert.deepEqual(JSON.parse(captured.options.body).capabilities, ['whep']);
 });
@@ -64,7 +64,7 @@ test('passes through stunServers on a valid P2P decision', async () => {
         status: 200,
         json: async () => ({
             mode: 'p2p-connect',
-            playUrl: 'https://edge.example/app/live/whep',
+            edgeStreamUrl: 'https://edge.example/app/live',
             p2p: {
                 sessionId: 'session', signalUrl: 'wss://signal.example', token: 'token',
                 raceWindowMs: 500, connectTimeoutMs: 2000, stunServers: ['stun:api.pp-cdn.org:3478'],
@@ -82,7 +82,7 @@ test('accepts a P2P decision with no stunServers at all', async () => {
         status: 200,
         json: async () => ({
             mode: 'p2p-connect',
-            playUrl: 'https://edge.example/app/live/whep',
+            edgeStreamUrl: 'https://edge.example/app/live',
             p2p: { sessionId: 'session', signalUrl: 'wss://signal.example', token: 'token', raceWindowMs: 500, connectTimeoutMs: 2000 },
         }),
     }) });
@@ -97,7 +97,7 @@ test('rejects P2P decisions with a malformed stunServers field', async () => {
         status: 200,
         json: async () => ({
             mode: 'p2p-connect',
-            playUrl: 'https://edge.example/app/live/whep',
+            edgeStreamUrl: 'https://edge.example/app/live',
             p2p: {
                 sessionId: 'session', signalUrl: 'wss://signal.example', token: 'token',
                 raceWindowMs: 500, connectTimeoutMs: 2000, stunServers: 'stun:api.pp-cdn.org:3478',
@@ -114,7 +114,7 @@ test('rejects P2P decisions with invalid race timing', async () => {
         status: 200,
         json: async () => ({
             mode: 'p2p-connect',
-            playUrl: 'https://edge.example/app/live/whep',
+            edgeStreamUrl: 'https://edge.example/app/live',
             p2p: { sessionId: 'session', signalUrl: 'wss://signal.example', token: 'token', raceWindowMs: 500, connectTimeoutMs: 500 },
         }),
     }) }), /invalid P2P decision/);
