@@ -1094,7 +1094,7 @@ async function startStream() {
     }
     if (directUrl) {
         startTimeSync(ppcenter);
-        await startDirectWhepUrl(directUrl, generation);
+        await startDirectWhepUrl(directUrl, generation, ppcenter);
         return;
     }
 
@@ -1127,13 +1127,60 @@ async function startStream() {
 // already codec-specific and signed, so the codec is read off the URL and the
 // URL is NOT rewritten - rewriting the codec segment would invalidate its
 // signature.
-async function startDirectWhepUrl(rawUrl, generation) {
+//
+// The console preview is a real viewer connection, so it is counted in the
+// pull-stream statistics like any signed link: appId/streamName come from the
+// signed WHEP path, and a viewer token for the session/outcome endpoints is
+// minted from POST /v1/play/link. The WHEP URL's own txSecret cannot be reused
+// for that - it is signed over the codec-suffixed path, not the appId/stream
+// pair those endpoints verify against. Reporting is best-effort: if the mint
+// fails the preview still plays, just uncounted.
+async function startDirectWhepUrl(rawUrl, generation, ppcenter) {
     const explicitCodec = String(rawUrl).match(/\/(h264|hevc)\/whep(?:\?|$)/);
     const codecType = explicitCodec ? explicitCodec[1] : 'h264';
+
+    playOutcomeReported = false;
+    playOutcomeCondition = null;
+    playStartedAt = Date.now();
+    firstFrameAt = null;
+    playReportIpv4 = '';
+    activePlayConfig = null;
+    const { appId, streamName } = parseWhepStreamInfo(rawUrl);
+    if (appId && streamName) {
+        try {
+            const { txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName);
+            if (generation !== readerGeneration) return;
+            activePlayConfig = {
+                ppcenter, appId, streamName, txTime, txSecret,
+                clientId: newClientId(), requestRegion: '', natProbeId: '',
+            };
+        } catch (error) {
+            console.warn('[Main] preview viewer token unavailable; preview will not be counted:', error && error.message);
+        }
+    }
+
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
     negotiateAndConnect(generation, rawUrl, codecType);
     lastStats.timestamp = Date.now();
     statsInterval = setInterval(updateStats, 1000);
+}
+
+// Pulls appId/streamName out of a signed WHEP URL's path
+// (https://<host>/{appId}/{streamName}/{codec}/whep?...), so the console
+// preview can be attributed to the right stream in the pull statistics. Any
+// trailing codec segment is optional; a bare /{appId}/{streamName}/whep works
+// too.
+function parseWhepStreamInfo(rawUrl) {
+    try {
+        const segments = new URL(rawUrl).pathname.split('/').filter(Boolean);
+        if (segments[segments.length - 1] === 'whep') segments.pop();
+        if (['h264', 'hevc', 'av1'].includes(segments[segments.length - 1])) segments.pop();
+        const streamName = segments.pop() || '';
+        const appId = segments.pop() || '';
+        return { appId, streamName };
+    } catch {
+        return { appId: '', streamName: '' };
+    }
 }
 
 // Clock calibration runs for every playback mode: the delay figures are
