@@ -9,7 +9,7 @@ import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';
 import { TimeSync } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecision } from './play-request.mjs?v=20260925-1';
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
-import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260929-2';
+import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260930-1';
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260929-2';
@@ -29,6 +29,10 @@ const wsStatusDot = document.getElementById('wsStatus');
         document.body.appendChild(dot);
     }
 })();
+
+// Verbose diagnostics (per-tick P2P stats, low-level transport state trails)
+// are opt-in with ?debug so a normal viewer's console stays readable.
+const PP_DEBUG = new URLSearchParams(window.location.search).has('debug');
 
 // Defaults for the "opened with no parameters" case - the console homepage's
 // "open demo" button links to the bare page (HomePage.tsx). These match the old
@@ -1288,20 +1292,29 @@ function logP2PSignal(m, expectedSessionId) {
     const idNote = m.sessionId ? ` sessionId=${m.sessionId === expectedSessionId ? 'match' : 'MISMATCH'}` : '';
     const tag = '[P2P]';
     switch (m.type) {
+        // The handshake's landmarks stay at normal verbosity; the per-step
+        // transport state trail and intermediate negotiation steps need ?debug.
         case 'ws-connecting': console.log(`${tag} signaling: connecting to ${m.url}`); break;
         case 'ws-open': console.log(`${tag} signaling: WebSocket open`); break;
         case 'ready': console.log(`${tag} signaling: publisher ready; creating offer`); break;
-        case 'pc-created': console.log(`${tag} RTCPeerConnection created; iceServers=${JSON.stringify(m.iceServers || [])}`); break;
-        case 'offer-created': console.log(`${tag} local offer created (sdp ${m.sdpLength}B); sent to publisher`); break;
-        case 'remote-description-set': console.log(`${tag} remote description (answer) applied`); break;
         case 'answer': console.log(`${tag} answer received (sdp ${(m.sdp || '').length}B)${idNote}`); break;
         case 'track': console.log(`${tag} media track received: ${m.kind}`); break;
+        case 'error': console.log(`${tag} signaling error: ${m.reason || 'rejected'}`); break;
+        case 'pc-created':
+            if (PP_DEBUG) console.log(`${tag} RTCPeerConnection created; iceServers=${JSON.stringify(m.iceServers || [])}`);
+            break;
+        case 'offer-created':
+            if (PP_DEBUG) console.log(`${tag} local offer created (sdp ${m.sdpLength}B); sent to publisher`);
+            break;
+        case 'remote-description-set':
+            if (PP_DEBUG) console.log(`${tag} remote description (answer) applied`);
+            break;
         case 'iceconnectionstate':
         case 'connectionstate':
         case 'signalingstate':
         case 'icegatheringstate':
-            console.log(`${tag} ${m.type}=${m.value}`); break;
-        case 'error': console.log(`${tag} signaling error: ${m.reason || 'rejected'}`); break;
+            if (PP_DEBUG) console.log(`${tag} ${m.type}=${m.value}`);
+            break;
         default: break; // local-candidate / ice are per-candidate, too chatty
     }
 }
@@ -1324,24 +1337,22 @@ function startP2PPlayback(decision, generation, playConfig) {
     lastStats.timestamp = Date.now();
     statsInterval = setInterval(updateStats, 1000);
 
+    const p2pSeiEnabled = new URLSearchParams(window.location.search).get('p2psei') !== '0';
     const path = createDirectP2PPlayback(decision, {
         bufferMs,
         WebSocketClass: WebSocket,
         PeerConnectionClass: RTCPeerConnection,
-        // The P2P publisher sends the same OBS abs-timestamp SEI the edge
-        // path reads, so the P2P leg can report a real end-to-end delay
-        // instead of the RTT/jitter estimate. Enabling the encoded transform
-        // requires a consumer or decode freezes, so onVideoReceiver attaches
-        // the SEI reader immediately. P2P is H264-only (PLY-009), so the
-        // reader is pinned to 'h264'.
-        insertableStreams: true,
-        onVideoReceiver: (receiver) => {
+        // TEMPORARY A/B test (2026-09-30): ?p2psei=0 disables the P2P OBS-SEI
+        // insertable-streams consumer, to tell "the transform blocks decode"
+        // apart from "the published RTP is undepacketizable".
+        insertableStreams: p2pSeiEnabled,
+        onVideoReceiver: p2pSeiEnabled ? (receiver) => {
             if (p2pSeiReaderAttached) return;
             p2pSeiReaderAttached = attachSeiTimestampReader(receiver, (ts) => {
                 reportP2PDelay(ts, 'sei');
             }, 'h264');
             if (p2pSeiReaderAttached) console.log('[SEI] abs-timestamp reader attached (P2P)');
-        },
+        } : undefined,
     });
     activePlaybackPath = path;
     activePlaybackPathName = 'p2p';
@@ -1858,6 +1869,14 @@ async function updateStats() {
             lastStats.videoBytes = videoStats.bytesReceived;
             lastStats.videoPacketsLost = videoStats.packetsLost || 0;
             lastStats.videoPacketsReceived = videoStats.packetsReceived || 0;
+        }
+
+        // TEMPORARY (2026-09-30): P2P decode diagnosis - remove once the P2P
+        // "connects but no frame" regression is understood. 1Hz (updateStats'
+        // cadence), only while the P2P leg is the active path, and only with
+        // ?debug since it otherwise spams one line per second.
+        if (PP_DEBUG && activePlaybackPathName === 'p2p' && videoStats) {
+            console.log(`[P2P-Stats] recv=${videoStats.packetsReceived || 0} bytes=${videoStats.bytesReceived || 0} framesReceived=${videoStats.framesReceived || 0} framesDecoded=${videoStats.framesDecoded || 0} fps=${videoStats.framesPerSecond || 0} lost=${videoStats.packetsLost || 0} nack=${videoStats.nackCount || 0}`);
         }
 
         if (audioStats) {

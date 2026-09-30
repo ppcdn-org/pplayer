@@ -1,6 +1,12 @@
 import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260929-2';
 import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260929-2';
 
+// Verbose diagnostics (raw SDP dumps) are opt-in with ?debug so a normal
+// viewer's console stays readable. Node (tests) has no location, so this
+// evaluates false there.
+const PP_DEBUG = typeof globalThis.location !== 'undefined' &&
+    new URLSearchParams(globalThis.location.search).has('debug');
+
 // Two playback legs for a p2p-connect decision, driven by
 // PlaybackRaceController's edge-primary + verified-P2P-upgrade model:
 //   * EdgeWHEPPath is the default. It reports `onReady` the moment its WHEP
@@ -116,6 +122,9 @@ export class P2PPlaybackPath {
         if (message.type === 'ready') {
             await this.#createOffer();
         } else if (message.type === 'answer' && message.sessionId === this.session.sessionId) {
+            // TEMPORARY (2026-09-30): dump the P2P answer SDP for the
+            // "connects but 0 frames" diagnosis - remove once understood.
+            if (PP_DEBUG) console.log('[P2P-SDP] remote answer:\n' + message.sdp);
             await this.pc.setRemoteDescription({ type: 'answer', sdp: message.sdp });
             this.onSignal?.({ type: 'remote-description-set' });
             for (const candidate of this.pendingCandidates) await this.pc.addIceCandidate(candidate);
@@ -189,6 +198,9 @@ export class P2PPlaybackPath {
         };
         const offer = await this.pc.createOffer();
         await this.pc.setLocalDescription(offer);
+        // TEMPORARY (2026-09-30): dump the P2P offer SDP for the
+        // "connects but 0 frames" diagnosis - remove once understood.
+        if (PP_DEBUG) console.log('[P2P-SDP] local offer:\n' + offer.sdp);
         this.onSignal?.({ type: 'offer-created', sdpLength: offer.sdp?.length ?? 0 });
         this.#send({ type: 'offer', sdp: offer.sdp });
     }
