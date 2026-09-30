@@ -1968,25 +1968,21 @@ async function updateStats() {
         // server-side from the bandwidth estimate. fps/loss below are
         // reported for statistics and drive the stall watchdog only.
 
-        // currentRoundTripTime is in seconds. The selected media pair can
-        // report 0 (or omit it) even while media flows - a recvonly P2P leg
-        // often has no RTCP round-trip sample - and printing that as "0.0 ms"
-        // is wrong: 0 is "no sample", not a 0ms path. So fall back to the
-        // smallest positive RTT any succeeded candidate pair reports (that is
-        // the media path; a backup pair is normally higher-latency), and only
-        // when nothing positive exists treat RTT as unknown.
+        // currentRoundTripTime is in seconds, and this is the MEDIA path: the
+        // selected candidate pair's RTCP-measured round trip (viewer <-> edge
+        // node, or <-> publisher over P2P). It is NOT the ppcenter clock-sync
+        // RTT (TimeSync's is a different endpoint and several times smaller),
+        // so the two are not comparable.
+        //
+        // Only the selected pair is trusted. The old fallback - "smallest
+        // positive RTT among every succeeded candidate pair" - picked a
+        // backup/relayed pair (e.g. a 377ms TCP/IPv6 pair) whenever the media
+        // pair's own sample was momentarily 0/absent, inventing an RTT the in-
+        // use path never had. A recvonly P2P leg genuinely has no RTCP sample
+        // much of the time; "—" (unknown) is honest, a backup pair's RTT is
+        // not.
         const pairRttSeconds = networkStats?.currentRoundTripTime;
-        let rttSeconds = Number.isFinite(pairRttSeconds) && pairRttSeconds > 0 ? pairRttSeconds : null;
-        if (rttSeconds === null) {
-            let best = null;
-            stats.forEach((r) => {
-                if (r.type !== 'candidate-pair' || r.state !== 'succeeded') return;
-                const v = r.currentRoundTripTime;
-                if (Number.isFinite(v) && v > 0 && (best === null || v < best)) best = v;
-            });
-            rttSeconds = best;
-        }
-        const rttMs = rttSeconds === null ? null : rttSeconds * 1000;
+        const rttMs = Number.isFinite(pairRttSeconds) && pairRttSeconds > 0 ? pairRttSeconds * 1000 : null;
         const jitterBufferMs = videoStats?.jitterBufferDelay && videoStats?.jitterBufferEmittedCount
             ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) * 1000
             : 0;
@@ -2072,10 +2068,17 @@ async function updateStats() {
             // skips for latency), so it read 100kbps..20000kbps at random.
             // The real throughput is already shown per track as "Recv Bitrate".
             const netRows = {
-                // Show sub-millisecond paths as "<1 ms" rather than a rounded
-                // "0.0 ms" (which reads as "broken"), and "—" only when no
-                // pair has produced a positive sample at all.
-                'RTT': rttMs === null ? '—' : (rttMs < 1 ? '<1 ms' : `${rttMs.toFixed(1)} ms`),
+                // Media-path RTT only (see above): the selected candidate
+                // pair's own RTCP sample. Sub-millisecond paths read "<1 ms"
+                // rather than a rounded "0.0 ms", and "—" means the selected
+                // pair has no fresh sample (common on a recvonly P2P leg),
+                // NOT that the path is broken. The title notes the source so
+                // it is not confused with TimeSync's (much smaller) ppcenter
+                // clock-sync RTT.
+                'RTT (media)': {
+                    text: rttMs === null ? '—' : (rttMs < 1 ? '<1 ms' : `${rttMs.toFixed(1)} ms`),
+                    title: 'Media-path RTT: the selected WebRTC candidate pair\'s round-trip (viewer <-> edge node, or <-> publisher over P2P). Not the ppcenter clock-sync RTT (TimeSync), which is a different, smaller number.',
+                },
                 'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ' (catching up)' : '')
             };
             html += renderStatGroup('Network', netRows);
@@ -2114,7 +2117,12 @@ async function updateStats() {
 function renderStatGroup(title, data) {
     let rows = '';
     for (const [key, value] of Object.entries(data)) {
-        rows += `<div class="stat-row"><span class="stat-key">${key}:</span><span class="stat-val">${value}</span></div>`;
+        // A value may be a plain string, or {text, title} to attach a tooltip
+        // explaining where the number comes from (e.g. the media-path RTT).
+        const isObj = value && typeof value === 'object';
+        const text = isObj ? value.text : value;
+        const tip = isObj && value.title ? ` title="${value.title}"` : '';
+        rows += `<div class="stat-row"${tip}><span class="stat-key">${key}:</span><span class="stat-val">${text}</span></div>`;
     }
     return `<div class="stat-group"><div class="stat-title">${title}</div>${rows}</div>`;
 }
