@@ -1167,7 +1167,14 @@ async function startStream(forceManual = false) {
         showLinkNotice(linkError.message);
         return;
     } else {
-        manualStream = null;
+        // A signed link may carry the stream's codec (?codec=h264|hevc), e.g.
+        // the console preview stamps the origin's multitrack path. Honor it so
+        // an HEVC stream skips the H264-only P2P attempt and the edge URL keeps
+        // the origin's actual codec. The box's own text is not used here.
+        const codecParam = (params.get('codec') || '').trim().toLowerCase();
+        manualStream = (playConfig && (codecParam === 'h264' || codecParam === 'hevc'))
+            ? { appId: playConfig.appId, streamName: playConfig.streamName, codec: codecParam }
+            : null;
         lastStartManual = false;
     }
 
@@ -1184,7 +1191,7 @@ async function startStream(forceManual = false) {
         // submission does (see submitNatProbe) - so start it before the token
         // round trip and overlap the two instead of paying them back to back.
         const natProbeStartedAt = performance.now();
-        const natGatherPromise = preferP2P() ? gatherNatProbe(ppcenter) : null;
+        const natGatherPromise = (preferP2P() && manual.codec !== 'hevc') ? gatherNatProbe(ppcenter) : null;
         try {
             const { txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName);
             if (generation !== readerGeneration) return;
@@ -1313,8 +1320,12 @@ async function startFromPpcenter(playConfig, generation, { natGatherPromise = nu
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Requesting playback route...</div>';
 
     // The NAT probe only matters for P2P; when the viewer unchecked it there
-    // is nothing to ask ppcenter for, so skip the round trip entirely.
-    const wantP2P = preferP2P();
+    // is nothing to ask ppcenter for, so skip the round trip entirely. P2P also
+    // carries H264 only, so an HEVC stream (typed in the box or stamped by the
+    // console preview) must go straight to the edge instead of a doomed P2P
+    // attempt - requesting without the p2p capability makes ppcenter answer
+    // edge-only.
+    const wantP2P = preferP2P() && manualStream?.codec !== 'hevc';
     let natProbeId = null;
     if (wantP2P) {
         // PLY-002: report the NAT observation so ppcenter can judge whether a
