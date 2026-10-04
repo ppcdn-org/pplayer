@@ -21,6 +21,7 @@ const video = document.getElementById('player-container-id') || document.getElem
 const statsContainer = document.querySelector('#local-video .stat ul') || document.getElementById('stats');
 const layerSelect = document.getElementById('quality-select') || document.getElementById('layerSelect');
 const wsStatusDot = document.getElementById('wsStatus');
+const streamInputEl = document.getElementById('streamInput');
 (() => {
     if (!wsStatusDot) {
         const dot = document.createElement('span');
@@ -35,12 +36,55 @@ const wsStatusDot = document.getElementById('wsStatus');
 const PP_DEBUG = new URLSearchParams(window.location.search).has('debug');
 
 // Defaults for the "opened with no parameters" case - the console homepage's
-// "open demo" button links to the bare page (HomePage.tsx). These match the old
-// pre-filled demo URL, so opening the player with nothing in the query still
-// plays the demo stream. Overridable with ?ppcenter=&appId=&streamName=.
+// "open demo" button links to the bare page (HomePage.tsx). Overridable with
+// ?ppcenter=&appId=&streamName=, or by editing the Stream box (whose demo
+// default value lives in index.html).
 const DEFAULT_PPCENTER = 'https://api.pp-cdn.org';
-const DEFAULT_APP_ID = 'appbd4cd2aa7be8';
-const DEFAULT_STREAM_NAME = 'B01-frontView';
+
+// Manual stream entry (the Stream box in index.html). A user types
+// "appId/streamName" and optionally a trailing codec ("/h264" or "/hevc"); a
+// codec, when present, overrides the browser-capability auto-selection for the
+// edge WHEP path (the P2P path is always H264). manualStream holds the parsed
+// box for the active session; lastStartManual remembers whether the current
+// session came from the box, so a watchdog restart replays the same source.
+let manualStream = null;
+let lastStartManual = false;
+
+// Parses the Stream box into { appId, streamName, codec }. codec is '' when
+// omitted. Returns null when it does not carry both an appId and a streamName.
+function parseStreamInput(raw) {
+    const parts = String(raw || '').trim().replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+    if (parts.length < 2) return null;
+    const appId = parts[0];
+    const streamName = parts[1];
+    if (!appId || !streamName) return null;
+    const codec = parts.slice(2)
+        .map((p) => p.toLowerCase())
+        .find((p) => p === 'h264' || p === 'hevc') || '';
+    return { appId, streamName, codec };
+}
+
+// Prefills the Stream box so a signed link / ?url= preview shows what is
+// playing; the box then doubles as a "play a different stream" entry point.
+// The bare page keeps the demo default baked into index.html.
+function prefillStreamInput() {
+    if (!streamInputEl) return;
+    const params = new URLSearchParams(window.location.search);
+    const urlParam = (params.get('url') || '').trim();
+    if (urlParam) {
+        const { appId, streamName } = parseWhepStreamInfo(urlParam);
+        const codec = (urlParam.match(/\/(h264|hevc)\/whep(?:\?|$)/) || [])[1] || '';
+        if (appId && streamName) streamInputEl.value = [appId, streamName, codec].filter(Boolean).join('/');
+        return;
+    }
+    const appId = (params.get('appId') || '').trim();
+    const streamName = (params.get('streamName') || '').trim();
+    if (appId && streamName) {
+        const codec = (params.get('codec') || '').trim().toLowerCase();
+        streamInputEl.value = [appId, streamName, (codec === 'h264' || codec === 'hevc') ? codec : '']
+            .filter(Boolean).join('/');
+    }
+}
 
 // Mints a short-lived viewer token from appId+streamName via ppcenter's open
 // POST /v1/play/link (no appSecret in the browser), so a bare/`?appId=` page
@@ -112,7 +156,7 @@ const stallWatchdog = new StallWatchdog({
     onStall: () => {
         console.warn('[Watchdog] Video stalled (receiving data, 0 fps) - restarting stream');
         showToast('Stream stalled, reconnecting...');
-        startStream();
+        startStream(lastStartManual);
     }
 });
 
@@ -696,8 +740,17 @@ function showToast(text) {
     }, 3000);
 }
 
-document.getElementById('startPlay') || document.getElementById('startBtn').addEventListener('click', startStream);
+document.getElementById('startPlay') || document.getElementById('startBtn').addEventListener('click', () => startStream(true));
 document.getElementById('stopPlay') || document.getElementById('exitBtn').addEventListener('click', stopStream);
+// Enter in the Stream box starts the typed stream, same as the Start button.
+if (streamInputEl) {
+    streamInputEl.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            startStream(true);
+        }
+    });
+}
 let videoPauseBtn = document.getElementById("videoPauseBtn");
 if (!videoPauseBtn) {
     videoPauseBtn = document.createElement("a");
@@ -907,9 +960,10 @@ function ensurePlaybackCodec() {
 }
 
 // Picks the codec from local decode capability (codec-capability.mjs) and
-// returns the full WHEP URL for the edge stream base.
+// returns the full WHEP URL for the edge stream base. A codec typed in the
+// Stream box (e.g. ".../hevc") takes precedence over capability detection.
 async function resolveEdgeWhepUrl(edgeStreamUrl) {
-    const codecType = await ensurePlaybackCodec();
+    const codecType = (manualStream && manualStream.codec) || await ensurePlaybackCodec();
     return { url: buildEdgeWhepUrl(edgeStreamUrl, codecType), codecType };
 }
 
@@ -1049,44 +1103,103 @@ function showLinkNotice(message) {
         + '&amp;txTime=&lt;hex&gt;&amp;txSecret=&lt;hmac&gt;';
     statsContainer.innerHTML =
         '<div style="padding: 4px;">' +
-        '<div style="color: #ffc107; font-weight: bold; margin-bottom: 6px;">Invalid signed P2P link</div>' +
+        '<div style="color: #ffc107; font-weight: bold; margin-bottom: 6px;">Cannot start playback</div>' +
         `<div style="color: #ffc107; margin-bottom: 10px;">${message}</div>` +
-        '<div style="color: #888; font-size: 12px; line-height: 1.5;">Expected format:<br>' +
+        '<div style="color: #888; font-size: 12px; line-height: 1.5;">Signed-link format:<br>' +
         `<code style="word-break: break-all;">${example}</code></div>` +
         '</div>';
 }
 
-// The player has two entry points, both from the URL (there is no URL box any
-// more):
+// The player has three entry points:
 //  - the five ppcenter params (signed link): ppcenter's decision names the edge
 //    stream base (edgeStreamUrl) + whether P2P is available, and the codec is
 //    chosen locally (see startDirectStream).
 //  - ?url=<complete WHEP URL>: a direct preview URL (the console's live preview
 //    uses this - see PublishSessionsPanel). It is already codec-specific and
 //    signed, so it is played verbatim.
+//  - the Stream box: a manually typed appId/streamName[/codec]. It is the
+//    fallback for a bare page (the console homepage links here with no params)
+//    and the override a manual Start uses.
 //
 // parsePlayRequest enforces all-or-nothing on the five parameters, so a
 // half-filled query string is a hard error rather than a silent fallback.
-async function startStream() {
+//
+// forceManual is set by the Start button (and by a watchdog restart of a manual
+// session): it plays whatever is in the Stream box, overriding any signed-link /
+// ?url= parameters still in the query string. The automatic start on page open
+// passes false so a shared link keeps its precedence.
+async function startStream(forceManual = false) {
     stopStream();
     const generation = ++readerGeneration;
 
+    const params = new URLSearchParams(window.location.search);
+    const ppcenter = (params.get('ppcenter') || '').trim() || DEFAULT_PPCENTER;
+
     let playConfig;
+    let linkError = null;
     try {
         playConfig = parsePlayRequest(window.location.search);
     } catch (error) {
-        showLinkNotice(error.message);
-        return;
+        // A partial link is malformed, but a manual Start can still recover by
+        // playing what is in the Stream box, so defer the error instead of
+        // returning here.
+        linkError = error;
     }
-
-    const params = new URLSearchParams(window.location.search);
     const directUrl = playConfig ? null : (params.get('url') || '').trim();
-    const ppcenter = (params.get('ppcenter') || '').trim() || DEFAULT_PPCENTER;
+
+    // The Stream box is authoritative for a manual Start and for the bare page
+    // (no signed link, no ?url=). A signed link / ?url= opened automatically
+    // keeps its own parameters and clears any stale box codec override.
+    let manual = null;
+    const boxUsable = forceManual || (!playConfig && !directUrl && !linkError);
+    if (boxUsable) {
+        manual = parseStreamInput(streamInputEl && streamInputEl.value);
+        if (!manual) {
+            showLinkNotice(linkError ? linkError.message
+                : 'Enter a stream as appId/streamName (optionally append /h264 or /hevc)');
+            return;
+        }
+        manualStream = manual;
+        lastStartManual = true;
+    } else if (linkError) {
+        // Malformed link on automatic start: surface it rather than silently
+        // falling back to the box's demo stream.
+        showLinkNotice(linkError.message);
+        return;
+    } else {
+        manualStream = null;
+        lastStartManual = false;
+    }
 
     resetSessionState();
     // Local and cached: start it now so it runs in parallel with the token /
     // probe / decision round trips below (see ensurePlaybackCodec).
     ensurePlaybackCodec();
+
+    if (manual) {
+        const { appId, streamName } = manual;
+        console.log(`[Main] playing Stream box: ${appId}/${streamName}` +
+            (manual.codec ? `/${manual.codec}` : '') + ` @ ${ppcenter}`);
+        // The STUN half of the NAT probe needs no token - only its ppcenter
+        // submission does (see submitNatProbe) - so start it before the token
+        // round trip and overlap the two instead of paying them back to back.
+        const natProbeStartedAt = performance.now();
+        const natGatherPromise = preferP2P() ? gatherNatProbe(ppcenter) : null;
+        try {
+            const { txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName);
+            if (generation !== readerGeneration) return;
+            startTimeSync(ppcenter);
+            await startFromPpcenter({
+                ppcenter, appId, streamName, txTime, txSecret,
+                clientId: newClientId(), requestRegion: '', natProbeId: '',
+            }, generation, { natGatherPromise, natProbeStartedAt });
+        } catch (error) {
+            console.warn('[Main] Stream box playback failed:', error);
+            showLinkNotice(`could not start ${appId}/${streamName} (${error.message})`);
+        }
+        return;
+    }
+
     if (playConfig) {
         startTimeSync(playConfig.ppcenter);
         await startFromPpcenter(playConfig, generation);
@@ -1096,30 +1209,6 @@ async function startStream() {
         startTimeSync(ppcenter);
         await startDirectWhepUrl(directUrl, generation, ppcenter);
         return;
-    }
-
-    // Nothing in the query (the console homepage links here bare, or the page
-    // was opened directly): play the default demo stream via a freshly minted
-    // viewer token, so the player works with no parameters at all.
-    const appId = (params.get('appId') || '').trim() || DEFAULT_APP_ID;
-    const streamName = (params.get('streamName') || '').trim() || DEFAULT_STREAM_NAME;
-    console.log(`[Main] no playback params; defaulting to ${appId}/${streamName} @ ${ppcenter}`);
-    // The STUN half of the NAT probe needs no token - only its ppcenter
-    // submission does (see submitNatProbe) - so start it before the token
-    // round trip and overlap the two instead of paying them back to back.
-    const natProbeStartedAt = performance.now();
-    const natGatherPromise = preferP2P() ? gatherNatProbe(ppcenter) : null;
-    try {
-        const { txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName);
-        if (generation !== readerGeneration) return;
-        startTimeSync(ppcenter);
-        await startFromPpcenter({
-            ppcenter, appId, streamName, txTime, txSecret,
-            clientId: newClientId(), requestRegion: '', natProbeId: '',
-        }, generation, { natGatherPromise, natProbeStartedAt });
-    } catch (error) {
-        console.warn('[Main] default playback failed:', error);
-        showLinkNotice(`could not start the default stream (${error.message}); open with ?url= or a signed link`);
     }
 }
 
@@ -2155,14 +2244,16 @@ function updateMediaState(state) {
 }
 
 // The page should just play on open: a signed link, a console ?url= preview,
-// ?appId=&streamName=, or the bare demo page (the console homepage links here
-// with no params). A partial query string is surfaced as a link error instead.
+// ?appId=&streamName=, or the Stream box's default (the console homepage links
+// here with no params). A partial query string is surfaced as a link error
+// instead.
 (function autoStartFromQuery() {
+    prefillStreamInput();
     try {
         parsePlayRequest(window.location.search);
     } catch (error) {
         showLinkNotice(error.message);
         return;
     }
-    startStream();
+    startStream(false);
 })();

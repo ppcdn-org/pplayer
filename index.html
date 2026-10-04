@@ -73,10 +73,18 @@
 <body>
 
 <div id="controls">
-    <!-- The player is driven entirely by the signed link's query parameters
-         (ppcenter/appId/streamName/txTime/txSecret); there is no authCenter or
-         webrtc URL input - ppcenter hands back the edge stream address and the
-         player appends the codec itself. -->
+    <!-- The player is normally driven by the signed link's query parameters
+         (ppcenter/appId/streamName/txTime/txSecret), or by ?url=<signed WHEP>.
+         The Stream box is the manual entry point: type your own
+         appId/streamName (an optional trailing /h264 or /hevc forces the codec)
+         and press Start. It is prefilled from the query string when one is
+         present, and keeps the demo default below otherwise. -->
+    <div class="controls-row">
+        <label for="streamInput">Stream:</label>
+        <input type="text" id="streamInput" value="keyc0c021b8ef993bcc/B01-frontView/hevc"
+               placeholder="appId/streamName (optionally /h264 or /hevc)"
+               title="Type appId/streamName to play your own stream. Append /h264 or /hevc to force the codec.">
+    </div>
     <div class="controls-row">
         <div style="display: flex; align-items: center; gap: 5px;">
             <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
@@ -130,7 +138,7 @@
 <!-- ES modules: main.js imports everything else, so only the entry point is
      listed here. Module scripts are deferred and run after parsing, so the
      DOM lookups at the top of main.js are safe. -->
-<script type="module" src="main.js?v=20260930-3"></script>
+<script type="module" src="main.js?v=20261003-1"></script>
 
 </body>
 </html>
