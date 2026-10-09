@@ -13,6 +13,24 @@ $('token').value = params.get('token') || '';
 $('appId').value = params.get('appId') || '';
 $('streamName').value = params.get('streamName') || '';
 
+// When the console opens this page as a popup it posts the login token in
+// (see BrowserPublishPanel), so it never has to go through the URL/history.
+// Announce readiness and accept the init message only from the configured
+// parent origin.
+const PARENT_ORIGIN = params.get('parent') || '';
+window.addEventListener('message', (event) => {
+  if (event.data?.type !== 'ppcdn-publish-init') return;
+  if (PARENT_ORIGIN && event.origin !== PARENT_ORIGIN) return;
+  if (event.data.token) $('token').value = event.data.token;
+  if (event.data.ppcenter) $('ppcenter').value = event.data.ppcenter;
+  if (event.data.appId) $('appId').value = event.data.appId;
+  if (event.data.streamName) $('streamName').value = event.data.streamName;
+  setStatus('已从控制台获取登录态');
+});
+if (window.opener) {
+  window.opener.postMessage({ type: 'ppcdn-publish-ready' }, PARENT_ORIGIN || '*');
+}
+
 let publisher = null;
 
 function setStatus(text, isError = false) {
