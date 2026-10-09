@@ -39,11 +39,13 @@ $('start').addEventListener('click', async () => {
 
   $('start').disabled = true;
   setStatus('启动中…');
+  const audioOnly = $('audioOnly').checked;
   publisher = new BrowserPublisher({
     ppcenter: $('ppcenter').value.trim(),
     token,
     appId,
     streamName,
+    audioOnly,
     codec: $('codec').value === 'auto' ? null : $('codec').value,
     simulcast: $('simulcast').checked,
     seiTimestamps: $('sei').checked,
@@ -54,8 +56,9 @@ $('start').addEventListener('click', async () => {
   try {
     const decision = await publisher.start();
     $('preview').srcObject = publisher.stream;
-    setStatus(`推流中：${decision.codec?.toUpperCase() || 'H264'} · session ${decision.sessionId}`
+    setStatus(`推流中：${audioOnly ? 'AUDIO' : (decision.codec?.toUpperCase() || 'H264')} · session ${decision.sessionId}`
       + (decision.signal ? ' · P2P 已启用' : ''));
+    $('switch').disabled = audioOnly;
     $('stop').disabled = false;
   } catch (error) {
     setStatus(`启动失败：${error?.code || error?.message || error}`, true);
@@ -64,8 +67,24 @@ $('start').addEventListener('click', async () => {
   }
 });
 
+$('switch').addEventListener('click', async () => {
+  if (!publisher) return;
+  $('switch').disabled = true;
+  try {
+    if (await publisher.switchCamera()) {
+      $('preview').srcObject = publisher.stream;
+      setStatus(`已切换到${publisher.facingMode === 'user' ? '前置' : '后置'}摄像头`);
+    }
+  } catch (error) {
+    setStatus(`切换摄像头失败：${error?.message || error}`, true);
+  } finally {
+    $('switch').disabled = false;
+  }
+});
+
 $('stop').addEventListener('click', async () => {
   $('stop').disabled = true;
+  $('switch').disabled = true;
   try {
     await publisher?.stop();
   } finally {

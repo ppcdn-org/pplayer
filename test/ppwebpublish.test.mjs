@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
     preferH264Order,
     detectPublishVideoCodec,
+    buildMediaConstraints,
     requestBrowserPublishSession,
     refreshBrowserPublishSession,
     stopBrowserPublishSession,
@@ -443,5 +444,51 @@ test('BrowserPublisher auto-probes NAT for P2P when none is supplied', async () 
         { enableP2P: true, clientId: 'c9', natProbeId: 'p9' },
     );
     assert.equal(FakeAnswerer.instances.length, 1);
+    await publisher.stop();
+});
+
+test('buildMediaConstraints honors audioOnly, facingMode and explicit overrides', () => {
+    assert.equal(buildMediaConstraints({ audioOnly: true }).video, false);
+    assert.equal(buildMediaConstraints({ facingMode: 'environment' }).video.facingMode, 'environment');
+    const explicit = { video: true, audio: true };
+    assert.equal(buildMediaConstraints({ mediaConstraints: explicit }), explicit);
+});
+
+test('BrowserPublisher.switchCamera replaces the WHIP video track', async () => {
+    const replaced = [];
+    const oldTrack = { kind: 'video', stopped: false, stop() { this.stopped = true; } };
+    const audioTrack = { kind: 'audio', stop() {} };
+    const newTrack = { kind: 'video', id: 'new' };
+    const stream = {
+        getTracks: () => [oldTrack, audioTrack],
+        getVideoTracks: () => [oldTrack],
+        removeTrack() {},
+        addTrack() {},
+    };
+    let gumCalls = 0;
+    const decision = {
+        sessionId: 'bp', codec: 'h264', whipUrl: 'https://origin/app/live/h264/whip', bearerToken: 't',
+        expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    };
+    const publisher = new BrowserPublisher({
+        ppcenter: 'https://api.pp-cdn.org', token: 'jwt', appId: 'app', streamName: 'live',
+        getUserMedia: async () => (gumCalls++ === 0 ? stream : { getVideoTracks: () => [newTrack] }),
+        createPeerConnection: () => ({
+            iceGatheringState: 'complete', localDescription: null,
+            addEventListener() {}, removeEventListener() {},
+            addTransceiver() { return { sender: { async replaceTrack(t) { replaced.push(t); } } }; },
+            async createOffer() { return { type: 'offer', sdp: 'O' }; },
+            async setLocalDescription(o) { this.localDescription = o; },
+            async setRemoteDescription() {},
+            close() {},
+        }),
+        fetchImpl: publishingFetch(decision, []),
+    });
+
+    await publisher.start();
+    assert.equal(await publisher.switchCamera(), true);
+    assert.deepEqual(replaced, [newTrack]);
+    assert.equal(publisher.facingMode, 'environment');
+    assert.equal(oldTrack.stopped, true);
     await publisher.stop();
 });

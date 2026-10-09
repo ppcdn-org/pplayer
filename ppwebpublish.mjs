@@ -364,6 +364,19 @@ export const DEFAULT_MEDIA_CONSTRAINTS = {
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
 };
 
+// buildMediaConstraints picks getUserMedia constraints. audioOnly drops video
+// entirely (mobile/audio use); facingMode selects the camera on devices with
+// more than one; an explicit mediaConstraints overrides both.
+export function buildMediaConstraints({ audioOnly = false, facingMode = 'user', mediaConstraints = null } = {}) {
+    if (mediaConstraints) return mediaConstraints;
+    const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+    if (facingMode) video.facingMode = facingMode;
+    return {
+        video: audioOnly ? false : video,
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    };
+}
+
 // DEFAULT_SIMULCAST_LAYERS is a three-rung H264 simulcast ladder (full / half /
 // quarter resolution). ppmmx accepts up to 5 H264 layers; three covers the
 // common weak-network range without multiplying the publisher's encode cost.
@@ -384,7 +397,11 @@ export class BrowserPublisher {
         appId,
         streamName,
         requestRegion = '',
-        mediaConstraints = DEFAULT_MEDIA_CONSTRAINTS,
+        mediaConstraints = null,
+        // audioOnly/formats: mobile adaptation. audioOnly publishes audio only.
+        audioOnly = false,
+        // facingMode: initial camera on multi-camera devices.
+        facingMode = 'user',
         // codec: null (auto-detect) | 'h264' | 'vp8'. VP8 is relay-only.
         codec = null,
         // simulcast: false | true (use DEFAULT_SIMULCAST_LAYERS) | explicit array.
@@ -413,7 +430,9 @@ export class BrowserPublisher {
         this.config = { ppcenter, token, appId, streamName, requestRegion, ...(codec ? { codec } : {}) };
         this.codec = codec;
         this.detectCodec = detectCodec;
-        this.mediaConstraints = mediaConstraints;
+        this.audioOnly = audioOnly;
+        this.facingMode = facingMode;
+        this.mediaConstraints = buildMediaConstraints({ audioOnly, facingMode, mediaConstraints });
         this.simulcastLayers = simulcast === true ? DEFAULT_SIMULCAST_LAYERS : (Array.isArray(simulcast) ? simulcast : null);
         this.seiTimestamps = seiTimestamps;
         this.p2p = p2p;
@@ -508,11 +527,43 @@ export class BrowserPublisher {
         const options = { direction: 'sendonly', streams: [this.stream] };
         if (video && this.simulcastLayers && h264) options.sendEncodings = this.simulcastLayers;
         const transceiver = this.pc.addTransceiver(track, options);
-        if (video && h264) {
-            preferH264(transceiver);
-            if (this.seiTimestamps) attachAbsTimestampInjector(transceiver?.sender);
+        if (video) {
+            this.videoSender = transceiver?.sender ?? null;
+            if (h264) {
+                preferH264(transceiver);
+                if (this.seiTimestamps) attachAbsTimestampInjector(transceiver?.sender);
+            }
         }
         return transceiver;
+    }
+
+    // switchCamera swaps the active camera (front/back) on a live publish by
+    // replacing the video track on the WHIP sender and every P2P peer sender,
+    // so the switch is seamless (no renegotiation on the same resolution).
+    async switchCamera() {
+        if (!this.stream || this.audioOnly) return false;
+        const next = this.facingMode === 'user' ? 'environment' : 'user';
+        const replacement = await this.getUserMedia({
+            video: { facingMode: next, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+            audio: false,
+        });
+        const newTrack = replacement.getVideoTracks?.()[0];
+        if (!newTrack) return false;
+
+        if (this.videoSender?.replaceTrack) {
+            await this.videoSender.replaceTrack(newTrack);
+        }
+        this.answerer?.replaceVideoTrack?.(newTrack);
+
+        const oldTrack = this.stream.getVideoTracks?.()[0];
+        if (oldTrack) {
+            this.stream.removeTrack?.(oldTrack);
+            oldTrack.stop();
+        }
+        this.stream.addTrack?.(newTrack);
+        this.facingMode = next;
+        this.onState('camera-switched', next);
+        return true;
     }
 
     scheduleRefresh() {

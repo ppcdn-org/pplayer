@@ -127,6 +127,16 @@ export class P2PAnswerer {
         this.onSignal({ type: 'peer-closed', sessionId });
     }
 
+    // replaceVideoTrack swaps the outgoing video track on every peer (e.g. a
+    // front/back camera switch) without renegotiating, mirroring the WHIP
+    // sender replacement BrowserPublisher.switchCamera does.
+    replaceVideoTrack(track) {
+        for (const { pc } of this.peers.values()) {
+            const sender = pc.getSenders?.().find((s) => s.track?.kind === 'video');
+            try { sender?.replaceTrack?.(track); } catch { /* ignore */ }
+        }
+    }
+
     #pcConfig() {
         const stunUrls = (this.session.stunServers ?? []).filter(
             (url) => typeof url === 'string' && (url.startsWith('stun:') || url.startsWith('stuns:')));

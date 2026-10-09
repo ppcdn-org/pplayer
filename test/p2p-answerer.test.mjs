@@ -147,3 +147,17 @@ test('P2PAnswerer stop closes every peer and the socket', async () => {
     assert.equal(FakeWebSocket.instance.readyState, 3);
     assert.equal(answerer.peerCount, 0);
 });
+
+test('P2PAnswerer.replaceVideoTrack swaps the sender track on every peer', async () => {
+    const created = [];
+    const answerer = newAnswerer({}, created);
+    answerer.start();
+    await FakeWebSocket.instance.emit({ v: 1, type: 'offer', sessionId: 's1', sdp: 'O' });
+    await flush();
+
+    const replaced = [];
+    created[0].getSenders = () => [{ track: { kind: 'video' }, replaceTrack(t) { replaced.push(t); } }];
+    const newTrack = { kind: 'video', id: 'new' };
+    answerer.replaceVideoTrack(newTrack);
+    assert.deepEqual(replaced, [newTrack]);
+});
