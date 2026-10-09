@@ -14,6 +14,7 @@
 // VP8 first - so publish *must* call preferH264() before createOffer or the
 // stream silently loses adaptive bitrate and end-to-end latency telemetry.
 import { P2PAnswerer } from './p2p-answerer.mjs';
+import { gatherNatProbe } from './nat-probe.mjs';
 // H264 with packetization-mode=1 is ranked first because the node's SEI
 // extractor decodes mode 1 (mode 0 would drop every fragmented SEI on a
 // simulcast/IDR stream).
@@ -274,6 +275,44 @@ export async function stopBrowserPublishSession(config, sessionId, { fetchImpl =
     await readJSONResponse(response, 'browser publish stop');
 }
 
+function randomClientID() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return `webpub-${crypto.randomUUID()}`;
+    }
+    return `webpub-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// probeBrowserPublisherNat is the browser publisher's default NAT-probe
+// client: gather a public endpoint via STUN (reusing pplayer's gatherNatProbe)
+// and register it as a publisher observation so P2P eligibility can pair the
+// page with viewers. Returns { clientId, natProbeId, gathered } to hand to
+// BrowserPublisher's natProbe option, or null when nothing usable was found.
+// The clientId must be stable from probe to session-create because the probe
+// handle is derived from (appId, clientId) server-side.
+export async function probeBrowserPublisherNat(config, { fetchImpl = fetch, gather = gatherNatProbe, clientId = null, signal } = {}) {
+    const id = clientId || config.clientId || randomClientID();
+    const gathered = await gather(config.ppcenter);
+    if (!gathered) return null;
+    const response = await fetchImpl(new URL('/v1/publish/browser-probe', config.ppcenter).toString(), {
+        method: 'POST',
+        signal,
+        headers: {
+            'Authorization': `Bearer ${config.token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            appId: config.appId,
+            streamName: config.streamName,
+            clientId: id,
+            natType: gathered.natType,
+            publicIp: gathered.publicIp,
+            publicPort: gathered.publicPort,
+        }),
+    });
+    const body = await readJSONResponse(response, 'browser publish probe');
+    return { clientId: id, natProbeId: body.probeId, gathered };
+}
+
 // waitForIceGathering resolves once ICE gathering completes, or after
 // timeoutMs, so a non-trickle WHIP publish doesn't hang on a candidate source
 // that never finishes. WHIP permits sending the offer as soon as gathering is
@@ -358,6 +397,10 @@ export class BrowserPublisher {
         // probe (POST /v1/publish/browser-probe).
         p2p = false,
         natProbe = null,
+        // autoNatProbe: when p2p is on and no natProbe was supplied, gather and
+        // register one via probeNat (browser NAT probe).
+        autoNatProbe = true,
+        probeNat = probeBrowserPublisherNat,
         fetchImpl = fetch,
         getUserMedia = (constraints) => navigator.mediaDevices.getUserMedia(constraints),
         createPeerConnection = () => new RTCPeerConnection(),
@@ -375,6 +418,8 @@ export class BrowserPublisher {
         this.seiTimestamps = seiTimestamps;
         this.p2p = p2p;
         this.natProbe = natProbe;
+        this.autoNatProbe = autoNatProbe;
+        this.probeNat = probeNat;
         this.fetchImpl = fetchImpl;
         this.getUserMedia = getUserMedia;
         this.createPeerConnection = createPeerConnection;
@@ -394,7 +439,16 @@ export class BrowserPublisher {
         this.onState('requesting-session');
         this.codec = (this.codec || this.detectCodec()).toLowerCase();
         this.config = { ...this.config, codec: this.codec };
-        // P2P is H264-only and needs a publisher NAT probe result.
+        // P2P is H264-only and needs a publisher NAT probe result. Without an
+        // explicit natProbe, gather+register one now.
+        if (this.p2p && this.codec === 'h264' && !this.natProbe?.natProbeId && this.autoNatProbe) {
+            this.onState('nat-probe');
+            try {
+                this.natProbe = await this.probeNat(this.config, { fetchImpl: this.fetchImpl });
+            } catch (error) {
+                this.onState('nat-probe-failed', error);
+            }
+        }
         if (this.p2p && this.codec === 'h264' && this.natProbe?.clientId && this.natProbe?.natProbeId) {
             this.config = {
                 ...this.config,

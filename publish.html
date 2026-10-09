@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PPCDN 网页推流</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; }
+    .hint { color: #64748b; font-size: 0.85rem; }
+    form { display: grid; gap: 0.6rem; margin: 1rem 0; }
+    label { display: grid; gap: 0.25rem; font-size: 0.85rem; }
+    input[type="text"], input[type="password"], select { padding: 0.4rem 0.5rem; font: inherit; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+    .row label { display: flex; gap: 0.35rem; align-items: center; }
+    video { width: 100%; max-width: 480px; background: #000; border-radius: 6px; aspect-ratio: 16 / 9; }
+    #status { margin-top: 0.75rem; font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: pre-wrap; }
+    .error { color: #b91c1c; }
+    button { padding: 0.5rem 1rem; font: inherit; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <h1>PPCDN 网页推流</h1>
+  <p class="hint">
+    在控制台登录后复制用户 Token（JWT）。网页只持有短期 WHIP 凭据，绝不接触 appSecret。
+    H264 支持自适应码率与精确时延；VP8 仅作兜底。
+  </p>
+
+  <form id="form" autocomplete="off">
+    <label>ppcenter<input id="ppcenter" type="text" value="https://api.pp-cdn.org" /></label>
+    <label>用户 Token (JWT)<input id="token" type="password" /></label>
+    <label>appId<input id="appId" type="text" /></label>
+    <label>streamName<input id="streamName" type="text" /></label>
+    <label>视频编码
+      <select id="codec">
+        <option value="auto">自动（优先 H264）</option>
+        <option value="h264">H264</option>
+        <option value="vp8">VP8（兜底，无 ABR/P2P/时延）</option>
+      </select>
+    </label>
+    <div class="row">
+      <label><input id="simulcast" type="checkbox" /> Simulcast</label>
+      <label><input id="sei" type="checkbox" /> 注入 SEI 时延戳</label>
+      <label><input id="p2p" type="checkbox" /> 启用 P2P 直连</label>
+    </div>
+    <div class="row">
+      <button id="start" type="button">开始推流</button>
+      <button id="stop" type="button" disabled>停止</button>
+    </div>
+  </form>
+
+  <video id="preview" muted autoplay playsinline></video>
+  <div id="status"></div>
+
+  <script type="module" src="./publish.js"></script>
+</body>
+</html>

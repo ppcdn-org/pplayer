@@ -7,6 +7,7 @@ import {
     requestBrowserPublishSession,
     refreshBrowserPublishSession,
     stopBrowserPublishSession,
+    probeBrowserPublisherNat,
     whipPublish,
     buildAbsTimestampNAL,
     injectAbsTimestampSEI,
@@ -374,7 +375,7 @@ test('BrowserPublisher does not request P2P without a NAT probe', async () => {
     };
     const publisher = new BrowserPublisher({
         ppcenter: 'https://api.pp-cdn.org', token: 'jwt', appId: 'app', streamName: 'live',
-        p2p: true, // no natProbe supplied
+        p2p: true, autoNatProbe: false, // no natProbe supplied and auto-probe off
         getUserMedia: async () => stream,
         createPeerConnection: () => fakePeerConnection(),
         P2PAnswererClass: FakeAnswerer,
@@ -383,5 +384,64 @@ test('BrowserPublisher does not request P2P without a NAT probe', async () => {
 
     await publisher.start();
     assert.equal(JSON.parse(fetchCalls[0].init.body).enableP2P, undefined);
+    await publisher.stop();
+});
+
+test('probeBrowserPublisherNat registers a publisher observation', async () => {
+    const calls = [];
+    const result = await probeBrowserPublisherNat(
+        { ppcenter: 'https://api.pp-cdn.org', token: 'jwt', appId: 'app123', streamName: 'live', clientId: 'c1' },
+        {
+            gather: async () => ({ natType: 'restricted', publicIp: '203.0.113.7', publicPort: 40000 }),
+            fetchImpl: async (url, init) => { calls.push({ url, init }); return jsonResponse({ probeId: 'probe-x' }); },
+        },
+    );
+    assert.equal(result.clientId, 'c1');
+    assert.equal(result.natProbeId, 'probe-x');
+    assert.equal(calls[0].url, 'https://api.pp-cdn.org/v1/publish/browser-probe');
+    assert.equal(calls[0].init.headers.Authorization, 'Bearer jwt');
+    assert.deepEqual(JSON.parse(calls[0].init.body), {
+        appId: 'app123', streamName: 'live', clientId: 'c1',
+        natType: 'restricted', publicIp: '203.0.113.7', publicPort: 40000,
+    });
+});
+
+test('probeBrowserPublisherNat returns null when nothing was gathered', async () => {
+    const result = await probeBrowserPublisherNat(
+        { ppcenter: 'https://api.pp-cdn.org', token: 't', appId: 'a', streamName: 's' },
+        { gather: async () => null, fetchImpl: async () => { throw new Error('should not fetch'); } },
+    );
+    assert.equal(result, null);
+});
+
+test('BrowserPublisher auto-probes NAT for P2P when none is supplied', async () => {
+    FakeAnswerer.instances = [];
+    const fetchCalls = [];
+    const probeCalls = [];
+    const stream = { getTracks: () => [{ kind: 'video', stop() {} }] };
+    const decision = {
+        sessionId: 'bp_auto', codec: 'h264', whipUrl: 'https://origin/app/live/h264/whip', bearerToken: 't',
+        expiresAt: new Date(Date.now() + 600_000).toISOString(),
+        signal: { signalUrl: 'wss://signal.example/x', token: 'st', participantId: 'p' },
+        stunServers: [], maxP2PSessions: 2,
+    };
+    const publisher = new BrowserPublisher({
+        ppcenter: 'https://api.pp-cdn.org', token: 'jwt', appId: 'app', streamName: 'live',
+        p2p: true,
+        probeNat: async (config) => { probeCalls.push(config); return { clientId: 'c9', natProbeId: 'p9' }; },
+        getUserMedia: async () => stream,
+        createPeerConnection: () => fakePeerConnection(),
+        P2PAnswererClass: FakeAnswerer,
+        fetchImpl: publishingFetch(decision, fetchCalls),
+    });
+
+    await publisher.start();
+    assert.equal(probeCalls.length, 1);
+    const body = JSON.parse(fetchCalls[0].init.body);
+    assert.deepEqual(
+        { enableP2P: body.enableP2P, clientId: body.clientId, natProbeId: body.natProbeId },
+        { enableP2P: true, clientId: 'c9', natProbeId: 'p9' },
+    );
+    assert.equal(FakeAnswerer.instances.length, 1);
     await publisher.stop();
 });
