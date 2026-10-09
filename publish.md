@@ -21,7 +21,7 @@
 1. 登录 `https://pp-cdn.org`。
 2. 打开 **网页推流** tab → **打开网页推流**，允许浏览器使用摄像头/麦克风。
 3. 填 `streamName`（`[A-Za-z0-9._-]`，≤128 字符）；`appId` 已按控制台所选 App 自动预填（可在控制台上方下拉切换）。
-4. 按需勾选：**Simulcast**、**注入 SEI 时延戳**、**启用 P2P 直连**、**仅音频**；编码保持「自动（优先 H264）」。
+4. 编码保持「自动（优先 H264）」；**启用 P2P 直连**默认勾选。（默认单流、默认注入 SEI 时延戳，无对应开关。）
 5. 点 **开始推流**；本地预览出现即已发布。
 6. 观看：
    - 另开 `https://pplayer.pp-cdn.org/`，在 **Stream** 输入框填 `{appId}/{streamName}` 或 `{appId}/{streamName}/h264`，Start；
@@ -41,7 +41,7 @@
 - 发布页状态依次：`requesting-session → capturing → publishing → live`。
 - 控制台 **网页推流** tab 出现该会话；停止后消失。
 - pplayer 能拉到并播放；H264 流可尝试 P2P，HEVC/兜底走 Edge。
-- 勾选 **注入 SEI 时延戳** 后，pplayer 面板 P2P Delay 为实测值（需 Chromium）。
+- 默认注入 SEI 时延戳后，pplayer 面板 P2P Delay 为实测值（需 Chromium）。
 - 控制台 **拉流统计** 出现该观看会话。
 
 ## 常见问题

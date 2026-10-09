@@ -74,16 +74,14 @@ $('start').addEventListener('click', async () => {
 
   $('start').disabled = true;
   setStatus('启动中…');
-  const audioOnly = $('audioOnly').checked;
   publisher = new BrowserPublisher({
     ppcenter: $('ppcenter').value.trim(),
     token,
     appId,
     streamName,
-    audioOnly,
     codec: $('codec').value === 'auto' ? null : $('codec').value,
-    simulcast: $('simulcast').checked,
-    seiTimestamps: $('sei').checked,
+    simulcast: false,        // always a single stream
+    seiTimestamps: true,     // always inject the absolute-timestamp SEI
     p2p: $('p2p').checked,
     onState: (state, detail) => setStatus(describe(state, detail), state === 'p2p-error' || state === 'nat-probe-failed'),
   });
@@ -91,9 +89,9 @@ $('start').addEventListener('click', async () => {
   try {
     const decision = await publisher.start();
     $('preview').srcObject = publisher.stream;
-    setStatus(`推流中：${audioOnly ? 'AUDIO' : (decision.codec?.toUpperCase() || 'H264')} · session ${decision.sessionId}`
+    setStatus(`推流中：${decision.codec?.toUpperCase() || 'H264'} · session ${decision.sessionId}`
       + (decision.signal ? ' · P2P 已启用' : ''));
-    $('switch').disabled = audioOnly;
+    $('switch').disabled = false;
     $('stop').disabled = false;
   } catch (error) {
     setStatus(`启动失败：${error?.code || error?.message || error}`, true);
