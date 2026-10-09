@@ -20,7 +20,7 @@
 
 1. 登录 `https://pp-cdn.org`。
 2. 打开 **网页推流** tab → **打开网页推流**，允许浏览器使用摄像头/麦克风。
-3. 填 `appId`、`streamName`（`[A-Za-z0-9._-]`，≤128 字符）。
+3. 填 `streamName`（`[A-Za-z0-9._-]`，≤128 字符）；`appId` 已按控制台所选 App 自动预填（可在控制台上方下拉切换）。
 4. 按需勾选：**Simulcast**、**注入 SEI 时延戳**、**启用 P2P 直连**、**仅音频**；编码保持「自动（优先 H264）」。
 5. 点 **开始推流**；本地预览出现即已发布。
 6. 观看：
@@ -52,7 +52,7 @@
 | `401 invalid_credentials`（probe/接口） | appId 不存在或 Token 与账号不符 |
 | `403 app_forbidden` | appId 不属于当前账号 |
 | `402 account_in_arrears` | 账号欠费 |
-| `409 stream_in_use` | 该 `{appId}/{streamName}` 已有活跃会话 → 换名或先停止旧的 |
+| `409 stream_in_use` | 已不再出现：同一 `{appId}/{streamName}` 再次推流会**自动顶替**上一个会话（appId 全局唯一，旧会话只可能是自己的残留）。若仍见到，说明服务端早于 v1.0.72 |
 | `429 too_many_publish_sessions` | 同账号并发超过 `browserPublish.maxSessionsPerUser`（默认 2） |
 | `503 browser_publish_unavailable` | 服务端 `browserPublish.disabled=true` |
 | 开始后 pplayer 404/黑屏 | Origin 尚在收到该流，等 1–2s 重试；确认 Origin 已放行 pplayer 跨域 |

@@ -452,6 +452,7 @@ export class BrowserPublisher {
         this.decision = null;
         this.refreshTimer = null;
         this.answerer = null;
+        this.stopped = false;
     }
 
     async start() {
@@ -583,6 +584,7 @@ export class BrowserPublisher {
     }
 
     async stop() {
+        this.stopped = true;
         if (this.refreshTimer) {
             clearTimeout(this.refreshTimer);
             this.refreshTimer = null;

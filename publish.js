@@ -31,6 +31,23 @@ if (window.opener) {
   window.opener.postMessage({ type: 'ppcdn-publish-ready' }, PARENT_ORIGIN || '*');
 }
 
+// Best-effort stop if the page is closed/hidden without clicking Stop, so a
+// stale session doesn't linger (and, until it expired, block a restart). The
+// server also supersedes a stale session on the same stream now, so this is
+// cleanliness rather than correctness. keepalive lets the request outlive the
+// page.
+window.addEventListener('pagehide', () => {
+  const config = publisher?.config;
+  const sessionId = publisher?.decision?.sessionId;
+  if (!config || !sessionId || publisher.stopped) return;
+  try {
+    const url = new URL(`/v1/publish/browser-requests/${encodeURIComponent(sessionId)}`, config.ppcenter);
+    fetch(url, { method: 'DELETE', keepalive: true, headers: { Authorization: `Bearer ${config.token}` } });
+  } catch {
+    // Ignore - the page is going away.
+  }
+});
+
 let publisher = null;
 
 function setStatus(text, isError = false) {
