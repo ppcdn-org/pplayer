@@ -9,8 +9,6 @@
 //
 // Only H264 is supported (P2P is H264-only server-side); the caller must not
 // provision this when publishing VP8.
-import { preferH264 } from './ppwebpublish.mjs';
-
 export class P2PAnswerer {
     constructor({
         session,               // { signalUrl, token, stunServers?, maxPeers? }
@@ -82,12 +80,6 @@ export class P2PAnswerer {
         this.peers.set(sessionId, entry);
         this.onSignal({ type: 'peer-created', sessionId });
 
-        // Send the publisher's media on this PC. One sendonly transceiver per
-        // captured track; video is pinned to H264 to match the viewer's offer.
-        for (const track of this.mediaStream.getTracks()) {
-            const transceiver = pc.addTransceiver(track, { direction: 'sendonly', streams: [this.mediaStream] });
-            if (track.kind === 'video') preferH264(transceiver);
-        }
         pc.onicecandidate = (event) => {
             if (event.candidate) this.#send({ type: 'ice', sessionId, candidate: event.candidate.toJSON() });
         };
@@ -101,9 +93,28 @@ export class P2PAnswerer {
             }
         };
 
+        // Answer the offer's OWN m-lines. The viewer offers one recvonly video
+        // and one recvonly audio m-line; we attach our captured tracks to those
+        // transceivers and flip them to sendonly. Adding new transceivers
+        // instead would leave the offered m-lines unanswered (recvonly) and the
+        // viewer would receive no media - the answer arrives but the player
+        // gets no track and falls back to edge.
         await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
         for (const candidate of entry.pendingCandidates) await pc.addIceCandidate(candidate);
         entry.pendingCandidates = [];
+
+        const tracks = this.mediaStream.getTracks();
+        for (const transceiver of pc.getTransceivers?.() ?? []) {
+            const kind = transceiver.receiver?.track?.kind;
+            const track = tracks.find((t) => t.kind === kind);
+            if (track) {
+                transceiver.direction = 'sendonly';
+                await transceiver.sender?.replaceTrack?.(track);
+            } else {
+                transceiver.direction = 'inactive';
+            }
+        }
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         this.#send({ type: 'answer', sessionId, sdp: answer.sdp });

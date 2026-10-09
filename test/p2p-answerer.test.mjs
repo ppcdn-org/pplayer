@@ -24,7 +24,11 @@ class FakeWebSocket {
     emit(message) { return this.onmessage({ data: JSON.stringify(message) }); }
 }
 
-function fakePCFactory(created) {
+// The offer from pplayer has one recvonly video and one recvonly audio m-line,
+// so setRemoteDescription materializes those transceivers (mirroring a real
+// browser), and the answerer must attach its tracks to them rather than add
+// new ones.
+function fakePCFactory(created, offerKinds = ['video', 'audio']) {
     return function FakePC(config) {
         const pc = {
             config,
@@ -32,12 +36,19 @@ function fakePCFactory(created) {
             localDescription: null,
             connectionState: 'new',
             candidates: [],
-            added: [],
+            transceivers: [],
             closed: false,
             onicecandidate: null,
             onconnectionstatechange: null,
-            addTransceiver(track, opts) { pc.added.push({ track, opts }); return {}; },
-            async setRemoteDescription(desc) { pc.remoteDescription = desc; },
+            async setRemoteDescription(desc) {
+                pc.remoteDescription = desc;
+                pc.transceivers = offerKinds.map((kind) => ({
+                    direction: 'recvonly',
+                    receiver: { track: { kind } },
+                    sender: { track: null, async replaceTrack(t) { this.track = t; } },
+                }));
+            },
+            getTransceivers() { return pc.transceivers; },
             async createAnswer() { return { type: 'answer', sdp: 'ANSWER_SDP' }; },
             async setLocalDescription(desc) { pc.localDescription = desc; },
             async addIceCandidate(candidate) { pc.candidates.push(candidate); },
@@ -77,8 +88,12 @@ test('P2PAnswerer answers an incoming offer and sends sendonly tracks', async ()
 
     assert.equal(created.length, 1);
     assert.equal(created[0].remoteDescription.sdp, 'OFFER_SDP');
-    assert.equal(created[0].added.length, 2);
-    assert.deepEqual(created[0].added[0].opts.direction, 'sendonly');
+    // The offered m-lines are answered sendonly with the captured tracks.
+    assert.equal(created[0].transceivers.length, 2);
+    assert.equal(created[0].transceivers[0].direction, 'sendonly');
+    assert.equal(created[0].transceivers[0].sender.track.kind, 'video');
+    assert.equal(created[0].transceivers[1].direction, 'sendonly');
+    assert.equal(created[0].transceivers[1].sender.track.kind, 'audio');
     assert.equal(answerer.peerCount, 1);
 
     const answer = FakeWebSocket.instance.sent.find((m) => m.type === 'answer');

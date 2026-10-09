@@ -13,7 +13,7 @@
 // sei_timestamp.go on the media side), and Chrome's default codec order puts
 // VP8 first - so publish *must* call preferH264() before createOffer or the
 // stream silently loses adaptive bitrate and end-to-end latency telemetry.
-import { P2PAnswerer } from './p2p-answerer.mjs';
+import { P2PAnswerer } from './p2p-answerer.mjs?v=20261010-1';
 import { gatherNatProbe } from './nat-probe.mjs';
 // H264 with packetization-mode=1 is ranked first because the node's SEI
 // extractor decodes mode 1 (mode 0 would drop every fragmented SEI on a
@@ -424,6 +424,10 @@ export class BrowserPublisher {
         detectCodec = detectPublishVideoCodec,
         P2PAnswererClass = P2PAnswerer,
         refreshLeadMs = 60 * 1000,
+        // Refresh at least this often regardless of token TTL, so the server's
+        // per-user idle timeout (which treats a session that stopped
+        // refreshing as dead) never reaps a live page.
+        maxRefreshMs = 60 * 1000,
         iceGatheringTimeoutMs = 2000,
         onState = () => {},
     }) {
@@ -444,6 +448,7 @@ export class BrowserPublisher {
         this.createPeerConnection = createPeerConnection;
         this.P2PAnswererClass = P2PAnswererClass;
         this.refreshLeadMs = refreshLeadMs;
+        this.maxRefreshMs = maxRefreshMs;
         this.iceGatheringTimeoutMs = iceGatheringTimeoutMs;
         this.onState = onState;
 
@@ -569,8 +574,8 @@ export class BrowserPublisher {
 
     scheduleRefresh() {
         const expiresAt = Date.parse(this.decision?.expiresAt || '');
-        if (Number.isNaN(expiresAt)) return;
-        const delay = Math.max(5_000, expiresAt - Date.now() - this.refreshLeadMs);
+        const untilExpiry = Number.isNaN(expiresAt) ? this.maxRefreshMs : expiresAt - Date.now() - this.refreshLeadMs;
+        const delay = Math.min(this.maxRefreshMs, Math.max(5_000, untilExpiry));
         this.refreshTimer = setTimeout(() => {
             this.refresh().catch((error) => this.onState('refresh-failed', error));
         }, delay);
