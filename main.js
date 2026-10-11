@@ -1484,14 +1484,21 @@ function startP2PPlayback(decision, generation, playConfig) {
     lastStats.timestamp = Date.now();
     statsInterval = setInterval(updateStats, 1000);
 
-    const p2pSeiEnabled = new URLSearchParams(window.location.search).get('p2psei') !== '0';
+    // Keep encoded insertable streams off by default. Chrome can fire ontrack
+    // and complete ICE while the encoded transform still prevents any frame
+    // from reaching the decoder (video stays 2x2, framesDecoded=0), which
+    // makes an otherwise-working P2P session fall back to edge. The P2P media
+    // path itself is already instrumented by ppobs; opt this SEI reader in
+    // explicitly with ?p2psei=1 when diagnosing timestamp extraction.
+    const p2pSeiEnabled = new URLSearchParams(window.location.search).get('p2psei') === '1';
     const path = createDirectP2PPlayback(decision, {
         bufferMs,
         WebSocketClass: WebSocket,
         PeerConnectionClass: RTCPeerConnection,
-        // TEMPORARY A/B test (2026-09-30): ?p2psei=0 disables the P2P OBS-SEI
-        // insertable-streams consumer, to tell "the transform blocks decode"
-        // apart from "the published RTP is undepacketizable".
+        // Optional diagnostic only: ?p2psei=1 enables the P2P OBS-SEI
+        // insertable-streams consumer. Disabled by default because some Chrome
+        // builds complete negotiation but never present a decoded frame while
+        // this transform is active.
         insertableStreams: p2pSeiEnabled,
         onVideoReceiver: p2pSeiEnabled ? (receiver) => {
             if (p2pSeiReaderAttached) return;
