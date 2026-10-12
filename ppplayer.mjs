@@ -406,6 +406,9 @@ class MediaMTXWebRTCReader {
   }
 
   #handleError(err) {
+    const httpStatus = (err && typeof err === 'object' && typeof err.httpStatus === 'number')
+      ? err.httpStatus : undefined;
+    const message = (err && typeof err === 'object' && err.message) ? err.message : String(err);
     if (this.state === 'running') {
       const staleSessionUrl = this.sessionUrl;
       if (this.pc !== null) {
@@ -418,21 +421,28 @@ class MediaMTXWebRTCReader {
       if (staleSessionUrl) {
         fetch(staleSessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
       }
-      
+      // Auth rejected (expired/invalid playback token): retrying this same URL
+      // would just spin against a 401. Stop the internal loop and hand control
+      // to the caller, which can re-mint a fresh token / re-resolve the play
+      // decision and start a new reader. See main.js's onUnauthorized.
+      if ((httpStatus === 401 || httpStatus === 403) && this.conf.onUnauthorized !== undefined) {
+        this.state = 'failed';
+        this.conf.onUnauthorized(message);
+        return;
+      }
       this.state = 'restarting';
       this.restartTimeout = window.setTimeout(() => {
         this.restartTimeout = null;
         this.state = 'running';
         this.#start();
       }, this.retryPause);
-      
       if (this.conf.onError !== undefined) {
-        this.conf.onError(`${err}, retrying in some seconds`);
+        this.conf.onError(`${message}, retrying in some seconds`);
       }
     } else if (this.state === 'getting_codecs') {
       this.state = 'failed';
       if (this.conf.onError !== undefined) {
-        this.conf.onError(err);
+        this.conf.onError(message);
       }
     }
   }
@@ -460,7 +470,7 @@ class MediaMTXWebRTCReader {
       })
       .catch((err) => {
         console.error(err);
-        this.#handleError(err.toString());
+        this.#handleError(err);
       });
   }
 
@@ -530,7 +540,11 @@ class MediaMTXWebRTCReader {
       headers: { ...this.#authHeader(), 'Content-Type': 'application/sdp' },
       body: offer,
     }).then((res) => {
-      if (res.status !== 201) return res.text().then(body => { throw new Error(`bad status code ${res.status}: ${body}`); });
+      if (res.status !== 201) return res.text().then(body => {
+        const err = new Error(`bad status code ${res.status}: ${body}`);
+        err.httpStatus = res.status;
+        throw err;
+      });
       const location = res.headers.get('location');
       if (!location) throw new Error("Missing Location header in response");
       

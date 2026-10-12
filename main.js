@@ -299,6 +299,10 @@ function stripCodecTypeSegment(whepUrl) {
 
 let reader = null;
 let readerGeneration = 0;
+// Guards the one-shot "edge rejected the WHEP token, refresh the play
+// decision" recovery (see handleEdgeAuthRejected), so a persistent 401 can't
+// loop. Reset for each new playback generation in startStream.
+let edgeAuthRefreshed = false;
 // The RTCRtpReceiver the Edge SEI reader is currently attached to, not a
 // boolean. MediaMTXWebRTCReader reconnects a failed WHEP session internally
 // (new PeerConnection, new receiver) without going through startStream, so a
@@ -967,6 +971,37 @@ async function resolveEdgeWhepUrl(edgeStreamUrl) {
     return { url: buildEdgeWhepUrl(edgeStreamUrl, codecType), codecType };
 }
 
+// One-shot recovery when the edge rejects a WHEP URL (401/403) - typically
+// because the edgeStreamUrl token's 8h TTL passed mid-session and the reader's
+// reconnect reused the stale URL. The edge now enforces txTime expiry, so
+// rather than spin on the same URL, re-mint the viewer token (its own TTL is
+// short) and re-resolve the play decision, then reconnect. Runs at most once
+// per playback generation; a second rejection just surfaces the error.
+async function handleEdgeAuthRejected(generation, err) {
+    if (generation !== readerGeneration) return;
+    console.warn('[Main] edge WHEP rejected:', err);
+    const cfg = activePlayConfig;
+    if (edgeAuthRefreshed || !cfg || !cfg.ppcenter || !cfg.appId || !cfg.streamName) {
+        statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${err}</div>`;
+        return;
+    }
+    edgeAuthRefreshed = true;
+    statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Refreshing playback route...</div>';
+    try {
+        let { txTime, txSecret } = cfg;
+        try {
+            ({ txTime, txSecret } = await mintViewerToken(cfg.ppcenter, cfg.appId, cfg.streamName));
+        } catch (e) {
+            console.warn('[Main] viewer token refresh failed; re-resolving with the existing token:', e && e.message);
+        }
+        if (generation !== readerGeneration) return;
+        await startFromPpcenter({ ...cfg, txTime, txSecret }, generation, {});
+    } catch (e) {
+        if (generation !== readerGeneration) return;
+        statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${e.message}</div>`;
+    }
+}
+
 // Builds and connects a single WHEP session for the given (url, codecType)
 // pair. Returns nothing directly - success/failure surface through the
 // reader's onConnected/onError callbacks, same as before this function
@@ -1028,6 +1063,13 @@ function negotiateAndConnect(generation, url, codecType) {
                 if (controlClient) switchMediaTrack(abrEngine.audioTrackId, 'connection_lost');
                 pauseVideoForAudioOnly();
             }
+        },
+        onUnauthorized: (err) => {
+            // The edge rejected our WHEP URL (401/403) - almost certainly the
+            // playback token's txTime expired (edgeStreamUrl TTL is 8h). The
+            // reader has stopped its internal retry; re-mint and reconnect.
+            if (generation !== readerGeneration) return;
+            handleEdgeAuthRejected(generation, err);
         },
         onConnected: () => {
             if (generation !== readerGeneration || !reader) return;
@@ -1131,6 +1173,7 @@ function showLinkNotice(message) {
 async function startStream(forceManual = false) {
     stopStream();
     const generation = ++readerGeneration;
+    edgeAuthRefreshed = false;
 
     const params = new URLSearchParams(window.location.search);
     const ppcenter = (params.get('ppcenter') || '').trim() || DEFAULT_PPCENTER;
