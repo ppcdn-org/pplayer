@@ -1,12 +1,13 @@
 // Builds the full WHEP URL for a ppcenter-issued edge stream base.
 //
-// ppcenter returns the bare edge stream base, e.g.
-//   https://edge-1.edge.pp-cdn.org/{appId}/{streamName}
-// with no codec segment, no /whep and no signature. The client appends the
-// codec it can actually decode (see codec-capability.mjs) and the WHEP
-// resource:
-//   .../{stream}/hevc/whep  when HEVC is supported
-//   .../{stream}/h264/whep  otherwise
+// ppcenter returns the edge stream base, e.g.
+//   https://edge-1.edge.pp-cdn.org/{appId}/{streamName}?txTime=..&txSecret=..
+// Its path is bare (no codec segment, no /whep) but its query DOES carry the
+// txTime/txSecret signature the edge verifies. The client appends the codec it
+// can actually decode (see codec-capability.mjs) and the WHEP resource, keeping
+// the query intact:
+//   .../{stream}/hevc/whep?txTime=..&txSecret=..  when HEVC is supported
+//   .../{stream}/h264/whep?txTime=..&txSecret=..  otherwise
 //
 // Idempotent for a URL that already carries a codec or /whep segment, so it is
 // safe regardless of which shape the server hands back.

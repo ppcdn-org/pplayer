@@ -1419,8 +1419,10 @@ async function startFromPpcenter(playConfig, generation, { natGatherPromise = nu
     }
 }
 
-// edgeStreamUrl is ppcenter's bare stream base. The codec (and therefore the
-// full WHEP URL) is decided here, from the browser's own HEVC capability.
+// edgeStreamUrl is ppcenter's edge stream base: bare path (no codec, no
+// /whep) but already carrying the txTime/txSecret signature. The codec (and
+// therefore the full WHEP URL) is decided here, from the browser's own HEVC
+// capability.
 async function startDirectStream(edgeStreamUrl, generation) {
     statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Connecting WHEP...</div>';
 
