@@ -2,7 +2,7 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20260929-2';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20261013-1';
 import { ABREngine } from './abr-engine.mjs?v=20260925-1';
 import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260925-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';

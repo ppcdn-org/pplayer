@@ -14,6 +14,18 @@ if (typeof crypto !== "undefined" && !crypto.randomUUID) {
 // server keys off this string to decide whether to leave auto mode on.
 const ABR_REASON_AUTO_BANDWIDTH = 'auto_bandwidth';
 
+// jitteredDelay spreads out reconnect timing instead of using a fixed
+// interval: if one Edge node drops at scale, every pplayer session attached
+// to it hits its retry branch at roughly the same moment, and a fixed delay
+// means they'd all retry again at the same moment too - a thundering herd
+// that can hit the just-recovered Edge with a synchronized spike right when
+// it's weakest. Returns a value in [baseMs, 2*baseMs), so a retry is never
+// faster than before (baseMs was chosen for a reason) but is spread out
+// across up to double that window.
+function jitteredDelay(baseMs) {
+  return baseMs + Math.random() * baseMs;
+}
+
 // ==========================================
 // 1. MMX Control Client (WebSocket Protocol)
 // ==========================================
@@ -97,12 +109,13 @@ class MMXControlClient {
             
             if (this.callbacks.onDisconnected) this.callbacks.onDisconnected();
 
-            // [核心修复] 自动重连逻辑
+            // [核心修复] 自动重连逻辑（加抖动，避免 Edge 大规模掉线时所有客户端同时重连）
             if (!this.isIntentionalClose) {
-                console.warn(`[WS] Connection lost unexpectedly. Retrying in ${this.reconnectDelay}ms...`);
+                const delay = jitteredDelay(this.reconnectDelay);
+                console.warn(`[WS] Connection lost unexpectedly. Retrying in ${Math.round(delay)}ms...`);
                 this.reconnectTimer = setTimeout(() => {
                     this.connect();
-                }, this.reconnectDelay);
+                }, delay);
             }
         };
 
@@ -431,11 +444,13 @@ class MediaMTXWebRTCReader {
         return;
       }
       this.state = 'restarting';
+      // Jittered, same reasoning as MMXControlClient's reconnect above: a
+      // mass Edge disconnect must not make every reader retry in lockstep.
       this.restartTimeout = window.setTimeout(() => {
         this.restartTimeout = null;
         this.state = 'running';
         this.#start();
-      }, this.retryPause);
+      }, jitteredDelay(this.retryPause));
       if (this.conf.onError !== undefined) {
         this.conf.onError(`${message}, retrying in some seconds`);
       }
@@ -605,4 +620,4 @@ class MediaMTXWebRTCReader {
   }
 }
 
-export { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH };
+export { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH, jitteredDelay };
