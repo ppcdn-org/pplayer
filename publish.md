@@ -53,7 +53,7 @@
 | `403 app_forbidden` | appId 不属于当前账号 |
 | `402 account_in_arrears` | 账号欠费 |
 | `409 stream_in_use` | 已不再出现：同一 `{appId}/{streamName}` 再次推流会**自动顶替**上一个会话（appId 全局唯一，旧会话只可能是自己的残留）。若仍见到，说明服务端早于 v1.0.72 |
-| `429 too_many_publish_sessions` | 同账号并发超过 `browserPublish.maxSessionsPerUser`（默认 2） |
+| `429 too_many_publish_sessions` | 同账号并发超过 `browserPublish.maxSessionsPerUser`（默认 2）。**已关闭/崩溃的页面不再占用名额**：会话超过 5 分钟没被刷新即视为空闲，不计入并发上限；正常关页也会兜底停止 |
 | `503 browser_publish_unavailable` | 服务端 `browserPublish.disabled=true` |
 | 开始后 pplayer 404/黑屏 | Origin 尚在收到该流，等 1–2s 重试；确认 Origin 已放行 pplayer 跨域 |
 | P2P 不生效 | 需 H264 + 双方 NAT 可穿透 + 有 publisher 空闲槽；对称 NAT/CGNAT 会回退 Edge |
