@@ -213,6 +213,17 @@ function preferP2P() {
     return P2P_CONNECTION_ENABLED && (p2pCheckbox ? p2pCheckbox.checked : true);
 }
 
+// Toggling the switch mid-session re-requests the play decision so the change
+// takes effect right away, instead of only on the next Start. Idle toggles do
+// nothing (the decision is only asked for when a start begins).
+if (p2pCheckbox) {
+    p2pCheckbox.addEventListener('change', () => {
+        if (reader || playbackRace) {
+            startStream(lastStartManual);
+        }
+    });
+}
+
 (() => {
     if (!bufferRange) return;
     // With no explicit request the slider still has to sit somewhere: park it
