@@ -1,33 +1,30 @@
 // PLY-013: consume the absolute timestamp ppobs embeds per frame and turn it
 // into an end-to-end delay, using the PLY-014-calibrated clock from
-// time-sync.mjs instead of raw Date.now(). Original wire format is the
-// "obs-timestamp" WebRTC DataChannel JSON ppobs sends
-// (ppobs/docs/obs-abs-timestamp-protocol.md §3):
-// {"frame_no": <uint16 rtp seq>, "timestamp": <utc epoch ms>, "rid": "<simulcast layer>"}
+// time-sync.mjs instead of raw Date.now(). ppobs embeds the timestamp
+// directly in the codec bitstream as a SEI (H.264/H.265) / metadata OBU
+// (AV1) payload (ppobs/docs/obs-abs-timestamp-protocol.md §2) - this works
+// uniformly across RTMP/ERTMP, SRT, and WHIP ingest since it's part of the
+// bitstream itself, not a protocol-specific side channel.
 //
-// mmx does not forward this as a literal WebRTC DataChannel, though — Origin
-// already receives it (ppmmx/internal/servers/webrtc/session.go
-// onInboundDataChannel) and re-broadcasts it to WHEP readers as an
-// `{"type":"OBS_TIMESTAMP","data":{frame_no,timestamp,rid}}` envelope over
-// the same ABR control WebSocket ppplayer's MMXControlClient already opens
-// (ppplayer.js), not a new channel. isValidObsTimestampMessage validates the
-// already-JSON.parsed `data` object regardless of which envelope it arrived
-// in.
+// mmx extracts that SEI/OBU on whichever protocol the publisher used (see
+// internal/servers/webrtc/sei_timestamp.go for WHIP, internal/protocols/rtmp
+// and internal/protocols/mpegts's to_stream.go for RTMP/SRT) and
+// re-broadcasts it to WHEP readers as a `{"type":"OBS_TIMESTAMP",
+// "data":{"timestamp":<ms>}}` envelope over the same ABR control WebSocket
+// ppplayer's MMXControlClient already opens (ppplayer.mjs), not a new
+// channel. isValidObsTimestampMessage validates the already-JSON.parsed
+// `data` object regardless of which ingest protocol produced it.
 //
-// Scope note: ppobs only sends this over its WHIP connection to Origin (not
-// over the direct P2P PeerConnection to a player), so this only ever fires
-// for the edge path today; the P2P path relies on RTCP RTT instead (see
-// docs/tech/P2P时延测量方案.md §4). It also only reaches viewers connected to
-// Origin directly until Edge relays what it pulls from Origin onward
-// (MMX-111/MMX-309 — Edge-side relay tracked separately).
+// Scope note: this only ever fires for the edge path today (SEI read via
+// WebCodecs Insertable Streams - see sei-timestamp.js - covers the direct
+// P2P PeerConnection case for Chromium browsers instead); the P2P path for
+// other browsers relies on RTCP RTT (see docs/tech/P2P时延测量方案.md §4).
 
 export function isValidObsTimestampMessage(msg) {
     return !!msg
         && typeof msg === 'object'
         && Number.isFinite(msg.timestamp)
-        && msg.timestamp > 0
-        && Number.isInteger(msg.frame_no)
-        && typeof msg.rid === 'string';
+        && msg.timestamp > 0;
 }
 
 // nowMs must already be offset-corrected (TimeSync#now()); passing the

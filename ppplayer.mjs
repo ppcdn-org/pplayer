@@ -162,9 +162,11 @@ class MMXControlClient {
                 break;
 
             case 'OBS_TIMESTAMP':
-                // Relayed from the WHIP publisher's "obs-timestamp" DataChannel
-                // (see docs/obs-abs-timestamp-protocol.md in the OBS repo).
-                // data: { frame_no, timestamp, rid }
+                // The OBS absolute-timestamp mmx extracted from the publisher's
+                // own bitstream SEI (see docs/obs-abs-timestamp-protocol.md in
+                // the OBS repo) - works the same for RTMP/SRT/WHIP ingest since
+                // SEI is embedded in the codec bitstream, not a protocol-specific
+                // side channel. data: { timestamp }
                 if (this.callbacks.onObsTimestamp) this.callbacks.onObsTimestamp(data);
                 break;
 

@@ -3,7 +3,7 @@
 // in the OBS repo) directly out of the received H.264/H.265 bitstream via
 // WebCodecs Insertable Streams (RTCRtpReceiver.createEncodedStreams()).
 //
-// Unlike the "obs-timestamp" DataChannel relay (see mmxplayer.js /
+// Unlike the OBS_TIMESTAMP server relay (see obs-timestamp.mjs /
 // obs_timestamp_broadcast.go), the SEI travels inside the encoded frame
 // itself, so it survives mmx-to-mmx cascading (origin -> edge -> ...)
 // without any server-side relay code: mmx's WHIP/WHEP path is pure RTP
@@ -24,7 +24,7 @@
 // Chromium-only (createEncodedStreams requires the PeerConnection to be
 // constructed with { encodedInsertableStreams: true }, see mmxplayer.js);
 // on browsers without it, attachSeiTimestampReader() is a no-op returning
-// false, and the caller should keep relying on the DataChannel relay.
+// false, and the caller should keep relying on the OBS_TIMESTAMP server relay.
 
 const OBS_ABS_TS_SEI_UUID = new Uint8Array([
     0x4F, 0x42, 0x53, 0x2D, 0x41, 0x42, 0x53, 0x54, // "OBS-ABST"

@@ -416,16 +416,17 @@ function readNegotiatedCodecs(pc) {
 //    bitstream via WebCodecs Insertable Streams. Survives mmx-to-mmx
 //    cascading (no server-side relay needed) and is inherently correct
 //    for whatever layer is actually being decoded. Chromium-only.
-// 2. DataChannel relay (OBS_TIMESTAMP over the ABR control WebSocket, see
-//    obs_timestamp_broadcast.go in mmx): only valid for a direct
-//    OBS->mmx->player hop (no cascading), and needs manual rid matching
-//    since it carries every simulcast layer's messages. Kept as a
-//    fallback for non-Chromium browsers where SEI reading isn't available.
+// 2. Server relay (OBS_TIMESTAMP over the ABR control WebSocket, see
+//    obs_timestamp_broadcast.go in mmx): mmx extracts the same in-band SEI
+//    from the publisher's bitstream - RTMP/SRT/WHIP ingest alike - and
+//    rebroadcasts it, so this only needs a direct OBS->mmx->player hop
+//    (no cascading). Kept as a fallback for non-Chromium browsers where
+//    SEI reading isn't available.
 //
 // SEI takes priority whenever both are reporting fresh values.
 let lastP2PDelayMs = null;
 let lastP2PDelayAt = 0;
-let lastP2PDelaySource = null; // 'sei' | 'datachannel'
+let lastP2PDelaySource = null; // 'sei' | 'relay'
 const P2P_DELAY_STALE_MS = 5000;
 // Fixed compensation added to every delay reading, on BOTH the P2P and the
 // Edge path (they share reportP2PDelay below, so there is no per-path
@@ -460,8 +461,8 @@ const P2P_DELAY_MAX_PLAUSIBLE_MS = 60000;
 
 function reportP2PDelay(timestampMs, source) {
     // SEI is strictly more accurate (in-band, cascade-safe, no rid
-    // ambiguity) - once it's reporting, ignore stale DataChannel values.
-    if (source === 'datachannel' && lastP2PDelaySource === 'sei' &&
+    // ambiguity) - once it's reporting, ignore stale server-relay values.
+    if (source === 'relay' && lastP2PDelaySource === 'sei' &&
         (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS) {
         return;
     }
@@ -1764,14 +1765,13 @@ function initControlClient(whepUrl, sessionId) {
         },
         onObsTimestamp: (data) => {
             // Fallback path (see comment above lastP2PDelayMs) - only used
-            // when SEI reading isn't available. Only count frames from the
-            // layer we're actually decoding: OBS tags each simulcast
-            // layer's frames with that layer's own rid, and
-            // frame_no/timestamp are meaningless if mismatched.
-            const activeTrack = abrEngine.trackRegistry[abrEngine.currentTrackId];
-            const activeRid = activeTrack ? String(activeTrack.rid) : null;
-            if (activeRid === null || String(data.rid) !== activeRid) return;
-            reportP2PDelay(data.timestamp, 'datachannel');
+            // when SEI reading isn't available. mmx extracts and broadcasts
+            // one timestamp per path regardless of which simulcast layer
+            // produced it (see obs-timestamp.mjs) - every layer encodes the
+            // same source frame at essentially the same wall-clock time, so
+            // this is accurate enough without per-layer rid matching.
+            if (!isValidObsTimestampMessage(data)) return;
+            reportP2PDelay(data.timestamp, 'relay');
         },
         onABRMode: (auto) => {
             // The server is authoritative about who is choosing layers -
@@ -2207,14 +2207,14 @@ async function updateStats() {
             const p2pImplausible = p2pFresh &&
                 (lastP2PDelayMs < P2P_DELAY_MIN_PLAUSIBLE_MS || lastP2PDelayMs > P2P_DELAY_MAX_PLAUSIBLE_MS);
             // The real measurement (SEI whenever encoded streams are
-            // available, otherwise the DataChannel relay) wins whenever it is
+            // available, otherwise the server relay) wins whenever it is
             // fresh and plausible; the RTT + jitter-buffer estimate only
             // covers the cold-start window / unsupported browsers and is
             // always labelled "(est.)" so it is never mistaken for a
             // measurement.
             const p2pLabel = !p2pFresh || p2pImplausible
                 ? `~${estimatedP2PDelayMs.toFixed(0)} ms (est.)`
-                : `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'DC'})`;
+                : `${lastP2PDelayMs.toFixed(0)} ms (${lastP2PDelaySource === 'sei' ? 'SEI' : 'Relay'})`;
 
             // Only chase a measurement that's both fresh and plausible - the
             // same gate the displayed label uses. The RTT/jitter-buffer
