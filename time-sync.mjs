@@ -31,9 +31,19 @@
 // clock artifact.
 
 const DEFAULT_PPCENTER_URL = 'http://127.0.0.1:18000';
-// 30~60s per the design doc: device clocks drift, so a single calibration at
-// startup goes stale over a long broadcast.
-const DEFAULT_RESYNC_INTERVAL_MS = 45000;
+// 10 minutes: device clocks drift, so a single calibration at startup goes
+// stale over a long broadcast, but the resync itself costs a burst of
+// sampleCount WebSocket messages on an already-open connection (no new
+// connection - the 30s server ping in ppcenter's play_hub.go already keeps
+// this socket alive regardless of how rarely TIME_SYNC fires). At a typical
+// uncorrected consumer clock's worst-case drift (~100ppm), 10 minutes is
+// ~60ms of worst-case staleness - still small next to the 70-400ms
+// latencies this measures, and far cheaper at scale than the previous 45s
+// cadence. Keep in sync with ppobs's mirror (ppcenter-time-sync.cpp's
+// RESYNC_INTERVAL_MS) and ntp-clock.c's NTP_PPCENTER_STALE_NS, which must
+// stay larger than this or ppobs's offset looks stale before its own next
+// resync and it falls back to public NTP more often than intended.
+const DEFAULT_RESYNC_INTERVAL_MS = 600000;
 const DEFAULT_SAMPLE_COUNT = 6;
 const SAMPLE_SPACING_MS = 150;
 const PROBE_TIMEOUT_MS = 5000;
