@@ -324,6 +324,22 @@ let edgeAuthRefreshed = false;
 // video) exactly when a first WHEP attempt fails and the retry succeeds.
 let seiReaderReceiver = null;
 let p2pSeiReaderAttached = false;
+// Fast, SEI-specific stall detector for the exact symptom in startP2PPlayback's
+// p2pSeiEnabled comment: encodedInsertableStreams can hold every encoded frame
+// at the transform forever (received/assembled, framesDecoded stuck at 0)
+// instead of a parse error or a clean failure. The generic StallWatchdog can't
+// catch this - it only arms after firstFrameDecoded (see updateStats), which
+// never becomes true here. p2pSeiZeroDecodeStreak counts consecutive
+// updateStats() ticks (1/sec) where packets are arriving but framesDecoded is
+// still 0; p2pSeiWatchdogTrip is the current P2P attempt's fallbackToEdge,
+// reachable from updateStats() (a module-level function, not a closure over
+// startP2PPlayback) only via this reference. One-shot: cleared the moment it
+// fires, so a session that reaches this never retries SEI again (the P2P leg
+// itself is untouched - this only abandons the transform in favor of edge,
+// via the same fallback every other P2P failure already uses).
+let p2pSeiZeroDecodeStreak = 0;
+let p2pSeiWatchdogTrip = null;
+const P2P_SEI_STALL_SECONDS = 3;
 let controlClient = null;
 let statsInterval = null;
 // Set once a playback path is actually carrying media. In direct mode this
@@ -1132,6 +1148,8 @@ function resetSessionState() {
     lastP2PDelaySource = null;
     seiReaderReceiver = null;
     p2pSeiReaderAttached = false;
+    p2pSeiZeroDecodeStreak = 0;
+    p2pSeiWatchdogTrip = null;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
     lastStats = {
@@ -1541,21 +1559,24 @@ function startP2PPlayback(decision, generation, playConfig) {
     lastStats.timestamp = Date.now();
     statsInterval = setInterval(updateStats, 1000);
 
-    // Keep encoded insertable streams off by default. Chrome can fire ontrack
-    // and complete ICE while the encoded transform still prevents any frame
-    // from reaching the decoder (video stays 2x2, framesDecoded=0), which
-    // makes an otherwise-working P2P session fall back to edge. The P2P media
-    // path itself is already instrumented by ppobs; opt this SEI reader in
-    // explicitly with ?p2psei=1 when diagnosing timestamp extraction.
-    const p2pSeiEnabled = new URLSearchParams(window.location.search).get('p2psei') === '1';
+    // Encoded insertable streams on by default (?p2psei=0 to opt out). Some
+    // Chrome builds can fire ontrack and complete ICE while the encoded
+    // transform still prevents any frame from reaching the decoder (video
+    // stays 2x2, framesDecoded=0 forever) - this used to mean turning the
+    // transform on risked an otherwise-working P2P session hanging well past
+    // the generic "no frame within grace window" fallback (graceMs below,
+    // 4-6+s). p2pSeiWatchdogTrip (armed below, checked in updateStats) now
+    // catches that exact signature - packets arriving, framesDecoded stuck at
+    // 0 - in P2P_SEI_STALL_SECONDS and reverts to edge via the same
+    // fallbackToEdge every other P2P failure uses, well before the generic
+    // timer would. On a browser where the transform behaves normally this
+    // never trips, and reportP2PDelay gets a real SEI-derived value instead
+    // of the RTT/jitter estimate.
+    const p2pSeiEnabled = new URLSearchParams(window.location.search).get('p2psei') !== '0';
     const path = createDirectP2PPlayback(decision, {
         bufferMs,
         WebSocketClass: WebSocket,
         PeerConnectionClass: RTCPeerConnection,
-        // Optional diagnostic only: ?p2psei=1 enables the P2P OBS-SEI
-        // insertable-streams consumer. Disabled by default because some Chrome
-        // builds complete negotiation but never present a decoded frame while
-        // this transform is active.
         insertableStreams: p2pSeiEnabled,
         onVideoReceiver: p2pSeiEnabled ? (receiver) => {
             if (p2pSeiReaderAttached) return;
@@ -1588,6 +1609,14 @@ function startP2PPlayback(decision, generation, playConfig) {
         // real costTime, or negotiateAndConnect's onError reports the failure.
         startDirectStream(decision.edgeStreamUrl, generation);
     };
+
+    // Armed only when the transform is actually attached - see
+    // p2pSeiZeroDecodeStreak's declaration for why updateStats (not a closure
+    // here) is what calls this.
+    p2pSeiZeroDecodeStreak = 0;
+    p2pSeiWatchdogTrip = p2pSeiEnabled
+        ? () => fallbackToEdge(`P2P SEI transform appears to block decode (framesDecoded stuck at 0 for ${P2P_SEI_STALL_SECONDS}s while packets were arriving)`)
+        : null;
 
     // Bound the P2P handshake itself (offer -> publisher answer -> first track).
     // onNegotiated fires as soon as the answer's remote track is applied, which
@@ -2079,6 +2108,29 @@ async function updateStats() {
             lastStats.videoBytes = videoStats.bytesReceived;
             lastStats.videoPacketsLost = videoStats.packetsLost || 0;
             lastStats.videoPacketsReceived = videoStats.packetsReceived || 0;
+
+            // See p2pSeiWatchdogTrip's declaration: packets arriving (vRecv,
+            // this tick's delta - cumulative packetsReceived alone would stay
+            // "true" forever after the first packet, including after a real
+            // stall unrelated to this) but framesDecoded cumulatively still
+            // zero, for P2P_SEI_STALL_SECONDS straight ticks, is exactly the
+            // "transform is holding every frame" signature - a real decode
+            // stall after frames were already flowing is the unrelated
+            // generic StallWatchdog's job (gated on firstFrameDecoded).
+            if (p2pSeiWatchdogTrip) {
+                if (vRecv > 0 && (videoStats.framesDecoded || 0) === 0) {
+                    p2pSeiZeroDecodeStreak++;
+                    if (p2pSeiZeroDecodeStreak >= P2P_SEI_STALL_SECONDS) {
+                        const trip = p2pSeiWatchdogTrip;
+                        p2pSeiWatchdogTrip = null; // one-shot - never retried this session
+                        p2pSeiZeroDecodeStreak = 0;
+                        trip();
+                    }
+                } else {
+                    p2pSeiZeroDecodeStreak = 0;
+                    if ((videoStats.framesDecoded || 0) > 0) p2pSeiWatchdogTrip = null; // real decode started; nothing left to watch for
+                }
+            }
         }
 
         // TEMPORARY (2026-09-30): P2P decode diagnosis - remove once the P2P
