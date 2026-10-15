@@ -70,3 +70,44 @@ export async function requestPlayDecision(config, { fetchImpl = fetch, signal, n
     }
     return body;
 }
+
+// requestErtspPlayDecision is requestPlayDecision's ERTSP counterpart, kept
+// separate rather than folded into it: ERTSP never attempts P2P (no NAT
+// probe, no capability toggle) and its decision shape is deliberately
+// different - mode "edge-ertsp" and an rtsp:// edgeStreamUrl, which
+// requestPlayDecision's validation above rejects on purpose (it only ever
+// expects the WHEP contract: "edge-only"/"p2p-connect" and an http(s) URL).
+export async function requestErtspPlayDecision(config, { fetchImpl = fetch, signal } = {}) {
+    const endpoint = new URL('/v1/play/requests', config.ppcenter).toString();
+    const response = await fetchImpl(endpoint, {
+        method: 'POST',
+        signal,
+        headers: {
+            'Authorization': `Bearer ${config.appId}:${config.txTime}:${config.txSecret}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            streamName: config.streamName,
+            clientId: config.clientId,
+            requestRegion: config.requestRegion,
+            capabilities: ['ertsp'],
+        }),
+    });
+    let body;
+    try {
+        body = await response.json();
+    } catch {
+        body = null;
+    }
+    if (!response.ok) {
+        throw new Error(body?.message || `play request failed with status ${response.status}`);
+    }
+    if (body?.mode !== 'edge-ertsp' || !body?.edgeStreamUrl) {
+        throw new Error('ppcenter returned an unsupported play decision');
+    }
+    const edgeStreamUrl = new URL(body.edgeStreamUrl);
+    if (edgeStreamUrl.protocol !== 'rtsp:') {
+        throw new Error('ppcenter returned an invalid ERTSP stream URL');
+    }
+    return body;
+}

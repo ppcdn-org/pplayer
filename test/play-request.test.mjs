@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parsePlayRequest, requestPlayDecision } from '../play-request.mjs';
+import { parsePlayRequest, requestPlayDecision, requestErtspPlayDecision } from '../play-request.mjs';
 
 test('parses complete ppcenter query and generates client ID', () => {
     const config = parsePlayRequest('?ppcenter=https%3A%2F%2Fcenter.example&appId=app1&streamName=live&txTime=abc&txSecret=sig', () => 'generated');
@@ -118,4 +118,43 @@ test('rejects P2P decisions with invalid race timing', async () => {
             p2p: { sessionId: 'session', signalUrl: 'wss://signal.example', token: 'token', raceWindowMs: 500, connectTimeoutMs: 500 },
         }),
     }) }), /invalid P2P decision/);
+});
+
+test('requestErtspPlayDecision sends only the ertsp capability, no P2P/natProbeId fields', async () => {
+    let captured;
+    const decision = { mode: 'edge-ertsp', edgeStreamUrl: 'rtsp://txtime:txsecret@edge.example:8554/app/live/h264' };
+    const result = await requestErtspPlayDecision({
+        ppcenter: 'https://center.example/base', appId: 'app1', streamName: 'live',
+        txTime: 'abc', txSecret: 'sig', clientId: 'viewer', requestRegion: 'Sydney',
+    }, { fetchImpl: async (url, options) => {
+        captured = { url, options };
+        return { ok: true, status: 200, json: async () => decision };
+    }});
+    assert.equal(captured.url, 'https://center.example/v1/play/requests');
+    assert.equal(captured.options.headers.Authorization, 'Bearer app1:abc:sig');
+    assert.deepEqual(JSON.parse(captured.options.body), {
+        streamName: 'live', clientId: 'viewer', requestRegion: 'Sydney', capabilities: ['ertsp'],
+    });
+    assert.equal(result.edgeStreamUrl, decision.edgeStreamUrl);
+});
+
+test('requestErtspPlayDecision rejects a WHEP-shaped decision (wrong mode)', async () => {
+    await assert.rejects(() => requestErtspPlayDecision({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, { fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ mode: 'edge-only', edgeStreamUrl: 'https://edge.example/app/live' }) }) }),
+    /unsupported/);
+});
+
+test('requestErtspPlayDecision rejects a non-rtsp edgeStreamUrl', async () => {
+    await assert.rejects(() => requestErtspPlayDecision({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, { fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ mode: 'edge-ertsp', edgeStreamUrl: 'https://edge.example/app/live' }) }) }),
+    /invalid ERTSP stream URL/);
+});
+
+test('requestErtspPlayDecision surfaces the API error message', async () => {
+    await assert.rejects(() => requestErtspPlayDecision({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, { fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({ message: 'expired' }) }) }),
+    /expired/);
 });
