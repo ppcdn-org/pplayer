@@ -51,7 +51,13 @@ export async function requestPlayDecision(config, { fetchImpl = fetch, signal, n
         body = null;
     }
     if (!response.ok) {
-        throw new Error(body?.message || `play request failed with status ${response.status}`);
+        const error = new Error(body?.message || `play request failed with status ${response.status}`);
+        // Carry the wire status/code so a caller can tell a transient
+        // "edge not ready yet" apart from a real auth/validation failure
+        // (see isTransientPlayError / requestPlayDecisionWithRetry).
+        error.status = response.status;
+        if (body?.code) error.code = body.code;
+        throw error;
     }
     if ((body?.mode !== 'edge-only' && body?.mode !== 'p2p-connect') || !body?.edgeStreamUrl) {
         throw new Error('ppcenter returned an unsupported play decision');
@@ -110,4 +116,56 @@ export async function requestErtspPlayDecision(config, { fetchImpl = fetch, sign
         throw new Error('ppcenter returned an invalid ERTSP stream URL');
     }
     return body;
+}
+
+// ppcenter answers 503 no_edge_available while a stream's Origin is momentarily
+// not reporting it. The common cause is benign: a publisher reconnecting or
+// switching transport leaves the Origin with no live path for a few seconds,
+// and ppcenter only learns the new pipeline set on the node's next heartbeat
+// (every 10s). Retrying is exactly right there - the stream is up again a
+// moment later - while a genuinely offline stream just exhausts the attempts
+// and reports the same error as before. Only this transient class is retried;
+// auth/validation failures (401/403/400, ...) throw on the first attempt.
+export const PLAY_REQUEST_MAX_ATTEMPTS = 6;
+export const PLAY_REQUEST_RETRY_DELAY_MS = 2000;
+
+export function isTransientPlayError(error) {
+    if (!error) return false;
+    if (error.status === 503) return true;
+    if (error.code === 'no_edge_available' || error.code === 'no_healthy_edge') return true;
+    // Older ppcenter bodies carry no status/code on the error - fall back to
+    // the message text so the retry still engages.
+    return /no healthy edge/i.test(error.message || '');
+}
+
+export async function requestPlayDecisionWithRetry(config, {
+    signal,
+    natProbeId,
+    preferP2P = true,
+    fetchImpl,
+    maxAttempts = PLAY_REQUEST_MAX_ATTEMPTS,
+    retryDelayMs = PLAY_REQUEST_RETRY_DELAY_MS,
+    onRetry = null,
+} = {}) {
+    // Abort-aware delay: a stop/switch while waiting resolves the wait
+    // immediately so the loop can observe the aborted signal and bail out
+    // instead of holding the request open for the full backoff.
+    const delay = (ms) => new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        if (signal) {
+            signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+        }
+    });
+
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await requestPlayDecision(config, { signal, natProbeId, preferP2P, fetchImpl });
+        } catch (error) {
+            if (error?.name === 'AbortError' || signal?.aborted) throw error;
+            if (!isTransientPlayError(error) || attempt >= maxAttempts) throw error;
+            if (onRetry) onRetry(attempt, error);
+            await delay(retryDelayMs);
+            if (signal?.aborted) throw error;
+        }
+    }
 }

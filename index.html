@@ -87,39 +87,25 @@
     </div>
     <div class="controls-row">
         <div style="display: flex; align-items: center; gap: 5px;">
-            <label for="protocolSelect">Protocol:</label>
-            <select id="protocolSelect"
-                    title="WEBRTC: play inline here (WHEP, optionally P2P). ERTSP: this page cannot decode RTSP itself - it instead asks ppcenter for a signed rtsp:// connection string for embedded devices, VLC, ffplay, etc. to open directly.">
-                <option value="webrtc" selected>WEBRTC</option>
-                <option value="ertsp">ERTSP</option>
+            <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
+            <label for="layerSelect">Quality:</label>
+            <select id="layerSelect" disabled>
+                <option value="-1">Auto (Waiting WS...)</option>
             </select>
         </div>
 
-        <!-- WEBRTC-only controls, hidden by main.js when protocolSelect is ERTSP
-             (quality/buffer/P2P are all WHEP/RTCPeerConnection concepts that
-             don't apply to a signed rtsp:// connection string). -->
-        <span id="webrtcControls" style="display: contents;">
-            <div style="display: flex; align-items: center; gap: 5px;">
-                <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
-                <label for="layerSelect">Quality:</label>
-                <select id="layerSelect" disabled>
-                    <option value="-1">Auto (Waiting WS...)</option>
-                </select>
-            </div>
+        <div id="bufferControl" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
+             title="Playout buffer: how much media the jitter buffer holds before rendering. Higher = smoother under jitter, more latency. Defaults to auto - the browser's own adaptive buffer.">
+            <label for="bufferRange">Buffer:</label>
+            <input type="range" id="bufferRange" min="100" max="1000" step="50" value="100">
+            <span id="bufferValue">auto</span>
+        </div>
 
-            <div id="bufferControl" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
-                 title="Playout buffer: how much media the jitter buffer holds before rendering. Higher = smoother under jitter, more latency. Defaults to auto - the browser's own adaptive buffer.">
-                <label for="bufferRange">Buffer:</label>
-                <input type="range" id="bufferRange" min="100" max="1000" step="50" value="100">
-                <span id="bufferValue">auto</span>
-            </div>
-
-            <label for="p2pCheckbox" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
-                   title="P2P: prefer a direct peer-to-peer connection to the publisher, and fall back to the edge node automatically when it can't connect. Uncheck to always play from the edge node.">
-                <input type="checkbox" id="p2pCheckbox" checked>
-                P2P
-            </label>
-        </span>
+        <label for="p2pCheckbox" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
+               title="P2P: prefer a direct peer-to-peer connection to the publisher, and fall back to the edge node automatically when it can't connect. Uncheck to always play from the edge node.">
+            <input type="checkbox" id="p2pCheckbox" checked>
+            P2P
+        </label>
 
         <button id="startBtn" title="Start">&#x25B6;</button>
         <button id="exitBtn" title="Exit">&#x23F9;</button>
@@ -136,24 +122,6 @@
 <div id="main-area">
     <div id="video-container">
         <video id="video" autoplay playsinline muted controls></video>
-        <!-- Shown instead of the <video> element when protocolSelect is ERTSP:
-             browsers have no native RTSP transport/decoder, so this page
-             never decodes ERTSP itself - it only displays the signed
-             rtsp://txTime:txSecret@host:port/appId/stream/codec connection
-             string ppcenter issues, for an embedded device, VLC, ffplay,
-             etc. to open directly. See main.js's startErtsp(). -->
-        <div id="ertspPanel" style="display: none; max-width: 640px; padding: 24px; text-align: center; color: #ddd;">
-            <div style="margin-bottom: 10px; color: #888;">
-                ERTSP connection string - open this in an RTSP client (embedded device, VLC, ffplay).
-                This page does not play ERTSP inline; browsers have no native RTSP support.
-            </div>
-            <div style="display: flex; gap: 8px;">
-                <input type="text" id="ertspUrl" readonly
-                       style="flex: 1; padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #0f0; font-family: monospace; font-size: 13px;">
-                <button id="ertspCopyBtn" title="Copy to clipboard">&#x1F4CB;</button>
-            </div>
-            <div id="ertspStatus" style="margin-top: 10px; color: #888; font-size: 13px;"></div>
-        </div>
     </div>
     <div id="stats">
         <div style="color: #888; text-align: center;">Waiting for stream...</div>
@@ -176,7 +144,7 @@
 <!-- ES modules: main.js imports everything else, so only the entry point is
      listed here. Module scripts are deferred and run after parsing, so the
      DOM lookups at the top of main.js are safe. -->
-<script type="module" src="main.js?v=20261015-1"></script>
+  <script type="module" src="main.js?v=20261016-3"></script>
 
 </body>
 </html>

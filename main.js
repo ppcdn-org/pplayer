@@ -7,7 +7,7 @@ import { ABREngine } from './abr-engine.mjs?v=20260925-1';
 import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260925-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20260925-1';
 import { TimeSync } from './time-sync.mjs?v=20260925-1';
-import { parsePlayRequest, requestPlayDecision, requestErtspPlayDecision } from './play-request.mjs?v=20261015-1';
+import { parsePlayRequest, requestPlayDecisionWithRetry } from './play-request.mjs?v=20261016-1';
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
 import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260930-1';
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
@@ -22,12 +22,6 @@ const statsContainer = document.querySelector('#local-video .stat ul') || docume
 const layerSelect = document.getElementById('quality-select') || document.getElementById('layerSelect');
 const wsStatusDot = document.getElementById('wsStatus');
 const streamInputEl = document.getElementById('streamInput');
-const protocolSelectEl = document.getElementById('protocolSelect');
-const webrtcControlsEl = document.getElementById('webrtcControls');
-const ertspPanelEl = document.getElementById('ertspPanel');
-const ertspUrlEl = document.getElementById('ertspUrl');
-const ertspStatusEl = document.getElementById('ertspStatus');
-const ertspCopyBtnEl = document.getElementById('ertspCopyBtn');
 (() => {
     if (!wsStatusDot) {
         const dot = document.createElement('span');
@@ -228,106 +222,6 @@ if (p2pCheckbox) {
             startStream(lastStartManual);
         }
     });
-}
-
-// Protocol selector: WEBRTC (default) plays inline via WHEP/P2P as above;
-// ERTSP is a parallel, much simpler path (see startErtsp()) that never
-// touches the race controller, P2P or the <video> element at all - this
-// page cannot decode RTSP itself, so switching to ERTSP swaps the WebRTC
-// controls and <video> for the connection-string panel instead.
-function isErtspSelected() {
-    return protocolSelectEl ? protocolSelectEl.value === 'ertsp' : false;
-}
-
-function updateProtocolUI() {
-    const ertsp = isErtspSelected();
-    if (webrtcControlsEl) webrtcControlsEl.style.display = ertsp ? 'none' : 'contents';
-    if (video) video.style.display = ertsp ? 'none' : '';
-    if (ertspPanelEl) ertspPanelEl.style.display = ertsp ? 'flex' : 'none';
-    if (ertspPanelEl) ertspPanelEl.style.flexDirection = 'column';
-}
-
-function showErtspStatus(message, isError) {
-    if (!ertspStatusEl) return;
-    ertspStatusEl.textContent = message;
-    ertspStatusEl.style.color = isError ? '#ff6b6b' : '#888';
-}
-
-if (protocolSelectEl) {
-    protocolSelectEl.addEventListener('change', () => {
-        stopStream();
-        updateProtocolUI();
-    });
-    updateProtocolUI();
-}
-
-if (ertspCopyBtnEl) {
-    ertspCopyBtnEl.addEventListener('click', async () => {
-        if (!ertspUrlEl || !ertspUrlEl.value) return;
-        try {
-            await navigator.clipboard.writeText(ertspUrlEl.value);
-            showErtspStatus('Copied to clipboard.', false);
-        } catch {
-            // Clipboard API unavailable/blocked (e.g. insecure context) - the
-            // field is still readonly-selectable, so fall back to that.
-            ertspUrlEl.select();
-            showErtspStatus('Clipboard unavailable - selected the text instead, copy manually (Ctrl/Cmd+C).', true);
-        }
-    });
-}
-
-// Mirrors startStream's manual/link resolution (Stream box vs a signed
-// ?ppcenter=&appId=&... link), but skips everything WHEP/P2P-specific: no
-// NAT probe, no race controller, no <video>. It only ever produces one
-// thing - a signed rtsp:// connection string - or an error message.
-async function startErtsp() {
-    stopStream();
-    const generation = ++readerGeneration;
-
-    const params = new URLSearchParams(window.location.search);
-    const ppcenter = (params.get('ppcenter') || '').trim() || DEFAULT_PPCENTER;
-
-    let playConfig = null;
-    try {
-        playConfig = parsePlayRequest(window.location.search);
-    } catch {
-        playConfig = null;
-    }
-
-    let appId, streamName, txTime, txSecret;
-    if (playConfig) {
-        ({ appId, streamName, txTime, txSecret } = playConfig);
-    } else {
-        const manual = parseStreamInput(streamInputEl && streamInputEl.value);
-        if (!manual) {
-            showErtspStatus('Enter a stream as appId/streamName', true);
-            return;
-        }
-        appId = manual.appId;
-        streamName = manual.streamName;
-        try {
-            ({ txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName));
-        } catch (error) {
-            showErtspStatus(`could not get a viewer token: ${error.message}`, true);
-            return;
-        }
-    }
-    if (generation !== readerGeneration) return;
-
-    if (ertspUrlEl) ertspUrlEl.value = '';
-    showErtspStatus('Requesting ERTSP connection string...', false);
-    try {
-        const decision = await requestErtspPlayDecision({
-            ppcenter, appId, streamName, txTime, txSecret,
-            clientId: newClientId(), requestRegion: '',
-        });
-        if (generation !== readerGeneration) return;
-        if (ertspUrlEl) ertspUrlEl.value = decision.edgeStreamUrl;
-        showErtspStatus('Ready - open this URL in an RTSP client (embedded device, VLC, ffplay).', false);
-    } catch (error) {
-        if (generation !== readerGeneration) return;
-        showErtspStatus(`Error: ${error.message}`, true);
-    }
 }
 
 (() => {
@@ -879,11 +773,7 @@ function showToast(text) {
 }
 
 document.getElementById('startPlay') || document.getElementById('startBtn').addEventListener('click', () => {
-    if (isErtspSelected()) {
-        startErtsp();
-    } else {
-        startStream(true);
-    }
+    startStream(true);
 });
 document.getElementById('stopPlay') || document.getElementById('exitBtn').addEventListener('click', stopStream);
 // Enter in the Stream box starts the typed stream, same as the Start button.
@@ -1567,10 +1457,18 @@ async function startFromPpcenter(playConfig, generation, { natGatherPromise = nu
     const abortController = new AbortController();
     playRequestAbortController = abortController;
     try {
-        const decision = await requestPlayDecision(playConfig, {
+        const decision = await requestPlayDecisionWithRetry(playConfig, {
             signal: abortController.signal,
             natProbeId,
             preferP2P: wantP2P,
+            onRetry: (attempt) => {
+                // Transient no_edge_available: ppcenter hasn't seen the
+                // stream's Origin yet (publisher just (re)connected or
+                // switched transport). Show it as progress rather than a
+                // failure - the retry usually succeeds within a few seconds.
+                if (generation !== readerGeneration) return;
+                statsContainer.innerHTML = `<div style="color: #00bcd4; text-align: center;">Waiting for stream... (retry ${attempt})</div>`;
+            },
         });
         if (playRequestAbortController !== abortController || generation !== readerGeneration) return;
         playRequestAbortController = null;

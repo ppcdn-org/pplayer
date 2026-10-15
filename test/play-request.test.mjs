@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parsePlayRequest, requestPlayDecision, requestErtspPlayDecision } from '../play-request.mjs';
+import { parsePlayRequest, requestPlayDecision, requestErtspPlayDecision, requestPlayDecisionWithRetry, isTransientPlayError } from '../play-request.mjs';
 
 test('parses complete ppcenter query and generates client ID', () => {
     const config = parsePlayRequest('?ppcenter=https%3A%2F%2Fcenter.example&appId=app1&streamName=live&txTime=abc&txSecret=sig', () => 'generated');
@@ -157,4 +157,77 @@ test('requestErtspPlayDecision surfaces the API error message', async () => {
         ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
     }, { fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({ message: 'expired' }) }) }),
     /expired/);
+});
+
+test('classifies only transient (503 / no_edge_available) play errors', () => {
+    assert.equal(isTransientPlayError({ status: 503 }), true);
+    assert.equal(isTransientPlayError({ code: 'no_edge_available' }), true);
+    assert.equal(isTransientPlayError({ code: 'no_healthy_edge' }), true);
+    assert.equal(isTransientPlayError(new Error('no healthy edge is available')), true);
+    assert.equal(isTransientPlayError({ status: 401, message: 'expired' }), false);
+    assert.equal(isTransientPlayError({ status: 400, code: 'invalid_request' }), false);
+    assert.equal(isTransientPlayError(null), false);
+});
+
+test('requestPlayDecisionWithRetry retries a transient 503 then succeeds', async () => {
+    let calls = 0;
+    const retries = [];
+    const decision = { mode: 'edge-only', edgeStreamUrl: 'https://edge.example/app/live' };
+    const result = await requestPlayDecisionWithRetry({
+        ppcenter: 'https://center.example', appId: 'app1', streamName: 'live',
+        txTime: 'abc', txSecret: 'sig', clientId: 'viewer', requestRegion: '',
+    }, {
+        retryDelayMs: 0,
+        onRetry: (attempt) => retries.push(attempt),
+        fetchImpl: async () => {
+            calls += 1;
+            if (calls < 3) {
+                return { ok: false, status: 503, json: async () => ({ code: 'no_edge_available', message: 'no healthy edge is available' }) };
+            }
+            return { ok: true, status: 200, json: async () => decision };
+        },
+    });
+    assert.equal(calls, 3);
+    assert.deepEqual(retries, [1, 2]);
+    assert.equal(result.edgeStreamUrl, decision.edgeStreamUrl);
+});
+
+test('requestPlayDecisionWithRetry does not retry a non-transient failure', async () => {
+    let calls = 0;
+    await assert.rejects(() => requestPlayDecisionWithRetry({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, {
+        retryDelayMs: 0,
+        fetchImpl: async () => { calls += 1; return { ok: false, status: 401, json: async () => ({ message: 'expired' }) }; },
+    }), /expired/);
+    assert.equal(calls, 1);
+});
+
+test('requestPlayDecisionWithRetry gives up after maxAttempts on a persistent 503', async () => {
+    let calls = 0;
+    await assert.rejects(() => requestPlayDecisionWithRetry({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, {
+        maxAttempts: 3,
+        retryDelayMs: 0,
+        fetchImpl: async () => { calls += 1; return { ok: false, status: 503, json: async () => ({ code: 'no_edge_available', message: 'no healthy edge is available' }) }; },
+    }), /no healthy edge/);
+    assert.equal(calls, 3);
+});
+
+test('requestPlayDecisionWithRetry stops immediately once the signal is aborted', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    await assert.rejects(() => requestPlayDecisionWithRetry({
+        ppcenter: 'https://center.example', appId: 'a', txTime: '1', txSecret: '2', streamName: 's', clientId: 'c', requestRegion: '',
+    }, {
+        signal: controller.signal,
+        retryDelayMs: 0,
+        fetchImpl: async () => {
+            calls += 1;
+            controller.abort();
+            return { ok: false, status: 503, json: async () => ({ code: 'no_edge_available', message: 'no healthy edge is available' }) };
+        },
+    }));
+    assert.equal(calls, 1);
 });
