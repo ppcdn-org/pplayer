@@ -948,7 +948,16 @@ function ensurePlaybackCodec() {
 // returns the full WHEP URL for the edge stream base. A codec typed in the
 // Stream box (e.g. ".../hevc") takes precedence over capability detection.
 async function resolveEdgeWhepUrl(edgeStreamUrl) {
-    const codecType = (manualStream && manualStream.codec) || await ensurePlaybackCodec();
+    let codecType = (manualStream && manualStream.codec) || await ensurePlaybackCodec();
+    // A forced /hevc must still be one the browser can actually decode: a
+    // browser without HEVC decode connects the WHEP session and receives RTP
+    // but renders 0 fps, which the stall watchdog then loops on. When HEVC was
+    // requested but the local decode probe says h264, drop back to the h264
+    // path (the multitrack origin publishes both).
+    if (codecType === 'hevc' && (await ensurePlaybackCodec()) !== 'hevc') {
+        console.warn('[Main] HEVC requested but this browser cannot decode HEVC; using H264');
+        codecType = 'h264';
+    }
     return { url: buildEdgeWhepUrl(edgeStreamUrl, codecType), codecType };
 }
 
