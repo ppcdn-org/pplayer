@@ -74,15 +74,22 @@ let cachedHevcSupport = null;
 async function isHevcPlaybackSupported() {
     if (cachedHevcSupport !== null) return cachedHevcSupport;
 
-    let supported = await hevcSupportedViaMediaCapabilities();
-    if (supported === null) {
-        supported = hevcSupportedViaRtpCapabilities();
-    }
-    // Inconclusive (both methods unavailable or threw) - not "detected
-    // unsupported" but treated identically per the design doc: H264 is the
-    // safe, always-available fallback.
-    cachedHevcSupport = supported === true;
-    console.log(`[CodecCapability] HEVC playback supported: ${cachedHevcSupport}`);
+    // Ask both probes and accept EITHER as a yes. The WebRTC
+    // mediaCapabilities query is unreliable in Chrome - a
+    // {type:'webrtc', contentType:'video/mp4; codecs="hvc1..."'} request can
+    // answer supported:false even on a browser that negotiates and hardware-
+    // decodes H265 over WebRTC - and treating that "false" as final (the old
+    // behaviour, where RTCRtpReceiver was only consulted when
+    // mediaCapabilities was *inconclusive*) is exactly what made HEVC
+    // unplayable on a capable browser. RTCRtpReceiver.getCapabilities is the
+    // authoritative signal for "this WebRTC stack offers H265", so it can
+    // override a mediaCapabilities false; only when neither probe affirms
+    // support do we fall back to the always-available H264.
+    const viaMediaCapabilities = await hevcSupportedViaMediaCapabilities();
+    const viaRtpCapabilities = hevcSupportedViaRtpCapabilities();
+    cachedHevcSupport = viaMediaCapabilities === true || viaRtpCapabilities === true;
+    console.log(`[CodecCapability] HEVC playback supported: ${cachedHevcSupport}` +
+        ` (mediaCapabilities=${viaMediaCapabilities}, rtpCapabilities=${viaRtpCapabilities})`);
     return cachedHevcSupport;
 }
 
