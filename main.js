@@ -12,7 +12,7 @@ import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
 import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260930-1';
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20260929-2';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261016-1';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260929-2';
 import { StallWatchdog } from './stall-watchdog.mjs?v=20260925-1';
 import { LagTracker } from './lag-tracker.mjs?v=20260929-1';
@@ -167,21 +167,10 @@ const lagTracker = new LagTracker();
 
 // Playout buffer length: how much media the jitter buffer holds before
 // rendering, trading latency against resilience to jitter. Purely local -
-// nothing is negotiated with the server. A "bufferMs" query parameter pins a
-// value without touching the UI; moving the slider overrides it live.
-//
-// null means "not requested", and is deliberately the default: pinning
-// jitterBufferTarget/playoutDelayHint opts the browser out of its own
-// continuously-adapting jitter buffer, and it does so for *every* receiver
-// including audio. The old unconditional 100ms therefore replaced Chrome's
-// adaptive buffer with a fixed one while Safari - which exposes neither API -
-// kept adapting, which is one reason the two browsers' audio stats were never
-// comparable. Let the browser adapt unless a deployment explicitly asks
-// otherwise.
-const bufferRange = document.getElementById('bufferRange');
-const bufferValue = document.getElementById('bufferValue');
-const bufferControl = document.getElementById('bufferControl');
-let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs'));
+// nothing is negotiated with the server, and there is no UI control for it.
+// Defaults to DEFAULT_BUFFER_MS (200ms); a "bufferMs" query parameter can still
+// override it for testing.
+let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs')) ?? DEFAULT_BUFFER_MS;
 
 // Normally P2P is opt-out for signed links: checked, playback asks ppcenter
 // for a direct connection and races it against the edge leg, falling back to
@@ -222,44 +211,6 @@ if (p2pCheckbox) {
             startStream(lastStartManual);
         }
     });
-}
-
-(() => {
-    if (!bufferRange) return;
-    // With no explicit request the slider still has to sit somewhere: park it
-    // on DEFAULT_BUFFER_MS and label the value "auto", so the readout says
-    // "the browser is adapting" rather than claiming a length nothing set.
-    bufferRange.value = String(bufferMs ?? DEFAULT_BUFFER_MS);
-    if (bufferValue) bufferValue.textContent = bufferMs === null ? 'auto' : `${bufferMs} ms`;
-    bufferRange.addEventListener('input', () => {
-        bufferMs = Number(bufferRange.value);
-        if (bufferValue) bufferValue.textContent = `${bufferMs} ms`;
-        // Re-apply live so the effect can be felt without restarting the
-        // stream; on a browser that supports neither API this reports null
-        // and the control greys itself out.
-        markBufferSupport(applyPlayoutBuffer(activePlaybackPath?.pc, bufferMs));
-    });
-})();
-
-// Called once a track has actually arrived: before that there are no
-// receivers and applyPlayoutBuffer legitimately reports null, which would
-// otherwise look like "unsupported".
-function markBufferSupport(applied) {
-    if (!bufferControl) return;
-    if (bufferMs === null) {
-        bufferControl.classList.remove('unsupported');
-        bufferControl.title = "Auto: the browser's own adaptive jitter buffer is in charge. " +
-            'Move the slider (or pass ?bufferMs=) to pin a length instead.';
-        return;
-    }
-    if (applied) {
-        bufferControl.classList.remove('unsupported');
-        bufferControl.title = `Playout buffer via ${applied}. Higher = smoother under jitter, more latency.`;
-    } else {
-        bufferControl.classList.add('unsupported');
-        bufferControl.title = 'This browser does not expose a playout buffer control ' +
-            '(no jitterBufferTarget / playoutDelayHint); its own adaptive buffer stays in charge.';
-    }
 }
 
 // HEVC/H264 multitrack simulcast (see
@@ -1105,7 +1056,7 @@ function negotiateAndConnect(generation, url, codecType) {
             if (generation !== readerGeneration || !reader) return;
             activePlaybackPath = reader;
             activePlaybackPathName = 'edge';
-            markBufferSupport(applyPlayoutBuffer(reader.pc, bufferMs));
+            applyPlayoutBuffer(reader.pc, bufferMs);
             const sessionId = reader.sessionId;
             console.log(`[Glue] WHEP Connected. SessionID: ${sessionId}`);
             if (window.parent) window.parent.postMessage('mmxplayer-connected', '*');
@@ -1653,7 +1604,7 @@ function startP2PPlayback(decision, generation, playConfig) {
                 if (err && err.name === 'AbortError') return;
                 console.warn('[P2P] play() after srcObject failed:', err);
             });
-            markBufferSupport(applyPlayoutBuffer(path.pc, bufferMs));
+            applyPlayoutBuffer(path.pc, bufferMs);
             statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Playing via P2P</div>';
             // Report p2p only once a frame is actually presented - a
             // connected-but-never-decoding P2P must count as edge in the
@@ -1724,7 +1675,7 @@ function startRacedPlayback(decision, generation, playConfig) {
             // The path already applied the buffer on its own track event;
             // this call only reports which API took it now that a winner
             // exists.
-            markBufferSupport(applyPlayoutBuffer(selected.pc, bufferMs));
+            applyPlayoutBuffer(selected.pc, bufferMs);
             // ABR layer control only exists on the Edge leg: the first-phase
             // P2P link carries a single video layer (PLY-009).
             if (path === 'edge' && selected.sessionId) {

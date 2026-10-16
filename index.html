@@ -16,13 +16,6 @@
         select { padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; min-width: 150px; }
         select:disabled { opacity: 0.5; cursor: not-allowed; }
 
-        #bufferRange { width: 110px; accent-color: #00bcd4; }
-        #bufferValue { font-family: monospace; min-width: 52px; display: inline-block; text-align: right; }
-        /* Set by main.js when the browser exposes neither jitterBufferTarget
-           nor playoutDelayHint, so the control visibly reads as inert
-           instead of silently doing nothing. */
-        #bufferControl.unsupported { opacity: 0.45; }
-
         button { padding: 8px 14px; min-width: 40px; border: none; border-radius: 4px; font-weight: bold; font-size: 16px; line-height: 1; cursor: pointer; transition: 0.2s; }
         #startBtn { background: #28a745; color: white; }
         #startBtn:hover { background: #218838; }
@@ -94,13 +87,6 @@
             </select>
         </div>
 
-        <div id="bufferControl" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
-             title="Playout buffer: how much media the jitter buffer holds before rendering. Higher = smoother under jitter, more latency. Defaults to auto - the browser's own adaptive buffer.">
-            <label for="bufferRange">Buffer:</label>
-            <input type="range" id="bufferRange" min="100" max="1000" step="50" value="100">
-            <span id="bufferValue">auto</span>
-        </div>
-
         <label for="p2pCheckbox" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
                title="P2P: prefer a direct peer-to-peer connection to the publisher, and fall back to the edge node automatically when it can't connect. Uncheck to always play from the edge node.">
             <input type="checkbox" id="p2pCheckbox" checked>
@@ -144,7 +130,7 @@
 <!-- ES modules: main.js imports everything else, so only the entry point is
      listed here. Module scripts are deferred and run after parsing, so the
      DOM lookups at the top of main.js are safe. -->
-  <script type="module" src="main.js?v=20261016-3"></script>
+  <script type="module" src="main.js?v=20261016-4"></script>
 
 </body>
 </html>

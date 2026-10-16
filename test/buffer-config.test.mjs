@@ -102,7 +102,7 @@ test('applyPlayoutBuffer tolerates a missing or half-built peer connection', () 
 });
 
 test('DEFAULT_BUFFER_MS sits inside the supported range', () => {
-    // Lowered from 200ms to 100ms in commit 52fadc9.
-    assert.equal(DEFAULT_BUFFER_MS, 100);
+    // 200ms is the applied default now that the UI slider is gone.
+    assert.equal(DEFAULT_BUFFER_MS, 200);
     assert.ok(DEFAULT_BUFFER_MS >= MIN_BUFFER_MS && DEFAULT_BUFFER_MS <= MAX_BUFFER_MS);
 });

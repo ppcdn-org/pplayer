@@ -7,13 +7,11 @@
 export const MIN_BUFFER_MS = 100;
 export const MAX_BUFFER_MS = 1000;
 
-// Where the UI slider parks when nothing was requested explicitly. It is NOT
-// applied in that case: setting a playout buffer at all opts the browser out
-// of its own continuously-adapting jitter buffer - for every receiver,
-// audio included - so "not requested" means "let the browser adapt", not
-// "apply this number" (see main.js's bufferMs). This value only decides where
-// the slider starts if a viewer does decide to pin one.
-export const DEFAULT_BUFFER_MS = 100;
+// The playout buffer applied when no ?bufferMs= override is given. There is no
+// longer a UI control for this - main.js always applies it (which pins the
+// browser's own jitter buffer to a fixed length, for every receiver, audio
+// included) unless a deployment overrides it via the query parameter.
+export const DEFAULT_BUFFER_MS = 200;
 
 // parseBufferMs reads the raw "bufferMs" query value and clamps it into the
 // supported [100, 1000] range. Missing/invalid input returns null rather than
