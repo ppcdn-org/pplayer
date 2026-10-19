@@ -2252,7 +2252,20 @@ async function updateStats() {
             // estimate is unreliable here (it needs a pacer the deployment
             // skips for latency), so it read 100kbps..20000kbps at random.
             // The real throughput is already shown per track as "Recv Bitrate".
+            //
+            // Video load time is the same costTime the outcome beacon reports:
+            // the wall-clock gap from sending the play request (playStartedAt)
+            // to decoding the first video frame (firstFrameAt). It stays at its
+            // settled value for the rest of the session, so it is a cold-start
+            // metric rather than a live one.
+            const videoLoadTimeMs = (playStartedAt && firstFrameAt)
+                ? Math.max(0, firstFrameAt - playStartedAt)
+                : null;
             const netRows = {
+                'Video Load Time': {
+                    text: videoLoadTimeMs === null ? '--' : `${videoLoadTimeMs} ms`,
+                    title: 'Time from sending the play request to decoding the first video frame (the same costTime reported to ppcenter).',
+                },
                 // Media-path RTT only (see above): the selected candidate
                 // pair's own RTCP sample. Sub-millisecond paths read "<1 ms"
                 // rather than a rounded "0.0 ms", and "—" means the selected
