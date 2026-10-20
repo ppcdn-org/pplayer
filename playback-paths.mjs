@@ -1,5 +1,6 @@
 import { applyPlayoutBuffer } from './buffer-config.mjs?v=20261020-1';
 import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260929-2';
+import { attachPassthroughTransform } from './sei-timestamp.mjs?v=20261021-1';
 
 // Verbose diagnostics (raw SDP dumps) are opt-in with ?debug so a normal
 // viewer's console stays readable. Node (tests) has no location, so this
@@ -170,6 +171,15 @@ export class P2PPlaybackPath {
             // insertableStreams requires - see ppplayer.mjs.
             if (event.track?.kind === 'video' && event.receiver) {
                 this.onVideoReceiver?.(event.receiver);
+            }
+            // Same encodedInsertableStreams requirement as the edge path: the
+            // P2P PC enables it for the video SEI reader, which also holds the
+            // audio receiver until its encoded stream is consumed. Pump it
+            // through unchanged so the decoder gets the Opus frames.
+            if (event.track?.kind === 'audio' && event.receiver && this.insertableStreams) {
+                if (attachPassthroughTransform(event.receiver)) {
+                    console.log('[EncodedStreams] P2P audio passthrough attached');
+                }
             }
             // Same as the Edge path: receivers exist only once a track lands.
             if (this.bufferMs !== null) applyPlayoutBuffer(this.pc, this.bufferMs);

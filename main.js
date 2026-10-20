@@ -4,12 +4,12 @@
 
 import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20261013-1';
 import { ABREngine } from './abr-engine.mjs?v=20260925-1';
-import { attachSeiTimestampReader } from './sei-timestamp.mjs?v=20260925-1';
+import { attachSeiTimestampReader, attachPassthroughTransform } from './sei-timestamp.mjs?v=20261021-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20261016-1';
 import { TimeSync } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecisionWithRetry } from './play-request.mjs?v=20261016-1';
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
-import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260930-1';
+import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20261021-1';
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261020-1';
@@ -1048,6 +1048,15 @@ function negotiateAndConnect(generation, url, codecType) {
                 }
             }
             if (evt.track.kind === 'video') armFirstVideoFrameCallback(generation);
+            // The reader above enables encodedInsertableStreams for the SEI
+            // reader. Chrome then holds the audio receiver too until something
+            // consumes its encoded stream - attach the passthrough or audio is
+            // received but never decoded (audible silence, zero samples).
+            if (evt.track.kind === 'audio' && evt.receiver) {
+                if (attachPassthroughTransform(evt.receiver)) {
+                    console.log('[EncodedStreams] audio passthrough attached');
+                }
+            }
             if (evt.track.kind === 'video' && evt.receiver && evt.receiver !== seiReaderReceiver) {
                 if (attachSeiTimestampReader(evt.receiver, (ts) => {
                     reportP2PDelay(ts, 'sei');

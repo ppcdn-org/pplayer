@@ -181,4 +181,37 @@ function attachSeiTimestampReader(receiver, onTimestamp, codec) {
     return true;
 }
 
-export { attachSeiTimestampReader, findObsAbsTimestamp };
+// Consumes and forwards an encoded-streams receiver without inspecting it.
+// Chrome routes EVERY inbound encoded track through the insertion point as
+// soon as the PeerConnection is built with { encodedInsertableStreams: true },
+// not just the one receiver whose transform we create. If we only consume the
+// video receiver (for the SEI reader above) and leave audio unconsumed, the
+// audio frames are received and assembled but never released to the decoder:
+// getStats() shows audio packets/bytes climbing with totalSamplesReceived 0
+// and audioLevel 0, so the stream is audibly silent even after unmuting.
+// Audio needs no parsing, so a passthrough transform is enough to unblock it.
+function attachPassthroughTransform(receiver) {
+    if (!receiver || typeof receiver.createEncodedStreams !== 'function') return false;
+
+    let streams;
+    try {
+        streams = receiver.createEncodedStreams();
+    } catch (e) {
+        console.warn('[EncodedStreams] createEncodedStreams failed:', e && e.message);
+        return false;
+    }
+
+    const transform = new TransformStream({
+        transform(frame, controller) {
+            controller.enqueue(frame);
+        }
+    });
+
+    streams.readable.pipeThrough(transform).pipeTo(streams.writable).catch((e) => {
+        console.warn('[EncodedStreams] passthrough pipeline error:', e && e.message);
+    });
+
+    return true;
+}
+
+export { attachSeiTimestampReader, attachPassthroughTransform, findObsAbsTimestamp };
