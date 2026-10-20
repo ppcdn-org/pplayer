@@ -11,7 +11,7 @@ export const MAX_BUFFER_MS = 1000;
 // longer a UI control for this - main.js always applies it (which pins the
 // browser's own jitter buffer to a fixed length, for every receiver, audio
 // included) unless a deployment overrides it via the query parameter.
-export const DEFAULT_BUFFER_MS = 200;
+export const DEFAULT_BUFFER_MS = 100;
 
 // parseBufferMs reads the raw "bufferMs" query value and clamps it into the
 // supported [100, 1000] range. Missing/invalid input returns null rather than

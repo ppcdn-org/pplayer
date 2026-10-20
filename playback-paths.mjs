@@ -1,4 +1,4 @@
-import { applyPlayoutBuffer } from './buffer-config.mjs?v=20260929-2';
+import { applyPlayoutBuffer } from './buffer-config.mjs?v=20261020-1';
 import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260929-2';
 
 // Verbose diagnostics (raw SDP dumps) are opt-in with ?debug so a normal

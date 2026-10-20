@@ -12,7 +12,7 @@ import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
 import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20260930-1';
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261016-1';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261020-1';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260929-2';
 import { StallWatchdog } from './stall-watchdog.mjs?v=20260925-1';
 import { LagTracker } from './lag-tracker.mjs?v=20260929-1';
@@ -168,7 +168,7 @@ const lagTracker = new LagTracker();
 // Playout buffer length: how much media the jitter buffer holds before
 // rendering, trading latency against resilience to jitter. Purely local -
 // nothing is negotiated with the server, and there is no UI control for it.
-// Defaults to DEFAULT_BUFFER_MS (200ms); a "bufferMs" query parameter can still
+// Defaults to DEFAULT_BUFFER_MS (100ms); a "bufferMs" query parameter can still
 // override it for testing.
 let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs')) ?? DEFAULT_BUFFER_MS;
 
@@ -401,9 +401,11 @@ const P2P_DELAY_STALE_MS = 5000;
 // when the encoded frame reaches the receiver, so the raw subtraction stops
 // short of the true end-to-end delay: it misses the encode time already spent
 // before the stamp, and the decoder + compositor/render time after reception.
-// +50ms stands in for that overhead so the displayed "P2P Delay" reflects
-// what a viewer actually experiences. One shared constant keeps the two paths
-// directly comparable.
+// +50ms stands in for that overhead. The configured playout buffer is added
+// separately in reportP2PDelay: the SEI is read before the receiver's jitter
+// buffer releases the frame, so without it the number would omit the largest
+// local contribution on an edge pull. One shared computation keeps the two
+// paths directly comparable.
 const P2P_DELAY_FIXED_COMPENSATION_MS = 50;
 // Both ends of the subtraction must share a clock base: the timestamp comes
 // from ppobs's NTP-disciplined clock, so the local side has to be corrected
@@ -439,7 +441,12 @@ function reportP2PDelay(timestampMs, source) {
     const correctedNow = timeSync ? timeSync.now() : null;
     if (correctedNow === null) return;
 
-    lastP2PDelayMs = correctedNow - Number(timestampMs) + P2P_DELAY_FIXED_COMPENSATION_MS;
+    // The SEI is read from the encoded frame as it arrives, before the
+    // receiver's playout buffer releases it and before decode/render. Add the
+    // configured buffer so the reported delay reflects what the viewer
+    // experiences rather than transport-only time.
+    const playoutBufferMs = Number.isFinite(bufferMs) ? bufferMs : 0;
+    lastP2PDelayMs = correctedNow - Number(timestampMs) + P2P_DELAY_FIXED_COMPENSATION_MS + playoutBufferMs;
     lastP2PDelayAt = Date.now();
     lastP2PDelaySource = source;
 
@@ -2202,7 +2209,9 @@ async function updateStats() {
         // without encoded insertable streams, and is labelled "(est.)". It
         // carries the same fixed compensation as a real measurement so the
         // two are on the same scale.
-        const estimatedP2PDelayMs = (rttMs ?? 0) / 2 + jitterBufferMs + P2P_DELAY_FIXED_COMPENSATION_MS;
+        const playoutBufferMs = Number.isFinite(bufferMs) ? bufferMs : 0;
+        const estimatedP2PDelayMs = (rttMs ?? 0) / 2 + Math.max(jitterBufferMs, playoutBufferMs) +
+            P2P_DELAY_FIXED_COMPENSATION_MS;
 
         // --- 渲染 UI ---
         let html = '';
