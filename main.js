@@ -468,6 +468,10 @@ let playOutcomeCondition = null;
 // ms from requesting the connection to receiving video data.
 let playStartedAt = null;
 let firstFrameAt = null;
+// One requestVideoFrameCallback registration per play. The edge path used to
+// learn about the first frame only from updateStats' 1Hz fps sample, which could
+// report a load time up to ~1s later than the actual first presented frame.
+let firstFrameCallbackArmed = false;
 let activePlayConfig = null;
 let playReportIpv4 = '';
 
@@ -515,6 +519,24 @@ function reportPlayOutcome(playConfig, path, { isOK = true, reason = '' } = {}) 
     // the console can list it as online (see startPlaySession). Pass the same
     // video-load time the outcome reports.
     if (isOK) startPlaySession(playConfig, path, costTime);
+}
+
+// Marks firstFrameAt at the first frame the browser actually presents, instead
+// of waiting for updateStats' 1Hz fps sample (which could overstate the load
+// time by up to a second). Used by the edge path; the P2P path already does
+// this from its own onNegotiated callback. Safe to call for every video track:
+// only the first call arms a callback, and reportPlayOutcome is once-guarded.
+function armFirstVideoFrameCallback(generation) {
+    if (firstFrameCallbackArmed) return;
+    if (typeof video.requestVideoFrameCallback !== 'function') return;
+    firstFrameCallbackArmed = true;
+    video.requestVideoFrameCallback(() => {
+        if (generation !== readerGeneration) return;
+        if (firstFrameAt === null) {
+            firstFrameAt = Date.now();
+            reportPlayOutcome(activePlayConfig, activePlaybackPathName || 'edge');
+        }
+    });
 }
 
 // ── Viewer session tracking (console "online pull" list) ──────────────────
@@ -1016,6 +1038,7 @@ function negotiateAndConnect(generation, url, codecType) {
                     video.srcObject = evt.streams[0];
                 }
             }
+            if (evt.track.kind === 'video') armFirstVideoFrameCallback(generation);
             if (evt.track.kind === 'video' && evt.receiver && evt.receiver !== seiReaderReceiver) {
                 if (attachSeiTimestampReader(evt.receiver, (ts) => {
                     reportP2PDelay(ts, 'sei');
@@ -1105,6 +1128,7 @@ function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) 
 function resetSessionState() {
     previousTrackType = null;
     firstFrameDecoded = false;
+    firstFrameCallbackArmed = false;
     lastP2PDelayMs = null;
     lastP2PDelayAt = 0;
     lastP2PDelaySource = null;
