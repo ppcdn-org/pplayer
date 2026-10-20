@@ -298,6 +298,8 @@ let statsInterval = null;
 // .pc, so one accessor covers every mode.
 let activePlaybackPath = null;
 let activePlaybackPathName = 'edge'; // 'edge' | 'p2p', for latency reporting
+// Name of the edge node currently serving this pull; empty for P2P.
+let activeEdgeNodeName = '';
 let playbackRace = null;
 let playRequestAbortController = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
@@ -1307,6 +1309,11 @@ async function startDirectWhepUrl(rawUrl, generation, ppcenter) {
     firstFrameAt = null;
     playReportIpv4 = '';
     activePlayConfig = null;
+    try {
+        activeEdgeNodeName = new URL(rawUrl).host;
+    } catch {
+        activeEdgeNodeName = '';
+    }
     const { appId, streamName } = parseWhepStreamInfo(rawUrl);
     if (appId && streamName) {
         try {
@@ -1342,6 +1349,20 @@ function parseWhepStreamInfo(rawUrl) {
         return { appId, streamName };
     } catch {
         return { appId: '', streamName: '' };
+    }
+}
+
+// The edge node name shown in the stats panel. ppcenter now returns it with
+// the play decision; older builds only carry the signed WHEP host, which is
+// still a useful identifier. P2P pulls deliberately show an empty value.
+function edgeNodeNameFromDecision(decision) {
+    const name = (decision && decision.edge && decision.edge.nodeName) || '';
+    if (name) return String(name);
+    const url = (decision && decision.edgeStreamUrl) || '';
+    try {
+        return url ? new URL(url).host : '';
+    } catch {
+        return '';
     }
 }
 
@@ -1477,6 +1498,7 @@ async function startFromPpcenter(playConfig, generation, { natGatherPromise = nu
             publisherNat: decision.publisherNat,
             playerNat: decision.playerNat,
         };
+        activeEdgeNodeName = edgeNodeNameFromDecision(decision);
         startPlaybackFromDecision(decision, {
             startDirectStream: (url) => {
                 // Edge-only: no immediate report - the first decoded frame
@@ -2009,6 +2031,7 @@ function stopStream() {
     reader = null;
     activePlaybackPath = null;
     activePlaybackPathName = 'edge';
+    activeEdgeNodeName = '';
     if (statsInterval) {
         clearInterval(statsInterval);
         statsInterval = null;
@@ -2221,7 +2244,8 @@ async function updateStats() {
         // activePlaybackPathName is maintained by the reader/race already (it
         // is also what latency reporting uses).
         html += renderStatGroup('Connection', {
-            'Type': activePlaybackPathName === 'p2p' ? 'p2p' : 'edge-node'
+            'Type': activePlaybackPathName === 'p2p' ? 'p2p' : 'edge-node',
+            'edge-node-name': activePlaybackPathName === 'p2p' ? '' : (activeEdgeNodeName || '')
         });
 
         if (videoStats) {
