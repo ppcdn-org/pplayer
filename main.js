@@ -2,7 +2,7 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20261013-1';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20261022-1';
 import { ABREngine } from './abr-engine.mjs?v=20260925-1';
 import { attachSeiTimestampReader, attachPassthroughTransform } from './sei-timestamp.mjs?v=20261021-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20261016-1';
@@ -257,6 +257,34 @@ function stripCodecTypeSegment(whepUrl) {
         }
     } catch (e) { /* not a valid absolute URL - fall through */ }
     return whepUrl;
+}
+
+// True only for a WHEP URL this page assembled itself from ppcenter's bare edge
+// stream base (startDirectStream). A caller-supplied full URL (?url=) is signed
+// over its exact codec path and must never be rewritten.
+let codecPathFallback = false;
+
+// Next WHEP URL to try after `whepUrl` returned 404, or null when exhausted:
+// hevc -> h264 -> bare (no codec segment, where a multitrack-off publisher lives).
+// The edge verifies the signature with the codec segment stripped, so all three
+// share one query string. A typed ".../hevc" is an explicit request and never
+// silently downgraded to H264.
+function nextCodecPathCandidate(whepUrl) {
+    const u = new URL(whepUrl);
+    const parts = u.pathname.split('/');
+    const whepIndex = parts.lastIndexOf('whep');
+    const codec = whepIndex >= 2 ? parts[whepIndex - 1] : '';
+    if (codec === 'hevc' && !(manualStream && manualStream.codec === 'hevc')) {
+        parts[whepIndex - 1] = 'h264';
+        u.pathname = parts.join('/');
+        return { url: u.toString(), codecType: 'h264' };
+    }
+    if (codec === 'h264') {
+        parts.splice(whepIndex - 1, 1);
+        u.pathname = parts.join('/');
+        return { url: u.toString(), codecType: 'h264' };
+    }
+    return null;
 }
 
 let reader = null;
@@ -1066,9 +1094,24 @@ function negotiateAndConnect(generation, url, codecType) {
                 }
             }
         },
-        onError: (err) => {
+        onError: (err, httpStatus) => {
             if (generation !== readerGeneration) return;
             console.error("Reader Error:", err);
+
+            // The edge answers 404 when nothing is published on the codec path
+            // we picked. A publisher that left HEVC/H264 multitrack off sits on
+            // the bare ".../{stream}" path (no codec segment), and a stream
+            // without an HEVC ladder has no ".../hevc" path, so step down
+            // hevc -> h264 -> bare instead of retrying a path that cannot exist.
+            if (httpStatus === 404 && codecPathFallback) {
+                const next = nextCodecPathCandidate(url);
+                if (next) {
+                    console.warn(`[Main] no stream on ${url}; trying ${next.url}`);
+                    if (reader) reader.close();
+                    negotiateAndConnect(generation, next.url, next.codecType);
+                    return;
+                }
+            }
 
             // One-shot HEVC->H264 fallback (design doc §4.4 "播放失败降级"):
             // only for a codec/SDP negotiation failure, not a plain network
@@ -1156,6 +1199,7 @@ function resetSessionState() {
     p2pSeiWatchdogTrip = null;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
+    codecPathFallback = false;
     lastStats = {
         videoBytes: 0, audioBytes: 0,
         videoPacketsLost: 0, audioPacketsLost: 0,
@@ -1533,6 +1577,7 @@ async function startDirectStream(edgeStreamUrl, generation) {
 
     const { url, codecType } = await resolveEdgeWhepUrl(edgeStreamUrl);
     if (generation !== readerGeneration) return; // superseded while awaiting codec detection
+    codecPathFallback = true;
     negotiateAndConnect(generation, url, codecType);
 
     lastStats.timestamp = Date.now();

@@ -454,12 +454,12 @@ class MediaMTXWebRTCReader {
         this.#start();
       }, jitteredDelay(this.retryPause));
       if (this.conf.onError !== undefined) {
-        this.conf.onError(`${message}, retrying in some seconds`);
+        this.conf.onError(`${message}, retrying in some seconds`, httpStatus);
       }
     } else if (this.state === 'getting_codecs') {
       this.state = 'failed';
       if (this.conf.onError !== undefined) {
-        this.conf.onError(message);
+        this.conf.onError(message, httpStatus);
       }
     }
   }
