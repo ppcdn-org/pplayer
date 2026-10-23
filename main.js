@@ -9,6 +9,7 @@ import { selectPlaybackCodec } from './codec-capability.mjs?v=20261016-1';
 import { TimeSync } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecisionWithRetry } from './play-request.mjs?v=20261016-1';
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
+import { isWhepUrl, looksLikeUrl, WHEP_ONLY_MESSAGE } from './whep-url.mjs?v=20261023-1';
 import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20261021-1';
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
@@ -53,6 +54,8 @@ let lastStartManual = false;
 // Parses the Stream box into { appId, streamName, codec }. codec is '' when
 // omitted. Returns null when it does not carry both an appId and a streamName.
 function parseStreamInput(raw) {
+    // The box takes appId/streamName only; a pasted URL is not a stream id.
+    if (looksLikeUrl(raw)) return null;
     const parts = String(raw || '').trim().replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
     if (parts.length < 2) return null;
     const appId = parts[0];
@@ -1268,6 +1271,13 @@ async function startStream(forceManual = false) {
     }
     const directUrl = playConfig ? null : (params.get('url') || '').trim();
 
+    // WHEP is the only pull format: a ?url= that is not a WHEP URL is refused
+    // with an explicit message instead of being handed to the WHEP reader.
+    if (directUrl && !forceManual && !isWhepUrl(directUrl)) {
+        showLinkNotice(WHEP_ONLY_MESSAGE);
+        return;
+    }
+
     // The Stream box is authoritative for a manual Start and for the bare page
     // (no signed link, no ?url=). A signed link / ?url= opened automatically
     // keeps its own parameters and clears any stale box codec override.
@@ -1277,6 +1287,7 @@ async function startStream(forceManual = false) {
         manual = parseStreamInput(streamInputEl && streamInputEl.value);
         if (!manual) {
             showLinkNotice(linkError ? linkError.message
+                : looksLikeUrl(streamInputEl && streamInputEl.value) ? WHEP_ONLY_MESSAGE
                 : 'Enter a stream as appId/streamName (optionally append /h264 or /hevc)');
             return;
         }

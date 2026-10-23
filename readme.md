@@ -5,6 +5,8 @@
 - 官方在线 demo: <https://www.pp-cdn.org/>
 - 官方 TG 运营群: <https://t.me/+oEpcmaGXdihjMzY1>
 
+> **pplayer 只接受 WHEP 拉流格式**：`?url=` 必须是以 `/whep` 结尾的 WHEP 地址，Stream 框只接受 `appId/streamName`；HLS、FLV、RTMP、SRT 等其它地址会被直接拒绝并提示 "pplayer only plays WHEP streams"。校验见 `whep-url.mjs`。
+
 ## 1. 简介
 本 SDK 是一套轻量级的前端解决方案，专为配合 MediaMTX 服务的 WebRTC WHEP 接口和 Simulcast 功能设计。它包含以下核心组件：
 1.  **`MediaMTXWebRTCReader`**: 负责 WHEP 协议交互、WebRTC 连接建立、RTP 接收和 SDP 协商。
