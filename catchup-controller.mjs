@@ -25,7 +25,9 @@
 // return to 1.0x once it drops back under target+LOW. The gap between the
 // two stops the controller from flapping rate right at a single threshold
 // when delay hovers near it.
-export const DEFAULT_TARGET_MS = 500;
+// Engages at DEFAULT_TARGET_MS + HIGH_MARGIN_MS = 1000ms (SRT-ingested h264 sits
+// near 650ms on the edge path, which made 650ms flap permanently).
+export const DEFAULT_TARGET_MS = 850;
 const HIGH_MARGIN_MS = 150; // engage catch-up above target+150ms
 const LOW_MARGIN_MS = 50; // disengage below target+50ms
 

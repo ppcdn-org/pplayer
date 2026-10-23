@@ -13,7 +13,7 @@ import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision 
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261020-1';
-import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20260929-2';
+import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20261023-1';
 import { StallWatchdog } from './stall-watchdog.mjs?v=20260925-1';
 import { LagTracker } from './lag-tracker.mjs?v=20260929-1';
 
