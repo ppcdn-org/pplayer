@@ -4,21 +4,21 @@
 // not involved — there's nothing to negotiate, so this never goes into the
 // /v1/play/requests body, only into the RTCRtpReceiver once a track exists
 // (see playback-paths.mjs).
-export const MIN_BUFFER_MS = 100;
+export const MIN_BUFFER_MS = 50;
 export const MAX_BUFFER_MS = 1000;
 
 // The playout buffer applied when no ?bufferMs= override is given. There is no
 // longer a UI control for this - main.js always applies it (which pins the
 // browser's own jitter buffer to a fixed length, for every receiver, audio
 // included) unless a deployment overrides it via the query parameter.
-export const DEFAULT_BUFFER_MS = 100;
+export const DEFAULT_BUFFER_MS = 50;
 
 // parseBufferMs reads the raw "bufferMs" query value and clamps it into the
-// supported [100, 1000] range. Missing/invalid input returns null rather than
+// supported [50, 1000] range. Missing/invalid input returns null rather than
 // silently substituting a guessed default — callers that care about "was a
 // buffer length requested at all" (e.g. deciding whether to touch
 // playoutDelayHint and override the browser's own adaptive default) need to
-// tell that apart from "requested 100 and got clamped to 100".
+// tell that apart from "requested 50 and got clamped to 50".
 export function parseBufferMs(rawValue) {
     if (rawValue === null || rawValue === undefined || rawValue === '') return null;
     const parsed = Number(rawValue);
@@ -48,7 +48,7 @@ export function bufferMsToPlayoutDelaySeconds(bufferMs) {
 // callers apply this on the track event rather than right after connecting -
 // and when bufferMs is null/undefined, i.e. no length was requested: that is
 // "leave the browser's adaptive buffer alone", and must not be confused with
-// clampBufferMs's floor of 100.
+// clampBufferMs's floor of 50.
 export function applyPlayoutBuffer(pc, bufferMs) {
     if (!pc || typeof pc.getReceivers !== 'function') return null;
     if (bufferMs === null || bufferMs === undefined) return null;

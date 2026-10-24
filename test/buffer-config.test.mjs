@@ -17,7 +17,7 @@ test('parseBufferMs returns null for non-numeric input instead of guessing a def
 test('parseBufferMs clamps values below the supported minimum', () => {
     assert.equal(parseBufferMs('0'), MIN_BUFFER_MS);
     assert.equal(parseBufferMs('-500'), MIN_BUFFER_MS);
-    assert.equal(parseBufferMs('50'), MIN_BUFFER_MS);
+    assert.equal(parseBufferMs('25'), MIN_BUFFER_MS);
 });
 
 test('parseBufferMs clamps values above the supported maximum', () => {
@@ -26,12 +26,13 @@ test('parseBufferMs clamps values above the supported maximum', () => {
 
 test('parseBufferMs passes through in-range values unchanged', () => {
     assert.equal(parseBufferMs('500'), 500);
+    assert.equal(parseBufferMs('50'), 50);
     assert.equal(parseBufferMs('100'), 100);
     assert.equal(parseBufferMs('1000'), 1000);
 });
 
 test('clampBufferMs clamps a raw number the same way', () => {
-    assert.equal(clampBufferMs(50), MIN_BUFFER_MS);
+    assert.equal(clampBufferMs(25), MIN_BUFFER_MS);
     assert.equal(clampBufferMs(1500), MAX_BUFFER_MS);
     assert.equal(clampBufferMs(750), 750);
 });
@@ -69,7 +70,7 @@ test('applyPlayoutBuffer sets every receiver, not just the first', () => {
 });
 
 test('applyPlayoutBuffer leaves the browser alone when no length was requested', () => {
-    // "not requested" must not collapse into clampBufferMs's 100ms floor:
+    // "not requested" must not collapse into clampBufferMs's 50ms floor:
     // pinning a target opts every receiver, audio included, out of the
     // browser's own adaptive jitter buffer, so null has to stay a no-op.
     const receiver = { jitterBufferTarget: null, playoutDelayHint: null };
@@ -102,7 +103,7 @@ test('applyPlayoutBuffer tolerates a missing or half-built peer connection', () 
 });
 
 test('DEFAULT_BUFFER_MS sits inside the supported range', () => {
-    // 100ms is the applied default now that the UI slider is gone.
-    assert.equal(DEFAULT_BUFFER_MS, 100);
+    // 50ms is the applied default now that the UI slider is gone.
+    assert.equal(DEFAULT_BUFFER_MS, 50);
     assert.ok(DEFAULT_BUFFER_MS >= MIN_BUFFER_MS && DEFAULT_BUFFER_MS <= MAX_BUFFER_MS);
 });

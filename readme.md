@@ -461,8 +461,8 @@ Playback codec: h264
 
 播放缓冲（jitter buffer）决定浏览器在渲染前先缓存多少毫秒的媒体：**调大更抗抖动但延迟增加，调小延迟低但容易卡顿**。这是纯本地的播放端参数，不与服务端协商。
 
-- **默认 100ms**（`DEFAULT_BUFFER_MS`；页面上没有开关）。显式钉一个值会让浏览器对**所有** receiver（含音频轨）停用自适应逻辑，而这两个 API 只有 Chromium 系支持——Safari 无论如何都在自适应，下发无效。
-- 可用范围 100~1000ms，URL 参数 `?bufferMs=300` 可覆盖默认值。
+- **默认 50ms**（`DEFAULT_BUFFER_MS`；页面上没有开关）。显式钉一个值会让浏览器对**所有** receiver（含音频轨）停用自适应逻辑，而这两个 API 只有 Chromium 系支持——Safari 无论如何都在自适应，下发无效。
+- 可用范围 50~1000ms，URL 参数 `?bufferMs=300` 可覆盖默认值。
 - 底层优先用标准的 `RTCRtpReceiver.jitterBufferTarget`（毫秒），不支持时退回 Chrome 的 `playoutDelayHint`（秒）；两者都没有的浏览器保持自身的自适应缓冲。
 
 ```javascript
@@ -470,10 +470,12 @@ import { applyPlayoutBuffer, parseBufferMs, DEFAULT_BUFFER_MS } from './buffer-c
 
 // 返回实际生效的 API 名称，或 null（该浏览器不支持 / 未请求任何长度）
 const applied = applyPlayoutBuffer(pc, 300);
-applyPlayoutBuffer(pc, null); // no-op：保持浏览器自适应，不会被当成 100ms
+applyPlayoutBuffer(pc, null); // no-op：保持浏览器自适应，不会被当成 50ms
 ```
 
 ### 9.1 追帧 (catchup-controller.mjs)
+
+> **当前已暂时关闭**：`main.js` 里 `CATCHUP_ENABLED = false`，控制器不再介入，界面也不会出现 “(catching up)”。原因见下文——倍速对 MediaStream 无效，调低缓冲只能排掉几十毫秒，且默认缓冲已经是 50ms 下限。把该开关改回 `true` 即可恢复缓冲法。
 
 延迟一旦累积起来，调小缓冲只能限制**后续**增量，排不掉已经堆在缓冲里的部分，因此有一个追帧控制器：测得的端到端延迟超过 `targetMs + 150ms` 时介入，回落到 `targetMs + 50ms` 以下时退出（滞回区防抖）。`?catchupTargetMs=` 可调目标值。
 
@@ -481,7 +483,7 @@ applyPlayoutBuffer(pc, null); // no-op：保持浏览器自适应，不会被当
 
 改法：控制器只做判定，执行交给调用方传入的 `onCatchUp(engaged)`：
 
-- 有缓冲目标时（默认 100ms，或 `?bufferMs=` 指定），介入期间把 `jitterBufferTarget` 临时调低 50ms，让 jitter buffer 提前播出以排空；
+- 有缓冲目标时（默认 50ms，或 `?bufferMs=` 指定），介入期间把 `jitterBufferTarget` 临时调低 50ms，让 jitter buffer 提前播出以排空；
 - 若调用方传 `bufferMs=null`（保留浏览器自适应），`onCatchUp` 返回 `false`，控制器保持未介入状态——浏览器的自适应缓冲本来就会自己收缩。
 
 ---

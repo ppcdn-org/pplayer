@@ -10,10 +10,10 @@ import { TimeSync } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecisionWithRetry } from './play-request.mjs?v=20261016-1';
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
 import { isWhepUrl, looksLikeUrl, WHEP_ONLY_MESSAGE } from './whep-url.mjs?v=20261023-1';
-import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20261021-1';
+import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20261024-1';
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
-import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261020-1';
+import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261024-1';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20261023-1';
 import { StallWatchdog } from './stall-watchdog.mjs?v=20260925-1';
 import { LagTracker } from './lag-tracker.mjs?v=20260929-1';
@@ -110,6 +110,12 @@ function newClientId() {
     return globalThis.crypto?.randomUUID ? crypto.randomUUID() : `pplayer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+// Live-edge catch-up is switched OFF for now (CATCHUP_ENABLED below): it has
+// no working actuator - playbackRate is ignored for a MediaStream-backed
+// element, and lowering the jitter-buffer target can only drain a few tens of
+// ms and is a no-op once the buffer already sits at its minimum. Flip the
+// flag to bring the buffer-based version back.
+//
 // Live-edge catch-up (see catchup-controller.mjs): drains delay that has
 // already built up, rather than just limiting how fast new delay accrues.
 // "catchupTargetMs" lets a deployment tune this the same way "bufferMs"
@@ -143,10 +149,13 @@ function applyCatchUpBuffer(engaged) {
     return applyPlayoutBuffer(pc, engaged ? bufferMs - CATCHUP_BUFFER_DRAIN_MS : bufferMs) !== null;
 }
 
+const CATCHUP_ENABLED = false;
+
 const catchUpController = new CatchUpController(video, {
     targetMs: catchupTargetMs,
     onCatchUp: applyCatchUpBuffer,
 });
+catchUpController.setEnabled(CATCHUP_ENABLED);
 
 // Auto-recovers the "receiving bytes but decoding nothing" stall (see
 // stall-watchdog.mjs) by doing exactly what a manual Start click does -
@@ -171,7 +180,7 @@ const lagTracker = new LagTracker();
 // Playout buffer length: how much media the jitter buffer holds before
 // rendering, trading latency against resilience to jitter. Purely local -
 // nothing is negotiated with the server, and there is no UI control for it.
-// Defaults to DEFAULT_BUFFER_MS (100ms); a "bufferMs" query parameter can still
+// Defaults to DEFAULT_BUFFER_MS (50ms); a "bufferMs" query parameter can still
 // override it for testing.
 let bufferMs = parseBufferMs(new URLSearchParams(window.location.search).get('bufferMs')) ?? DEFAULT_BUFFER_MS;
 
