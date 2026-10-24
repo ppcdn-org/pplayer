@@ -186,6 +186,97 @@ test('BrowserPublisher.start publishes then stop tears everything down', async (
     assert.equal(stopCall.url, 'https://api.pp-cdn.org/v1/publish/browser-requests/bp_1');
 });
 
+function failedStartDecision() {
+    return {
+        sessionId: 'bp_fail',
+        whipUrl: 'https://origin/app123/live-001/h264/whip',
+        bearerToken: 'tok',
+        expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    };
+}
+
+test('BrowserPublisher.start releases the session when capture fails after it was created', async () => {
+    const decision = failedStartDecision();
+    const states = [];
+    const fetchCalls = [];
+    const pcs = [];
+    const publisher = new BrowserPublisher({
+        ppcenter: 'https://api.pp-cdn.org', token: 'jwt', appId: 'app123', streamName: 'live-001',
+        getUserMedia: async () => { throw new Error('NotAllowedError'); },
+        createPeerConnection: () => { const pc = fakePeerConnection(); pcs.push(pc); return pc; },
+        onState: (state) => states.push(state),
+        fetchImpl: publishingFetch(decision, fetchCalls),
+    });
+
+    await assert.rejects(publisher.start(), /NotAllowedError/);
+
+    const stopCall = fetchCalls.find((c) => c.init.method === 'DELETE');
+    assert.equal(stopCall.url, 'https://api.pp-cdn.org/v1/publish/browser-requests/bp_fail');
+    assert.equal(pcs.length, 0);
+    assert.equal(publisher.decision, null);
+    assert.equal(states.at(-1), 'stopped');
+});
+
+test('BrowserPublisher.start releases the session, peer connection and tracks when WHIP is rejected', async () => {
+    const decision = failedStartDecision();
+    const video = { kind: 'video', stopped: false, stop() { this.stopped = true; } };
+    const audio = { kind: 'audio', stopped: false, stop() { this.stopped = true; } };
+    const pcs = [];
+    const fetchCalls = [];
+    const publisher = new BrowserPublisher({
+        ppcenter: 'https://api.pp-cdn.org', token: 'jwt', appId: 'app123', streamName: 'live-001',
+        getUserMedia: async () => ({ getTracks: () => [video, audio] }),
+        createPeerConnection: () => { const pc = fakePeerConnection(); pcs.push(pc); return pc; },
+        fetchImpl: async (url, init) => {
+            fetchCalls.push({ url, init });
+            if (url.endsWith('/v1/publish/browser-requests')) return jsonResponse(decision);
+            if (url === decision.whipUrl) return { ok: false, status: 503 };
+            return jsonResponse({});
+        },
+    });
+
+    await assert.rejects(publisher.start(), /WHIP publish failed with status 503/);
+
+    assert.equal(pcs[0].closed, true);
+    assert.equal(video.stopped, true);
+    assert.equal(audio.stopped, true);
+    assert.equal(fetchCalls.filter((c) => c.init.method === 'DELETE').length, 1);
+    assert.equal(publisher.pc, null);
+    assert.equal(publisher.stopped, true);
+});
+
+test('BrowserPublisher.start surfaces the original error even when releasing the session also fails', async () => {
+    const decision = failedStartDecision();
+    const states = [];
+    const publisher = new BrowserPublisher({
+        ppcenter: 'https://api.pp-cdn.org', token: 'jwt', appId: 'app123', streamName: 'live-001',
+        getUserMedia: async () => { throw new Error('NotFoundError'); },
+        onState: (state) => states.push(state),
+        fetchImpl: async (url, init) => {
+            if (url.endsWith('/v1/publish/browser-requests') && init.method === 'POST') return jsonResponse(decision);
+            throw new Error('network down');
+        },
+    });
+
+    await assert.rejects(publisher.start(), /NotFoundError/);
+    assert.ok(states.includes('stop-failed'));
+});
+
+test('BrowserPublisher.start does not try to release anything when the session request itself fails', async () => {
+    const fetchCalls = [];
+    const publisher = new BrowserPublisher({
+        ppcenter: 'https://api.pp-cdn.org', token: 'jwt', appId: 'app123', streamName: 'live-001',
+        getUserMedia: async () => { throw new Error('should not be reached'); },
+        fetchImpl: async (url, init) => {
+            fetchCalls.push({ url, init });
+            return jsonResponse({ code: 'too_many_publish_sessions' }, { ok: false, status: 429 });
+        },
+    });
+
+    await assert.rejects(publisher.start());
+    assert.equal(fetchCalls.filter((c) => c.init.method === 'DELETE').length, 0);
+});
+
 function annexBFrame(payloadBytes) {
     return new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x65, ...payloadBytes]);
 }

@@ -484,24 +484,35 @@ export class BrowserPublisher {
         }
         this.decision = await requestBrowserPublishSession(this.config, { fetchImpl: this.fetchImpl });
 
-        this.onState('capturing');
-        this.stream = await this.getUserMedia(this.mediaConstraints);
+        // From here a server-side session exists. Every later failure (camera
+        // denied, WHIP rejected, ICE timeout...) must release it, otherwise the
+        // session keeps counting against the per-user cap until its idle
+        // timeout and a few failed starts lock the user out with
+        // too_many_publish_sessions. stop() also closes the peer connection and
+        // the capture tracks.
+        try {
+            this.onState('capturing');
+            this.stream = await this.getUserMedia(this.mediaConstraints);
 
-        this.onState('publishing');
-        this.pc = this.createPeerConnection();
-        for (const track of this.stream.getTracks()) {
-            this.addPublisherTrack(track);
+            this.onState('publishing');
+            this.pc = this.createPeerConnection();
+            for (const track of this.stream.getTracks()) {
+                this.addPublisherTrack(track);
+            }
+            await whipPublish(this.decision, this.pc, {
+                fetchImpl: this.fetchImpl,
+                iceGatheringTimeoutMs: this.iceGatheringTimeoutMs,
+            });
+
+            this.startP2P();
+
+            this.scheduleRefresh();
+            this.onState('live');
+            return this.decision;
+        } catch (error) {
+            await this.stop();
+            throw error;
         }
-        await whipPublish(this.decision, this.pc, {
-            fetchImpl: this.fetchImpl,
-            iceGatheringTimeoutMs: this.iceGatheringTimeoutMs,
-        });
-
-        this.startP2P();
-
-        this.scheduleRefresh();
-        this.onState('live');
-        return this.decision;
     }
 
     // startP2P attaches the answerer when the decision carries a publisher
