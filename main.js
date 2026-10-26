@@ -10,7 +10,7 @@ import { TimeSync } from './time-sync.mjs?v=20260925-1';
 import { parsePlayRequest, requestPlayDecisionWithRetry } from './play-request.mjs?v=20261025-1';
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
 import { isWhepUrl, looksLikeUrl, WHEP_ONLY_MESSAGE } from './whep-url.mjs?v=20261023-1';
-import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20261024-1';
+import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20261026-2';
 import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261024-1';
@@ -2496,5 +2496,7 @@ function updateMediaState(state) {
         showLinkNotice(error.message);
         return;
     }
-    startStream(false);
+    if (new URLSearchParams(window.location.search).get('autoplay') !== '0') {
+        startStream(false);
+    }
 })();

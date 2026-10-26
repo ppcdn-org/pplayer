@@ -2,6 +2,16 @@ import { applyPlayoutBuffer } from './buffer-config.mjs?v=20261024-1';
 import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20261026-1';
 import { attachPassthroughTransform } from './sei-timestamp.mjs?v=20261021-1';
 
+function preferH264(transceiver) {
+    if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
+    const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities?.('video')) ||
+        (typeof RTCRtpSender !== 'undefined' && RTCRtpSender.getCapabilities?.('video')) || null;
+    const codecs = (caps?.codecs || []).filter((codec) =>
+        String(codec?.mimeType || '').toLowerCase().includes('h264'));
+    if (codecs.length === 0) return;
+    try { transceiver.setCodecPreferences(codecs); } catch { /* keep browser defaults */ }
+}
+
 // Verbose diagnostics (raw SDP dumps) are opt-in with ?debug so a normal
 // viewer's console stays readable. Node (tests) has no location, so this
 // evaluates false there.
@@ -148,7 +158,8 @@ export class P2PPlaybackPath {
             : iceConfig;
         this.pc = new this.PeerConnectionClass(pcConfig);
         this.onSignal?.({ type: 'pc-created', iceServers: (iceConfig?.iceServers ?? []).map((s) => s.urls) });
-        this.pc.addTransceiver('video', { direction: 'recvonly' });
+        const videoTransceiver = this.pc.addTransceiver('video', { direction: 'recvonly' });
+        preferH264(videoTransceiver);
         this.pc.addTransceiver('audio', { direction: 'recvonly' });
         this.pc.ontrack = (event) => {
             // The publisher (libdatachannel) may negotiate the track without a
