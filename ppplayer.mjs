@@ -525,8 +525,9 @@ class MediaMTXWebRTCReader {
     });
 
     const direction = 'recvonly';
-    this.pc.addTransceiver('video', { direction });
+    const videoTransceiver = this.pc.addTransceiver('video', { direction });
     this.pc.addTransceiver('audio', { direction });
+    this.#preferVideoCodec(videoTransceiver);
 
     this.pc.onicecandidate = (evt) => this.#onLocalCandidate(evt);
     this.pc.onconnectionstatechange = () => this.#onConnectionState();
@@ -548,6 +549,29 @@ class MediaMTXWebRTCReader {
         const modifiedOffer = new RTCSessionDescription({ type: 'offer', sdp: sdp });
         return this.pc.setLocalDescription(modifiedOffer).then(() => sdp);
       });
+  }
+
+  // Force the requested codec to lead the video offer. Without this a HEVC
+  // path is rejected by mmx with "requires H265 video (offer m-lines:
+  // audio:port=9,sendrecv)" because Chrome's default offer lists H264/VP8
+  // only, even when H265 receive is available.
+  #preferVideoCodec(transceiver) {
+    const want = String(this.conf.videoCodec || '').toLowerCase();
+    if (want !== 'h264' && want !== 'hevc') return;
+    if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
+    const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities?.('video')) ||
+      (typeof RTCRtpSender !== 'undefined' && RTCRtpSender.getCapabilities?.('video')) || null;
+    const codecs = caps?.codecs || [];
+    if (codecs.length === 0) return;
+    const match = codecs.find((c) => want === 'hevc'
+      ? /h265|hevc/i.test(c.mimeType)
+      : /h264/i.test(c.mimeType));
+    if (!match) return;
+    try {
+      transceiver.setCodecPreferences([match, ...codecs.filter((c) => c !== match)]);
+    } catch {
+      // Browser rejected the preference list; keep its default order.
+    }
   }
 
   #sendOffer(offer) {

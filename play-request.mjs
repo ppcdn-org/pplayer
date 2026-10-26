@@ -9,6 +9,9 @@ export function parsePlayRequest(search, randomUUID = () => crypto.randomUUID())
         clientId: params.get('clientId')?.trim() || randomUUID(),
         requestRegion: params.get('requestRegion')?.trim() || '',
         natProbeId: params.get('natProbeId')?.trim() || '',
+        codec: ['h264', 'hevc'].includes((params.get('codec') || '').trim().toLowerCase())
+            ? (params.get('codec') || '').trim().toLowerCase()
+            : '',
     };
     const required = ['ppcenter', 'appId', 'streamName', 'txTime', 'txSecret'];
     const missing = required.filter((key) => !config[key]);
@@ -41,6 +44,7 @@ export async function requestPlayDecision(config, { fetchImpl = fetch, signal, n
             clientId: config.clientId,
             requestRegion: config.requestRegion,
             capabilities,
+            ...(config.codec ? { codec: config.codec } : {}),
             ...(config.natProbeId || natProbeId ? { natProbeId: natProbeId || config.natProbeId } : {}),
         }),
     });

@@ -2,12 +2,12 @@
 // Supports both tx HTML (#player-container-id, #quality-select)
 // and legacy mmx HTML (#video, #layerSelect)
 
-import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20261022-1';
+import { MMXControlClient, MediaMTXWebRTCReader, ABR_REASON_AUTO_BANDWIDTH } from './ppplayer.mjs?v=20261026-1';
 import { ABREngine } from './abr-engine.mjs?v=20260925-1';
 import { attachSeiTimestampReader, attachPassthroughTransform } from './sei-timestamp.mjs?v=20261021-1';
 import { selectPlaybackCodec } from './codec-capability.mjs?v=20261016-1';
 import { TimeSync } from './time-sync.mjs?v=20260925-1';
-import { parsePlayRequest, requestPlayDecisionWithRetry } from './play-request.mjs?v=20261016-1';
+import { parsePlayRequest, requestPlayDecisionWithRetry } from './play-request.mjs?v=20261025-1';
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
 import { isWhepUrl, looksLikeUrl, WHEP_ONLY_MESSAGE } from './whep-url.mjs?v=20261023-1';
 import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20261024-1';
@@ -1074,6 +1074,7 @@ function negotiateAndConnect(generation, url, codecType) {
 
     reader = new MediaMTXWebRTCReader({
         url: url,
+        videoCodec: codecType,
         maxBitrate: 2500, // 初始带宽限制
         // The direct path reads the OBS abs-timestamp SEI out of the encoded
         // bitstream (attachSeiTimestampReader below), which needs the encoded

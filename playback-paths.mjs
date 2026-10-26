@@ -1,5 +1,5 @@
 import { applyPlayoutBuffer } from './buffer-config.mjs?v=20261024-1';
-import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20260929-2';
+import { MediaMTXWebRTCReader } from './ppplayer.mjs?v=20261026-1';
 import { attachPassthroughTransform } from './sei-timestamp.mjs?v=20261021-1';
 
 // Verbose diagnostics (raw SDP dumps) are opt-in with ?debug so a normal
