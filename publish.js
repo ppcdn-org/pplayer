@@ -11,7 +11,7 @@ const params = new URLSearchParams(location.search);
 $('ppcenter').value = params.get('ppcenter') || 'https://api.pp-cdn.org';
 $('token').value = params.get('token') || '';
 $('appId').value = params.get('appId') || '';
-$('streamName').value = params.get('streamName') || '';
+$('streamName').value = params.get('streamName') || 'B01-frontView';
 
 // When the console opens this page as a popup it posts the login token in
 // (see BrowserPublishPanel), so it never has to go through the URL/history.
@@ -126,4 +126,18 @@ $('stop').addEventListener('click', async () => {
     $('start').disabled = false;
     setStatus('已停止');
   }
+});
+
+$('watch').addEventListener('click', () => {
+  const appId = $('appId').value.trim();
+  const streamName = ($('streamName').value.trim() || 'B01-frontView').replace(/\/(h264|hevc)$/i, '');
+  if (!appId) {
+    setStatus('请先填写 appId', true);
+    return;
+  }
+  const url = new URL('https://pplayer.pp-cdn.org/');
+  url.searchParams.set('appId', appId);
+  url.searchParams.set('streamName', streamName);
+  url.searchParams.set('codec', 'h264');
+  window.open(url.toString(), '_blank', 'noopener');
 });
