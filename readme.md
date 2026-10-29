@@ -29,6 +29,7 @@ pplayer 是 PPCDN 的 Web 播放器 SDK，基于 WHEP / WebRTC，支持 Simulcas
 3.  **`MMXControlClient`** (内部): 负责 WebSocket 信令通道，与服务端进行层级切换通信。
 4.  **`TimeSync`**: 向 ppcenter 做应用层时钟校准，供端到端延迟（P2P Delay）计算使用。可选组件，不影响播放。
 5.  **`codec-capability.js`**: HEVC/H264 多轨同播的浏览器解码能力检测，决定连接 `.../h264/whep` 还是 `.../hevc/whep`。可选组件；未引入时固定请求 H264。详见 §7。
+6.  **`window.pplayer`**: 独立播放页的页面级 API，提供 `getCurrentFrameTimestamp()` 和逐帧 `onFrameTimestamp` 回调，用于读取当前播放帧的发布端时间戳。详见 §11。
 
 ---
 
@@ -66,8 +67,8 @@ import { ABREngine } from './abr-engine.mjs';
 | `play-request.mjs` | 向 ppcenter 请求播放决策（§10） |
 | `nat-probe.mjs` | NAT 类型探测（§10） |
 | `playback-paths.mjs` | Edge / P2P 两条播放路径（§10） |
-| `playback-race-controller.mjs` | 竞速状态机（§10） |
-| `play-decision-runner.mjs` | 按决策组装竞速（§10） |
+| `playback-race-controller.mjs` | 历史回滚保留；正常播放流程不再使用 |
+| `play-decision-runner.mjs` | 按 ppcenter 决策启动 Edge 或直接 P2P（§10） |
 
 **测试**：`npm test`（`node --test test/*.test.mjs`，共 168 个用例）。
 
@@ -212,45 +213,6 @@ function initControlClient(sessionId) {
 | `notifyAutoMode(enabled)` | `enabled`: Boolean | 采纳服务端下发的模式（对应 `onABRMode`）。 |
 | `setAutoMode(enabled)` | `enabled`: Boolean | 本端请求切换模式。仍需调用 `controlClient.setABRMode()` 通知服务端。 |
 | `selectedTrackId()` | - | 选择器应显示的层级：有未确认的手动选择时显示它，否则显示在播层级。 |
-
----
-
-### 3.4 页面级 API：`window.pplayer`
-
-加载独立播放页入口 `main.js` 后可用；只 import `ppplayer.mjs` 等 SDK 模块时不会创建该对象。
-
-| API | 说明 |
-| :--- | :--- |
-| `getCurrentFrameTimestamp()` | 读取最近一帧的发布端时间戳；无可用帧或超过 5 秒未收到时返回 `null`。 |
-| `onFrameTimestamp` | 可选逐帧回调：`(frame) => void`。 |
-
-返回对象：
-
-```javascript
-{
-  timestampMs: 1793347200123,  // ppobs 写入码流的绝对 UTC 毫秒
-  source: 'sei',               // 'sei' | 'relay'
-  path: 'edge',                // 'edge' | 'p2p'
-  receivedAtMs: 1793347200198, // 收到该时间戳时的本地 Date.now()
-  ageMs: 75                    // 距收到时刻的毫秒数
-}
-```
-
-```javascript
-window.pplayer.onFrameTimestamp = (frame) => {
-  console.log(frame.timestampMs, frame.source, frame.path);
-};
-
-const frame = window.pplayer.getCurrentFrameTimestamp();
-if (frame) {
-  // timestampMs 是发布端编码时间，不是浏览器渲染时间；
-  // 需要渲染时刻时用 requestVideoFrameCallback。
-}
-```
-
-- Chromium 下优先从码流 SEI 直接读取；其他浏览器回退到 mmx 通过控制通道下发的 `OBS_TIMESTAMP`。
-- 暂停、切流或超过 5 秒没有新媒体帧时返回 `null`，调用方不要缓存旧值。
-- 只使用 SDK 模块时，可直接用 `attachSeiTimestampReader(receiver, onTimestamp, codec)` 读取；非 Chromium 用 `MMXControlClient` 的 `onObsTimestamp` 回退。
 
 ---
 
@@ -542,26 +504,18 @@ applyPlayoutBuffer(pc, null); // no-op：保持浏览器自适应，不会被当
 
 ---
 
-## 10. P2P 加速与竞速 (§PLY-005/006)
+## 10. P2P 直连（ppcenter 决策，顺序回退）
 
-启用后，播放器会**同时**发起两条连接并采用先出帧的那条：
+当前版本 **不再在客户端并行发起 P2P/Edge 两条连接**。是否走 P2P 由 ppcenter 的播放决策判断；播放器只执行决策，P2P 失败时顺序回退 Edge。
 
-- **Edge 路**：常规 WHEP，连到边缘节点。
-- **P2P 路**：经 ppcenter 中转信令，直连推流端 ppobs。
+### 10.1 决策与执行
 
-### 10.1 为什么要竞速
-
-NAT 穿透在公网上没有成功保证——对称型 NAT、运营商级 CGNAT 都会让直连失败。若串行地"先试 P2P、失败再连 Edge"，每一次穿透误判都要让观众多等几秒黑屏。竞速把这个代价降为 0：P2P 失败时 Edge 早已在并行建连。
-
-判定以**首个可解码视频帧**为准（轮询 `inbound-rtp.framesDecoded > 0`），不是 ICE connected。
-
-| 情况 | 行为 |
+| ppcenter 决策 | 播放器行为 |
 | :--- | :--- |
-| P2P 先出帧 | 用 P2P，关闭尚未完成的 WHEP |
-| Edge 先出帧 | 用 Edge，P2P 转入后台继续建连（默认至 2s 超时） |
-| 后台 P2P 后来成功 | 仅在可平滑切换时才切（`canSwitchToP2P` 回调裁决），否则关闭 P2P |
-| 选中路径中途失败 | 切到另一条；若 Edge 已被关闭则重新拉起 |
-| 两条都失败 | 报错 |
+| `mode=p2p-connect` 且 `p2pAvailable != false` | 先建立 P2P；P2P 失败或超时没有首帧时，顺序回退到 `edgeStreamUrl` 的 WHEP |
+| `mode=edge-only` 或 `p2pAvailable=false` | 直接连接 Edge WHEP |
+
+`p2pAvailable` 是 ppcenter 的显式可用标记（穿透可达且 publisher 有空闲 P2P 名额）；旧版 ppcenter 不带该字段时按 `mode` 处理。P2P 只有一条 H264 视频层，ABR 选层只在 Edge 路径上可用。
 
 ### 10.2 启用方式
 
@@ -571,26 +525,49 @@ NAT 穿透在公网上没有成功保证——对称型 NAT、运营商级 CGNAT
 index.html?ppcenter=http://center:18000&appId=xxx&streamName=live/s1&txTime=<hex>&txSecret=<hmac>
 ```
 
-流程：播放器先做 NAT 探测并上报，再向 ppcenter `POST /v1/play/requests` 请求决策；ppcenter 返回 `p2pAvailable`（P2P 资源是否可用）和 `edgeStreamUrl`（Edge 裸流地址基址）。`p2pAvailable` 为 true 时走 P2P connect；否则用 `edgeStreamUrl` 拼 WHEP 地址——本机支持 HEVC 追加 `/hevc/whep`，否则追加 `/h264/whep`。
+流程：播放器先做 NAT 探测并上报，再向 ppcenter `POST /v1/play/requests` 请求决策；ppcenter 返回 `p2pAvailable`（P2P 资源是否可用）和 `edgeStreamUrl`（Edge 裸流地址基址）。`p2pAvailable` 为 true 时直接建立 P2P；否则用 `edgeStreamUrl` 拼 WHEP 地址——本机支持 HEVC 追加 `/hevc/whep`，否则追加 `/h264/whep`。
 
 **分享链接**：上面这个带齐五参数的 URL 就是一条可分享的签名播放链接，打开即自动起播（无需再点 Start）。若五参数只给了一部分，页面会在统计区给出明确报错并列出缺失的参数；五个都不给时页面无法播放（没有手工输入 URL 的直接播放模式）。
 
 `txTime`/`txSecret` 由 `appSecret` 派生（`POST /auth/generate`，需 appId+appSecret），**不要**把 appSecret 放进播放页或链接。
 
-### 10.3 单独使用竞速控制器
+> `playback-race-controller.mjs` / `createPlaybackRace` 仅作为历史回滚代码保留，正常播放流程不调用；当前入口是 `startPlaybackFromDecision()` + `createDirectP2PPlayback()`。
 
-`PlaybackRaceController` 不依赖 ppcenter，两条路径和时钟都可注入，可以独立使用：
+---
+
+## 11. 获取当前播放帧时间戳 API
+
+`window.pplayer` 在加载独立播放页入口 `main.js` 后创建；只 import `ppplayer.mjs` 等 SDK 模块时不会创建该对象。
+
+| API | 说明 |
+| :--- | :--- |
+| `getCurrentFrameTimestamp()` | 读取最近一帧的发布端时间戳；无可用帧或超过 5 秒未收到时返回 `null`。 |
+| `onFrameTimestamp` | 可选逐帧回调：`(frame) => void`。 |
+
+返回对象：
 
 ```javascript
-import { PlaybackRaceController } from './playback-race-controller.mjs';
-
-const controller = new PlaybackRaceController({
-    edgePath, p2pPath,          // 需实现 start({onFirstFrame,onFailed}) / stop()
-    raceWindowMs: 500,
-    connectTimeoutMs: 2000,
-    onSelected: ({ path }) => console.log('选中', path),
-    onFailed: (err) => console.error(err),
-    onTelemetry: (e) => console.debug(e),
-});
-controller.start();
+{
+  timestampMs: 1793347200123,  // ppobs 写入码流的绝对 UTC 毫秒
+  source: 'sei',               // 'sei' | 'relay'
+  path: 'edge',                // 'edge' | 'p2p'
+  receivedAtMs: 1793347200198, // 收到该时间戳时的本地 Date.now()
+  ageMs: 75                    // 距收到时刻的毫秒数
+}
 ```
+
+```javascript
+window.pplayer.onFrameTimestamp = (frame) => {
+  console.log(frame.timestampMs, frame.source, frame.path);
+};
+
+const frame = window.pplayer.getCurrentFrameTimestamp();
+if (frame) {
+  // timestampMs 是发布端编码时间，不是浏览器渲染时间；
+  // 需要渲染时刻时用 requestVideoFrameCallback。
+}
+```
+
+- Chromium 下优先从码流 SEI 直接读取；其他浏览器回退到 mmx 通过控制通道下发的 `OBS_TIMESTAMP`。
+- 暂停、切流或超过 5 秒没有新媒体帧时返回 `null`，调用方不要缓存旧值。
+- 只使用 SDK 模块时，可直接用 `attachSeiTimestampReader(receiver, onTimestamp, codec)` 读取；非 Chromium 用 `MMXControlClient` 的 `onObsTimestamp` 回退。
