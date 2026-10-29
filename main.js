@@ -437,6 +437,50 @@ let lastP2PDelayMs = null;
 let lastP2PDelayAt = 0;
 let lastP2PDelaySource = null; // 'sei' | 'relay'
 const P2P_DELAY_STALE_MS = 5000;
+
+// Public page API: the last per-frame publisher timestamp seen on either the
+// in-band SEI path or the OBS_TIMESTAMP relay. This is the UTC ms stamped by
+// ppobs when the frame was encoded, not the local time at which the browser
+// paints it; callers that need paint time should combine it with
+// requestVideoFrameCallback. Null once the stream has been silent for
+// P2P_DELAY_STALE_MS so a paused/reconnected player never reports a stale frame.
+let lastFrameTimestampInfo = null;
+
+function getCurrentFrameTimestamp() {
+    if (!lastFrameTimestampInfo) return null;
+    const ageMs = Date.now() - lastFrameTimestampInfo.receivedAtMs;
+    if (ageMs < 0 || ageMs > P2P_DELAY_STALE_MS) return null;
+    return { ...lastFrameTimestampInfo, ageMs };
+}
+
+function noteFrameTimestamp(timestampMs, source) {
+    const value = Number(timestampMs);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    const info = {
+        timestampMs: value,
+        source,
+        path: activePlaybackPathName,
+        receivedAtMs: Date.now(),
+    };
+    lastFrameTimestampInfo = info;
+    const callback = typeof window !== 'undefined' && window.pplayer
+        ? window.pplayer.onFrameTimestamp
+        : null;
+    if (typeof callback === 'function') {
+        try {
+            callback({ ...info, ageMs: 0 });
+        } catch (e) {
+            console.warn('[pplayer] onFrameTimestamp callback failed:', e);
+        }
+    }
+    return info;
+}
+
+if (typeof window !== 'undefined') {
+    window.pplayer = Object.assign(window.pplayer || {}, {
+        getCurrentFrameTimestamp,
+    });
+}
 // Fixed compensation added to every delay reading, on BOTH the P2P and the
 // Edge path (they share reportP2PDelay below, so there is no per-path
 // branch). The in-band OBS SEI timestamp is stamped after encoding and read
@@ -477,6 +521,9 @@ function reportP2PDelay(timestampMs, source) {
         (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS) {
         return;
     }
+    // Expose the raw timestamp even before TimeSync has calibrated: reading
+    // it does not require a local clock, only computing the delay does.
+    if (noteFrameTimestamp(timestampMs, source) === null) return;
     // No calibrated clock yet => no delay. Deliberately not falling back to
     // a raw Date.now(): that's what produced the bogus readings this whole
     // mechanism exists to fix.
@@ -1206,6 +1253,7 @@ function resetSessionState() {
     lastP2PDelayMs = null;
     lastP2PDelayAt = 0;
     lastP2PDelaySource = null;
+    lastFrameTimestampInfo = null;
     seiReaderReceiver = null;
     p2pSeiReaderAttached = false;
     p2pSeiZeroDecodeStreak = 0;
