@@ -1,14 +1,29 @@
-# MediaMTX Player SDK v1.0 开发文档
+# pplayer — PPCDN Web 播放器 SDK
+
+> **PPCDN** 是一个开源社区项目：<https://www.pp-cdn.org>
+>
+> PPCDN 为您带来 30%~50% 的带宽 & 成本节约，端到端极致低时延（<500ms）体验：
+>
+> 1. 支持多推流协议（ERTMP/SRT/WHIP）适应不同直播现场网络，并带来极致低时延体验（含播放缓冲时延）：
+>    P2P 直连时延：<120ms；WHIP 推流时延：<200ms；ERTMP 推流时延：<200ms；SRT 推流时延：<500ms。
+> 2. 兼容多种技术带来 30%~50% 的流量 & 成本下降：支持 HEVC 同播、内嵌 P2P 穿透服务、0 网络转码技术。
+> 3. 支持 ABR 自适应用户端网络，播放更流畅。
+> 4. 提供 API 获取当前播放帧时间戳，可用于游戏结果与音视频流的同步。
+>
+> PPCDN 跟腾讯云直播相比的优势：时延缩短 1s；0 转码费用；可读取实时时间戳；不同 quality 流切换无黑屏停顿。
+>
+> 官方在线 demo：<https://pplayer.pp-cdn.org/>
+> 请先下载 [ppobs v32.1.2rc008](https://github.com/ppcdn-org/ppobs/releases/tag/v32.1.2rc008) 推流后才能观看。
 
 ## 官方链接
 
-- 官方在线 demo: <https://www.pp-cdn.org/>
-- 官方 TG 运营群: <https://t.me/+oEpcmaGXdihjMzY1>
+- 官方在线 demo: <https://pplayer.pp-cdn.org/>
+- ppobs 下载: <https://github.com/ppcdn-org/ppobs/releases/tag/v32.1.2rc008>
 
 > **pplayer 只接受 WHEP 拉流格式**：`?url=` 必须是以 `/whep` 结尾的 WHEP 地址，Stream 框只接受 `appId/streamName`；HLS、FLV、RTMP、SRT 等其它地址会被直接拒绝并提示 "pplayer only plays WHEP streams"。校验见 `whep-url.mjs`。
 
 ## 1. 简介
-本 SDK 是一套轻量级的前端解决方案，专为配合 MediaMTX 服务的 WebRTC WHEP 接口和 Simulcast 功能设计。它包含以下核心组件：
+pplayer 是 PPCDN 的 Web 播放器 SDK，基于 WHEP / WebRTC，支持 Simulcast/ABR、HEVC/H264 多轨、P2P 直连与 Edge 回退、时钟校准和当前播放帧时间戳读取。它包含以下核心组件：
 1.  **`MediaMTXWebRTCReader`**: 负责 WHEP 协议交互、WebRTC 连接建立、RTP 接收和 SDP 协商。
 2.  **`ABREngine`**: 层级状态记录。**自适应码率的决策已移到服务端**（见 §5），本模块只负责记录有哪些层级、当前在播哪一层、以及用户是否接管了手动选择。
 3.  **`MMXControlClient`** (内部): 负责 WebSocket 信令通道，与服务端进行层级切换通信。
@@ -54,7 +69,7 @@ import { ABREngine } from './abr-engine.mjs';
 | `playback-race-controller.mjs` | 竞速状态机（§10） |
 | `play-decision-runner.mjs` | 按决策组装竞速（§10） |
 
-**测试**：`npm test`（`node --test test/*.test.mjs`，共 59 个用例）。
+**测试**：`npm test`（`node --test test/*.test.mjs`，共 168 个用例）。
 
 ### 2.2 基础示例 (Main.js)
 ```javascript
@@ -200,6 +215,45 @@ function initControlClient(sessionId) {
 
 ---
 
+### 3.4 页面级 API：`window.pplayer`
+
+加载独立播放页入口 `main.js` 后可用；只 import `ppplayer.mjs` 等 SDK 模块时不会创建该对象。
+
+| API | 说明 |
+| :--- | :--- |
+| `getCurrentFrameTimestamp()` | 读取最近一帧的发布端时间戳；无可用帧或超过 5 秒未收到时返回 `null`。 |
+| `onFrameTimestamp` | 可选逐帧回调：`(frame) => void`。 |
+
+返回对象：
+
+```javascript
+{
+  timestampMs: 1793347200123,  // ppobs 写入码流的绝对 UTC 毫秒
+  source: 'sei',               // 'sei' | 'relay'
+  path: 'edge',                // 'edge' | 'p2p'
+  receivedAtMs: 1793347200198, // 收到该时间戳时的本地 Date.now()
+  ageMs: 75                    // 距收到时刻的毫秒数
+}
+```
+
+```javascript
+window.pplayer.onFrameTimestamp = (frame) => {
+  console.log(frame.timestampMs, frame.source, frame.path);
+};
+
+const frame = window.pplayer.getCurrentFrameTimestamp();
+if (frame) {
+  // timestampMs 是发布端编码时间，不是浏览器渲染时间；
+  // 需要渲染时刻时用 requestVideoFrameCallback。
+}
+```
+
+- Chromium 下优先从码流 SEI 直接读取；其他浏览器回退到 mmx 通过控制通道下发的 `OBS_TIMESTAMP`。
+- 暂停、切流或超过 5 秒没有新媒体帧时返回 `null`，调用方不要缓存旧值。
+- 只使用 SDK 模块时，可直接用 `attachSeiTimestampReader(receiver, onTimestamp, codec)` 读取；非 Chromium 用 `MMXControlClient` 的 `onObsTimestamp` 回退。
+
+---
+
 ## 4. 数据结构定义
 
 ### Track Info 对象
@@ -309,7 +363,7 @@ offset = ((T2 - T1) + (T3 - T4)) / 2   ≈ ppcenter 时钟 - 本地时钟
 校正后时间 = Date.now() + offset        // 是加不是减
 ```
 
-每轮采样 6 次取 RTT 最小的一次（RTT 越小说明受排队抖动干扰越小），默认每 45 秒重新校准一次。
+每轮采样 6 次取 RTT 最小的一次（RTT 越小说明受排队抖动干扰越小），默认每 10 分钟重新校准一次。
 
 ### 6.2 集成方式
 
@@ -342,7 +396,7 @@ if (now !== null) {
 | `start()` | 连接并执行首轮校准，返回 Promise&lt;Boolean&gt;。 |
 | `now()` | 校正后的 UTC 毫秒；未校准时为 `null`。 |
 | `isReady()` | 是否已完成至少一次校准。 |
-| `reportLatency(path, delayMs)` | 上报延迟，`path` 取 `'edge'` 或 `'p2p'`。 |
+| `reportLatency({ path, delayMs })` | 上报延迟，`path` 取 `'edge'` 或 `'p2p'`。 |
 | `stop()` | 停止校准并断开连接。 |
 | `offsetMs` / `lastSyncRttMs` | 当前生效的偏移量与所取样本的 RTT，用于判断可信度。 |
 
