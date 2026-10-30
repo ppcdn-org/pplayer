@@ -547,6 +547,20 @@ function reportP2PDelay(timestampMs, source) {
     }
 }
 
+// freshPlausibleP2PDelayMs returns the last SEI/relay measurement only while
+// it is fresh and inside the same plausibility band used by the UI. Heartbeat
+// reports must use this gate too: reportP2PDelay intentionally keeps an
+// implausible value around for the UI's "estimate instead" fallback, but
+// sending that value upstream poisons the per-stream/server aggregate after
+// reconnect/clock-skew events (e.g. the observed 65510 ms sample).
+function freshPlausibleP2PDelayMs() {
+    if (!Number.isFinite(lastP2PDelayMs)) return null;
+    if ((Date.now() - lastP2PDelayAt) >= P2P_DELAY_STALE_MS) return null;
+    if (lastP2PDelayMs < P2P_DELAY_MIN_PLAUSIBLE_MS ||
+        lastP2PDelayMs > P2P_DELAY_MAX_PLAUSIBLE_MS) return null;
+    return lastP2PDelayMs;
+}
+
 // One-shot report of which path actually played, so ppcenter can count the
 // true P2P penetration rate (P2P plays / total plays). Fired once per play:
 // 'edge' immediately for an edge-only decision, or - for a p2p-connect
@@ -703,11 +717,14 @@ function startPlaySession(playConfig, path, costTimeMs = 0) {
         };
         // Start reporting the measured P2P delay only after playback has run
         // for a minute - the first readings are noisy while the jitter buffer
-        // and clock sync settle. ppcenter keeps the last non-zero value, so a
-        // heartbeat without one does not clear it.
+        // and clock sync settle. Only fresh, plausible values may be sent:
+        // an implausible one is a clock/reconnect artifact and must not enter
+        // the server-side average. ppcenter keeps the last non-zero value, so
+        // a heartbeat without one does not clear it.
+        const p2pDelayMs = freshPlausibleP2PDelayMs();
         if (playSessionStartedAt && Date.now() - playSessionStartedAt > 60000 &&
-            lastP2PDelayMs != null && (Date.now() - lastP2PDelayAt) < P2P_DELAY_STALE_MS) {
-            body.p2pDelayMs = Math.round(lastP2PDelayMs);
+            p2pDelayMs != null) {
+            body.p2pDelayMs = Math.round(p2pDelayMs);
         }
         postPlaySession('/v1/play/session/heartbeat', body);
     }, 20000);
