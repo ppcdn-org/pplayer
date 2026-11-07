@@ -11,7 +11,7 @@ import { parsePlayRequest, requestPlayDecisionWithRetry } from './play-request.m
 import { buildEdgeWhepUrl } from './edge-url.mjs?v=20260929-1';
 import { isWhepUrl, looksLikeUrl, WHEP_ONLY_MESSAGE } from './whep-url.mjs?v=20261023-1';
 import { createDirectP2PPlayback, createPlaybackRace, startPlaybackFromDecision } from './play-decision-runner.mjs?v=20261026-2';
-import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20260925-3';
+import { gatherNatProbe, submitNatProbe } from './nat-probe.mjs?v=20261107-1';
 import { isValidObsTimestampMessage, computeDelayMs } from './obs-timestamp.mjs?v=20260925-1';
 import { parseBufferMs, applyPlayoutBuffer, DEFAULT_BUFFER_MS } from './buffer-config.mjs?v=20261024-1';
 import { CatchUpController, DEFAULT_TARGET_MS } from './catchup-controller.mjs?v=20261023-1';

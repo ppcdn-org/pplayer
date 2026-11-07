@@ -1,13 +1,17 @@
-// ppcenter runs its own STUN server (internal/stun) on the same host as the
-// API, conventionally at port 3478 - deriving it from `ppcenter` means the
-// probe doesn't need ppcenter to have answered anything yet (it runs before
-// the first request of any kind). Google's public STUN is raced alongside it
-// as a reachability fallback: some networks can't reach ppcenter's own STUN
-// at all (confirmed in production 2026-09-22 - a publisher's network that
-// reached Google's STUN reliably every 4 minutes via ppobs's probe refresh
-// got zero responses from ppcenter's own the moment Google was removed as a
-// fallback), and a failed probe here means the whole attempt falls back to
-// edge-only, so reachability matters more than which server answers.
+// pplayer's STUN server is stun.pp-cdn.org:3478 - a DNS-only record that
+// points straight at ppcenter's own STUN server (internal/stun), so it is
+// directly dialable over UDP. Deliberately a fixed host, NOT derived from the
+// `ppcenter` URL: that host (api.pp-cdn.org) is Cloudflare-fronted and
+// Cloudflare does not forward UDP/3478, so a derived stun:api.pp-cdn.org:3478
+// never answers (confirmed in production from mainland China, 2026-11-07).
+//
+// Google's public STUN is raced alongside it as a reachability fallback: some
+// networks can't reach ppcenter's own STUN at all (confirmed in production
+// 2026-09-22 - a publisher's network that reached Google's STUN reliably
+// every 4 minutes via ppobs's probe refresh got zero responses from
+// ppcenter's own the moment Google was removed as a fallback), and a failed
+// probe here means the whole attempt falls back to edge-only, so reachability
+// matters more than which server answers.
 //
 // Racing two servers can make the publisher and a player each win against a
 // *different* one and disagree on address family (api.pp-cdn.org has no
@@ -26,28 +30,22 @@
 // track each other closely: libdatachannel/libjuice uses only the first
 // STUN entry and silently discards the rest, so the publisher side always
 // probes against ppcenter's own alone. See that file's own comment.
-function deriveStunIceServers(ppcenter) {
-    const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
-    try {
-        const host = new URL(ppcenter).hostname;
-        if (host) servers.unshift({ urls: `stun:${host}:3478` });
-    } catch {
-        // Malformed ppcenter URL - fall back to the public server alone;
-        // requestPlayDecision will surface the same malformed URL as an
-        // error shortly after anyway.
-    }
-    return servers;
+function deriveStunIceServers() {
+    return [
+        { urls: 'stun:stun.pp-cdn.org:3478' },
+        { urls: 'stun:stun.l.google.com:19302' },
+    ];
 }
 
-// Local half of the probe: gather ICE candidates against ppcenter's STUN and
+// Local half of the probe: gather ICE candidates against ppcdn's STUN and
 // pick the best one. Needs no token and sends nothing, so the caller can start
 // it as early as possible - in parallel with minting a viewer token or
 // requesting the play decision - and submit only once the token is in hand
 // (see submitNatProbe). Returns null when no usable (non-mDNS) candidate is
 // found.
-export async function gatherNatProbe(ppcenter) {
+export async function gatherNatProbe() {
     const pc = new RTCPeerConnection({
-        iceServers: deriveStunIceServers(ppcenter),
+        iceServers: deriveStunIceServers(),
         iceTransportPolicy: 'all',
     });
     pc.createDataChannel('probe');
@@ -152,7 +150,7 @@ export async function submitNatProbe({ ppcenter, appId, txTime, txSecret, client
 // Convenience wrapper preserving the original one-call shape (gather, then
 // submit). Kept for callers that don't need to overlap the two halves.
 export async function probeNATAndSubmit(opts) {
-    const gathered = await gatherNatProbe(opts.ppcenter);
+    const gathered = await gatherNatProbe();
     return submitNatProbe({ ...opts, gathered });
 }
 

@@ -181,7 +181,7 @@ test('NAT probe returns null when fetch fails', async () => {
     assert.equal(await probePromise, null);
 });
 
-test('NAT probe races ppcenter\'s own STUN server (tried first) against Google\'s as a reachability fallback', async () => {
+test('NAT probe uses stun.pp-cdn.org (tried first) and races Google\'s as a reachability fallback', async () => {
     const { probeNATAndSubmit } = await import('../nat-probe.mjs');
     globalThis.RTCPeerConnection = FakeRTCPeerConnection;
     globalThis.fetch = mockFetch;
@@ -192,13 +192,15 @@ test('NAT probe races ppcenter\'s own STUN server (tried first) against Google\'
         clientId: 'viewer',
     });
 
-    // Google stays configured as a fallback: some networks can't reach
-    // ppcenter's own STUN at all (confirmed in production 2026-09-22) - see
-    // deriveStunIceServers's doc comment. Address-family consistency is
-    // handled separately, by preferring an IPv4 srflx candidate regardless
-    // of which server it came from (see the next two tests).
+    // The ppcdn STUN host is fixed (stun.pp-cdn.org, DNS-only), never derived
+    // from the Cloudflare-fronted ppcenter URL. Google stays configured as a
+    // fallback: some networks can't reach ppcenter's own STUN at all
+    // (confirmed in production 2026-09-22) - see deriveStunIceServers's doc
+    // comment. Address-family consistency is handled separately, by
+    // preferring an IPv4 srflx candidate regardless of which server it came
+    // from (see the next two tests).
     assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [
-        { urls: 'stun:api.pp-cdn.org:3478' },
+        { urls: 'stun:stun.pp-cdn.org:3478' },
         { urls: 'stun:stun.l.google.com:19302' },
     ]);
 
@@ -207,7 +209,7 @@ test('NAT probe races ppcenter\'s own STUN server (tried first) against Google\'
     await probePromise;
 });
 
-test('NAT probe falls back to Google\'s STUN server alone when ppcenter is not a valid URL', async () => {
+test('NAT probe always uses the fixed ppcdn STUN host, regardless of the ppcenter URL', async () => {
     const { probeNATAndSubmit } = await import('../nat-probe.mjs');
     globalThis.RTCPeerConnection = FakeRTCPeerConnection;
     globalThis.fetch = mockFetch;
@@ -218,10 +220,13 @@ test('NAT probe falls back to Google\'s STUN server alone when ppcenter is not a
         clientId: 'viewer',
     });
 
-    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [{ urls: 'stun:stun.l.google.com:19302' }]);
+    assert.deepEqual(FakeRTCPeerConnection.latest.config.iceServers, [
+        { urls: 'stun:stun.pp-cdn.org:3478' },
+        { urls: 'stun:stun.l.google.com:19302' },
+    ]);
 
     await new Promise(r => setTimeout(r, 10));
-    FakeRTCPeerConnection.latest.gather([]); // Google unreachable too -> gathering "completes" with nothing found
+    FakeRTCPeerConnection.latest.gather([]); // both unreachable -> gathering "completes" with nothing found
     assert.equal(await probePromise, null);
 });
 
