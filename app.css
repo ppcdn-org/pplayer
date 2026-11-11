@@ -1,0 +1,51 @@
+body {
+    background: #1a1a1a;
+    color: #fff;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    margin: 0;
+}
+
+#controls { background: #333; padding: 15px; display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid #444; }
+.controls-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+input[type="text"] { flex: 1; padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; }
+
+select { padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; min-width: 150px; }
+select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+button { padding: 8px 14px; min-width: 40px; border: none; border-radius: 4px; font-weight: bold; font-size: 16px; line-height: 1; cursor: pointer; transition: 0.2s; }
+#appStartBtn { background: #28a745; color: white; }
+#appStartBtn:hover { background: #218838; }
+#appExitBtn { background: #dc3545; color: white; }
+#appExitBtn:hover { background: #c82333; }
+#appPauseVideoBtn, #appPauseAudioBtn { background: #5253aa; color: white; }
+#appPauseVideoBtn:hover, #appPauseAudioBtn:hover { background: #6465bd; }
+#appMuteBtn { background: #00838f; color: white; }
+#appMuteBtn:hover { background: #00a5b5; }
+#appSnapshotBtn { background: #6c5ce7; color: white; }
+#appSnapshotBtn:hover { background: #7d6ff2; }
+#appRecordBtn { background: #b71c1c; color: white; }
+#appRecordBtn:hover { background: #d32f2f; }
+#appRecordBtn.recording { background: #ff1744; animation: recordPulse 1s infinite; }
+@keyframes recordPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+#appFullscreenBtn { background: #555; color: white; }
+#appFullscreenBtn:hover { background: #777; }
+#appStatsBtn { background: #0f766e; color: white; }
+#appStatsBtn:hover { background: #0d9488; }
+button:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; animation: none; }
+
+.ws-wrap { display: flex; align-items: center; gap: 5px; }
+.ws-status { width: 10px; height: 10px; border-radius: 50%; display: inline-block; background: #555; }
+.ws-connected { background: #28a745; box-shadow: 0 0 5px #28a745; }
+.ws-disconnected { background: #dc3545; }
+
+.p2p-toggle { display: flex; align-items: center; gap: 5px; margin-left: 10px; }
+
+#appStatus { color: #9aa4b2; font-size: 13px; }
+
+#main-area { flex: 1; display: flex; position: relative; overflow: hidden; }
+#video-container { flex: 1; position: relative; background: #000; }
+#player { position: absolute; inset: 0; }

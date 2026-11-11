@@ -5,132 +5,52 @@
     <link rel="icon" type="image/x-icon" href="favicon.ico">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>pplayer</title>
-    <style>
-        body { background: #1a1a1a; color: #fff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; flex-direction: column; height: 100vh; margin: 0; }
-        
-        #controls { background: #333; padding: 15px; display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid #444; }
-        .controls-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-
-        input[type="text"] { flex: 1; padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; }
-        
-        select { padding: 8px; border-radius: 4px; border: 1px solid #555; background: #222; color: #fff; font-size: 14px; min-width: 150px; }
-        select:disabled { opacity: 0.5; cursor: not-allowed; }
-
-        button { padding: 8px 14px; min-width: 40px; border: none; border-radius: 4px; font-weight: bold; font-size: 16px; line-height: 1; cursor: pointer; transition: 0.2s; }
-        #startBtn { background: #28a745; color: white; }
-        #startBtn:hover { background: #218838; }
-        #exitBtn { background: #dc3545; color: white; }
-        #exitBtn:hover { background: #c82333; }
-        #videoPauseBtn, #audioPauseBtn { background: #5253aa; color: white; }
-        #videoPauseBtn:hover, #audioPauseBtn:hover { background: #6465bd; }
-        #muteBtn { background: #00838f; color: white; }
-        #muteBtn:hover { background: #00a5b5; }
-        #snapshotBtn { background: #6c5ce7; color: white; }
-        #snapshotBtn:hover { background: #7d6ff2; }
-        #recordBtn { background: #b71c1c; color: white; }
-        #recordBtn:hover { background: #d32f2f; }
-        #recordBtn.recording { background: #ff1744; animation: recordPulse 1s infinite; }
-        @keyframes recordPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
-        #fullscreenBtn { background: #555; color: white; }
-        #fullscreenBtn:hover { background: #777; }
-        #statsToggleBtn { background: #0f766e; color: white; }
-        #statsToggleBtn:hover { background: #0d9488; }
-        button:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; animation: none; }
-
-        #main-area { flex: 1; display: flex; position: relative; overflow: hidden; }
-        #video-container { flex: 1; display: flex; justify-content: center; align-items: center; background: #000; }
-        video { width: 100%; height: 100%; object-fit: contain; }
-
-        #stats { 
-            position: absolute; top: 10px; right: 10px; width: 320px; max-height: calc(100% - 20px); 
-            background: rgba(0,0,0,0.85); border: 1px solid #444; padding: 10px; 
-            border-radius: 6px; overflow-y: auto; font-size: 13px; font-family: monospace;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3); pointer-events: none;
-        }
-        /* Toggled by the stats button in the controls row. */
-        #stats.collapsed { display: none; }
-        .stat-group { margin-bottom: 15px; }
-        .stat-title { color: #00bcd4; font-weight: bold; border-bottom: 1px dashed #555; margin-bottom: 5px; padding-bottom: 3px; }
-        .stat-row { display: flex; justify-content: space-between; margin-bottom: 3px; }
-        .stat-key { color: #aaa; }
-        .stat-val { color: #fff; font-weight: bold; }
-        .stat-val.good { color: #28a745; }
-        .stat-val.warn { color: #ffc107; }
-        .stat-val.bad { color: #dc3545; }
-        
-        .ws-status { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 5px; background: #555; }
-        .ws-connected { background: #28a745; box-shadow: 0 0 5px #28a745; }
-        .ws-disconnected { background: #dc3545; }
-    </style>
+    <link rel="stylesheet" href="app.css?v=20261111-1">
 </head>
 <body>
 
 <div id="controls">
-    <!-- The player is normally driven by the signed link's query parameters
-         (ppcenter/appId/streamName/txTime/txSecret), or by ?url=<signed WHEP>.
-         The Stream box is the manual entry point: type your own
-         appId/streamName (an optional trailing /h264 or /hevc forces the codec)
-         and press Start. It is prefilled from the query string when one is
-         present, and keeps the demo default below otherwise. -->
     <div class="controls-row">
-        <label for="streamInput">Stream:</label>
-        <input type="text" id="streamInput" value="keyc0c021b8ef993bcc/B01-frontView/h264"
+        <label for="appStreamInput">Stream:</label>
+        <input type="text" id="appStreamInput" value="keyc0c021b8ef993bcc/B01-frontView/h264"
                placeholder="appId/streamName (optionally /h264 or /hevc)"
                title="Type appId/streamName to play your own stream. Append /h264 or /hevc to force the codec.">
+        <span id="appStatus" title="Status"></span>
     </div>
     <div class="controls-row">
-        <div style="display: flex; align-items: center; gap: 5px;">
-            <span id="wsStatus" class="ws-status" title="Signaling Status"></span>
-            <label for="layerSelect">Quality:</label>
-            <select id="layerSelect" disabled>
-                <option value="-1">Auto (Waiting WS...)</option>
+        <div class="ws-wrap">
+            <span id="appWsStatus" class="ws-status" title="Signaling Status"></span>
+            <label for="appQualitySelect">Quality:</label>
+            <select id="appQualitySelect" disabled>
+                <option value="auto">Auto (Waiting...)</option>
             </select>
         </div>
 
-        <label for="p2pCheckbox" style="display: flex; align-items: center; gap: 5px; margin-left: 10px;"
+        <label for="appP2P" class="p2p-toggle"
                title="P2P: prefer a direct peer-to-peer connection to the publisher, and fall back to the edge node automatically when it can't connect. Uncheck to always play from the edge node.">
-            <input type="checkbox" id="p2pCheckbox" checked>
+            <input type="checkbox" id="appP2P" checked>
             P2P
         </label>
 
-        <button id="startBtn" title="Start">&#x25B6;</button>
-        <button id="exitBtn" title="Exit">&#x23F9;</button>
-        <button id="videoPauseBtn" title="Pause Video">&#x23F8;</button>
-        <button id="audioPauseBtn" title="Pause Audio">&#x23F8;</button>
-        <button id="muteBtn" title="Unmute">&#x1F507;</button>
-        <button id="snapshotBtn" title="Snapshot">&#x1F4F7;</button>
-        <button id="recordBtn" title="Record 60s (WebM)">&#x23FA;</button>
-        <button id="fullscreenBtn" title="Fullscreen">&#x26F6;</button>
-        <button id="statsToggleBtn" title="Show / hide statistics">&#x1F4CA;</button>
+        <button id="appStartBtn" title="Start" disabled>&#x25B6;</button>
+        <button id="appExitBtn" title="Exit" disabled>&#x23F9;</button>
+        <button id="appPauseVideoBtn" title="Pause Video" disabled>&#x23F8;</button>
+        <button id="appPauseAudioBtn" title="Pause Audio" disabled>&#x23F8;</button>
+        <button id="appMuteBtn" title="Unmute" disabled>&#x1F507;</button>
+        <button id="appSnapshotBtn" title="Snapshot" disabled>&#x1F4F7;</button>
+        <button id="appRecordBtn" title="Record 60s (WebM)" disabled>&#x23FA;</button>
+        <button id="appFullscreenBtn" title="Fullscreen" disabled>&#x26F6;</button>
+        <button id="appStatsBtn" title="Show / hide statistics" disabled>&#x1F4CA;</button>
     </div>
 </div>
 
 <div id="main-area">
     <div id="video-container">
-        <video id="video" autoplay playsinline muted controls></video>
-    </div>
-    <div id="stats">
-        <div style="color: #888; text-align: center;">Waiting for stream...</div>
+        <div id="player" title="pplayer"></div>
     </div>
 </div>
 
-<script>
-(function() {
-  // Collapse/expand the playback statistics overlay.
-  var statsToggle = document.getElementById('statsToggleBtn');
-  var statsPanel = document.getElementById('stats');
-  if (statsToggle && statsPanel) {
-    statsToggle.addEventListener('click', function () {
-      statsPanel.classList.toggle('collapsed');
-    });
-  }
-})();
-</script>
-
-<!-- ES modules: main.js imports everything else, so only the entry point is
-     listed here. Module scripts are deferred and run after parsing, so the
-     DOM lookups at the top of main.js are safe. -->
-  <script type="module" src="main.js?v=20261107-1"></script>
+<script type="module" src="app.js?v=20261111-1"></script>
 
 </body>
 </html>
