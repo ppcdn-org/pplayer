@@ -71,15 +71,32 @@ function resolveContainer(target) {
   throw new Error('PPPlayer container must be a selector or an Element');
 }
 
+function toCssSize(value) {
+  if (value === null || value === undefined || value === '') return '';
+  return typeof value === 'number' ? `${value}px` : String(value);
+}
+
+function applyViewport(root, video, options = {}) {
+  if (!root || !video) return;
+  const has = (key) => Object.prototype.hasOwnProperty.call(options, key);
+  const hasHeight = has('height') &&
+    options.height !== null && options.height !== undefined && options.height !== '';
+  if (has('width')) root.style.width = toCssSize(options.width);
+  if (has('height')) root.style.height = toCssSize(options.height);
+  if (has('aspectRatio')) {
+    const ratio = (options.aspectRatio === null || options.aspectRatio === undefined || options.aspectRatio === '')
+      ? '' : String(options.aspectRatio);
+    root.style.aspectRatio = ratio;
+    if (!hasHeight) root.style.height = ratio ? 'auto' : '';
+  }
+  const fit = has('fit') ? options.fit : options.objectFit;
+  if (fit !== undefined) video.style.objectFit = fit === null || fit === '' ? '' : String(fit);
+}
+
 function mountPlayer(container, options) {
   ensureStyle();
 
   const root = createElement('div', { className: ROOT_CLASS });
-  if (options.height) {
-    root.style.height = typeof options.height === 'number' ? `${options.height}px` : options.height;
-  } else if (!(container.clientHeight > 0)) {
-    root.classList.add('pplayer-sdk-aspect');
-  }
 
   const video = createElement('video', {
     id: 'player-container-id',
@@ -88,6 +105,14 @@ function mountPlayer(container, options) {
     muted: true,
   });
   if (options.controls !== false) video.setAttribute('controls', '');
+
+  if (!options.height && !(container.clientHeight > 0)) {
+    root.classList.add('pplayer-sdk-aspect');
+  }
+  applyViewport(root, video, options);
+  if (options.viewport && typeof options.viewport === 'object') {
+    applyViewport(root, video, options.viewport);
+  }
 
   const stats = createElement('div', {
     id: 'stats',
@@ -255,12 +280,40 @@ class PPPlayer {
     return this._call('get_state');
   }
 
+  set_viewport(options = {}) {
+    return this.ready.then(() => {
+      applyViewport(this.root, this.video, options);
+      return this.get_viewport();
+    });
+  }
+
+  get_viewport() {
+    return this.ready.then(() => ({
+      width: this.root.style.width || null,
+      height: this.root.style.height || null,
+      aspectRatio: this.root.style.aspectRatio || null,
+      fit: this.video.style.objectFit || 'contain',
+      clientWidth: this.root.clientWidth,
+      clientHeight: this.root.clientHeight,
+      videoWidth: this.video.videoWidth,
+      videoHeight: this.video.videoHeight,
+    }));
+  }
+
   switchQuality(target) {
     return this.switch_quality(target);
   }
 
   connectP2P(enabled = true) {
     return this.connect_p2p(enabled);
+  }
+
+  setViewport(options = {}) {
+    return this.set_viewport(options);
+  }
+
+  getViewport() {
+    return this.get_viewport();
   }
 
   pauseVideo(paused = true) {

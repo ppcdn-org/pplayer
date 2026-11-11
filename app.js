@@ -151,11 +151,52 @@ async function syncUi() {
     }
 }
 
+function streamNameFromStreamId(raw) {
+    if (!raw || /^https?:\/\//i.test(raw)) return '';
+    const parts = String(raw).trim().replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+    return parts.length >= 2 ? parts[1] : '';
+}
+
+function streamNameFromWhepUrl(raw) {
+    try {
+        const segments = new URL(raw).pathname.split('/').filter(Boolean);
+        if (segments[segments.length - 1] === 'whep') segments.pop();
+        if (['h264', 'hevc', 'av1'].includes(segments[segments.length - 1])) segments.pop();
+        return segments.pop() || '';
+    } catch {
+        return '';
+    }
+}
+
+function streamNameFromOptions(options) {
+    if (!options || typeof options !== 'object') return '';
+    if (options.streamName) return String(options.streamName).trim();
+    if (options.stream) return streamNameFromStreamId(options.stream);
+    if (options.url) return streamNameFromWhepUrl(options.url);
+    return '';
+}
+
+function viewportForStreamName(streamName) {
+    const last = String(streamName || '').trim().slice(-1).toLowerCase();
+    if (last === 'h') return { width: 1280, height: 720, fit: 'contain' };
+    if (last === 'v') return { width: 720, height: 1280, fit: 'contain' };
+    return { width: '100%', height: '100%', aspectRatio: null, fit: 'contain' };
+}
+
+async function applyStreamViewport(options) {
+    const streamName = streamNameFromOptions(options);
+    const viewport = viewportForStreamName(streamName);
+    await player.set_viewport(viewport);
+    return { streamName, viewport };
+}
+
 async function play(options) {
     playStartedAt = performance.now();
     setStatus('Starting...');
     setWsStatus(false);
     try {
+        const { streamName, viewport } = await applyStreamViewport(options);
+        console.log(`[app] stream=${streamName || '-'} viewport=${viewport.width}x${viewport.height}`);
         await player.play(options);
         playing = true;
         setControlsEnabled(true);

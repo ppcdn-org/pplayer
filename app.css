@@ -47,5 +47,6 @@ button:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; anima
 #appStatus { color: #9aa4b2; font-size: 13px; }
 
 #main-area { flex: 1; display: flex; position: relative; overflow: hidden; }
-#video-container { flex: 1; position: relative; background: #000; }
-#player { position: absolute; inset: 0; }
+#video-container { flex: 1; position: relative; background: #000; min-height: 0; }
+#player { position: absolute; inset: 0; display: flex; overflow: auto; }
+#player > .pplayer-sdk-root { flex: none; margin: auto; }
