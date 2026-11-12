@@ -187,8 +187,8 @@ class PPPlayer {
     this.api = window.pplayer;
 
     if (typeof this.options.onTracksInfo === 'function') {
-      this.api.onTracksInfo = (tracks, activeId) => {
-        try { this.options.onTracksInfo(tracks, activeId); } catch (error) {
+      this.api.onTracksInfo = (tracks, activeId, meta) => {
+        try { this.options.onTracksInfo(tracks, activeId, meta); } catch (error) {
           console.warn('[pplayer] onTracksInfo callback failed:', error);
         }
       };
@@ -709,6 +709,11 @@ let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
 let sdkLastPlayOptions = null;
 let pendingQualityTarget = null;
 
+// P2P playback deliberately has no Auto/ABR: a direct publisher<->viewer
+// connection exposes no usable capacity estimate to the viewer, so the quality
+// menu only offers the publisher's layers and the viewer picks one manually.
+// (Edge ABR still runs server-side from TWCC - see abr_controller.go in ppmmx.)
+
 // Loss has to be read as a RATE, not as a packet count. Audio runs at ~50
 // packets/s and video at several hundred, so the two cumulative counters the
 // stats panel used to print are an order of magnitude apart before a single
@@ -1123,8 +1128,13 @@ window.addEventListener('pagehide', () => stopPlaySession('client_stopped', { be
 const abrEngine = new ABREngine();
 
 function switchMediaTrack(trackId, reason) {
-    if (!controlClient) return;
+    const p2pPath = (activePlaybackPathName === 'p2p' && activePlaybackPath &&
+        typeof activePlaybackPath.selectLayer === 'function') ? activePlaybackPath : null;
+    if (!controlClient && !p2pPath) return;
     if (trackId === abrEngine.audioTrackId) {
+        // Audio-only selection is an Edge WHEP media-state feature; P2P
+        // always carries the publisher's Opus track and has no audio entry.
+        if (!controlClient) return;
         if (abrEngine.videoTrackIds.includes(abrEngine.currentTrackId)) lastVideoTrackId = abrEngine.currentTrackId;
         controlClient.setMediaState({ video: 'paused', audio: 'resumed' });
         abrEngine.notifyLayerSwitched(trackId);
@@ -1133,6 +1143,12 @@ function switchMediaTrack(trackId, reason) {
     }
     if (trackId === abrEngine.currentTrackId && !videoPaused) {
         console.log(`[Main] Ignore redundant layer switch: ${trackId} (${reason})`);
+        return;
+    }
+    if (p2pPath) {
+        lastVideoTrackId = trackId;
+        console.log(`[P2P] Requesting layer ${trackId} (${reason})`);
+        p2pPath.selectLayer(trackId, reason);
         return;
     }
     if (videoPaused) {
@@ -1410,6 +1426,11 @@ recordBtn.onclick = () => {
 
 function applyLayerSelection(val) {
     if (val === "auto") {
+        // P2P has no Auto/ABR: only the publisher's layers and a manual pick.
+        if (activePlaybackPathName === 'p2p') {
+            console.log('[UI] Auto mode is not available on P2P');
+            return false;
+        }
         abrEngine.setAutoMode(true);
         // Hand selection back to the server. A plain selectLayer() would
         // pin the layer again (it implies manual mode server-side), so
@@ -1423,7 +1444,7 @@ function applyLayerSelection(val) {
     } else {
         abrEngine.setAutoMode(false);
         const trackId = parseInt(val);
-        if (!isNaN(trackId) && controlClient) {
+        if (!isNaN(trackId)) {
             console.log(`[UI] Manual select track: ${trackId}`);
             // 通知引擎手动切换了，更新其内部状态
             abrEngine.notifyManualSwitch(trackId);
@@ -2144,16 +2165,24 @@ function startP2PPlayback(decision, generation, playConfig) {
     playbackRace = null;
 
     let settled = false;
+    let failedOver = false;
     let verifyTimer = null;
     let handshakeTimer = null;
 
     const fallbackToEdge = (reason) => {
-        if (settled || generation !== readerGeneration) return;
-        settled = true;
+        // Not gated on `settled`: once the first frame is in, a mid-playback
+        // P2P failure (ICE drop, a rejected control message) still has to fail
+        // over. The old `settled` guard made those no-ops, leaving the viewer
+        // frozen on a dead P2P leg forever. failedOver keeps it single-shot.
+        if (failedOver || generation !== readerGeneration) return;
+        failedOver = true;
         if (verifyTimer) clearTimeout(verifyTimer);
         if (handshakeTimer) clearTimeout(handshakeTimer);
         if (statsInterval) clearInterval(statsInterval);
         console.warn('[P2P] direct P2P did not play, falling back to edge:', reason);
+        p2pSeiWatchdogTrip = null;
+        p2pSeiZeroDecodeStreak = 0;
+        layerSelect.disabled = true;
         try { path.stop('p2p_failed'); } catch { /* best-effort */ }
         activePlaybackPath = null;
         activePlaybackPathName = 'edge';
@@ -2184,6 +2213,46 @@ function startP2PPlayback(decision, generation, playConfig) {
 
     path.start({
         onSignal: (message) => logP2PSignal(message, decision.p2p.sessionId),
+        onLayers: (layers, activeId) => {
+            if (generation !== readerGeneration) return;
+            // P2P does not support Auto/ABR: the menu lists only the
+            // publisher's layers and selection is always manual.
+            if (abrEngine.isAutoMode) abrEngine.setAutoMode(false);
+            const tracks = layers.map((layer) => ({ ...layer, type: 'video' }));
+            abrEngine.setTracks(tracks, activeId, video.videoWidth);
+            layerSelect.disabled = tracks.length === 0;
+            updateLayerSelectUI(tracks, activeId, false);
+            // The host UI (app.js) builds its own quality <select> from
+            // options.onTracksInfo, which the Edge leg feeds through the control
+            // channel. The P2P leg has no control channel, so without this the
+            // host selector never learned the publisher's layers and stayed
+            // disabled. opts.auto=false tells it to omit the "Auto (ABR)" entry.
+            if (typeof window !== 'undefined' && typeof window.pplayer?.onTracksInfo === 'function') {
+                try {
+                    window.pplayer.onTracksInfo(tracks, activeId, { path: 'p2p', auto: false });
+                } catch (e) {
+                    console.warn('[pplayer] onTracksInfo callback failed:', e);
+                }
+            }
+            if (pendingQualityTarget !== null) {
+                const queued = pendingQualityTarget;
+                pendingQualityTarget = null;
+                apiSwitchQuality(queued);
+            }
+        },
+        onLayerSwitched: (layerId) => {
+            if (generation !== readerGeneration) return;
+            const tracks = (path.layers || []).map((layer) => ({ ...layer, type: 'video' }));
+            abrEngine.notifyLayerSwitched(Number(layerId));
+            updateLayerSelectUI(tracks, Number(layerId), false);
+            if (typeof window !== 'undefined' && typeof window.pplayer?.onTracksInfo === 'function') {
+                try {
+                    window.pplayer.onTracksInfo(tracks, Number(layerId), { path: 'p2p', auto: false });
+                } catch (e) {
+                    console.warn('[pplayer] onTracksInfo callback failed:', e);
+                }
+            }
+        },
         onNegotiated: ({ stream }) => {
             if (generation !== readerGeneration) return;
             if (handshakeTimer) {
@@ -2202,13 +2271,14 @@ function startP2PPlayback(decision, generation, playConfig) {
             // penetration metric (same rule as the old race controller).
             if (typeof video.requestVideoFrameCallback === 'function') {
                 video.requestVideoFrameCallback(() => {
-                    if (settled || generation !== readerGeneration) return;
+                    if (settled || failedOver || generation !== readerGeneration) return;
                     settled = true;
                     if (firstFrameAt === null) firstFrameAt = Date.now();
                     if (verifyTimer) clearTimeout(verifyTimer);
                     reportPlayOutcome(playConfig, 'p2p');
                 });
             } else {
+                if (failedOver) return;
                 settled = true;
                 if (firstFrameAt === null) firstFrameAt = Date.now();
                 reportPlayOutcome(playConfig, 'p2p');
@@ -2329,6 +2399,10 @@ function initControlClient(whepUrl, sessionId) {
             layerSelect.disabled = true;
         },
         onTracksInfo: (tracks, activeId) => {
+            // While the P2P leg owns the media, the Edge control channel may
+            // still be alive from the race/setup phase; its track list must
+            // not overwrite the publisher's P2P layer menu.
+            if (activePlaybackPathName === 'p2p' && activePlaybackPath?.layers?.length) return;
             console.log("[UI] Received Tracks Info:", tracks);
             
             // [关键修复] 获取当前视频实际宽度，传给 ABR 引擎用于探测真实初始状态
@@ -2475,13 +2549,15 @@ function resumeVideoFromAudioOnly() {
     }
 }
 
-function updateLayerSelectUI(tracks, activeId) {
+function updateLayerSelectUI(tracks, activeId, allowAuto = true) {
     layerSelect.innerHTML = '';
-    
-    const autoOption = document.createElement('option');
-    autoOption.value = 'auto';
-    autoOption.text = 'Auto (ABR)';
-    layerSelect.appendChild(autoOption);
+
+    if (allowAuto) {
+        const autoOption = document.createElement('option');
+        autoOption.value = 'auto';
+        autoOption.text = 'Auto (ABR)';
+        layerSelect.appendChild(autoOption);
+    }
 
     const videos = tracks.filter(t => t.type === 'video');
     // UI显示：码率从高到低
@@ -2530,8 +2606,12 @@ function updateLayerSelectUI(tracks, activeId) {
         if (desired !== undefined && desired !== null &&
             tracks.some(t => String(t.id) === String(desired))) {
             layerSelect.value = desired;
-        } else {
+        } else if (allowAuto) {
             layerSelect.value = 'auto';
+        } else {
+            // P2P has no Auto entry; never leave the select on a value that
+            // has no matching option.
+            layerSelect.value = videos.length ? videos[0].id : '';
         }
     } else {
         layerSelect.value = 'auto';
@@ -3043,14 +3123,27 @@ async function apiPlay(input = {}) {
     }
 }
 
-function resolveQualityValue(target) {
+// Track metadata for quality resolution: the Edge control channel while that
+// leg owns the media, otherwise the layer list the publisher advertised over
+// the P2P signaling channel.
+function qualityTracks() {
+    if (controlClient && Array.isArray(controlClient.tracks) && controlClient.tracks.length) {
+        return controlClient.tracks;
+    }
+    if (activePlaybackPathName === 'p2p' && activePlaybackPath &&
+        Array.isArray(activePlaybackPath.layers)) {
+        return activePlaybackPath.layers.map((layer) => ({ ...layer, type: 'video' }));
+    }
+    return [];
+}
+
+function resolveQualityValue(target, tracks = qualityTracks()) {
     if (target === undefined || target === null) return null;
     const raw = String(target).trim();
     if (!raw) return null;
     const lower = raw.toLowerCase();
     if (lower === 'auto' || lower === 'abr' || lower === '-1') return 'auto';
 
-    const tracks = (controlClient && Array.isArray(controlClient.tracks)) ? controlClient.tracks : [];
     const numeric = Number(raw);
     if (Number.isFinite(numeric) && tracks.some((t) => Number(t.id) === numeric)) {
         return String(numeric);
@@ -3071,12 +3164,21 @@ function resolveQualityValue(target) {
 }
 
 function apiSwitchQuality(target) {
-    if (!controlClient || !Array.isArray(controlClient.tracks) || controlClient.tracks.length === 0) {
+    // P2P playback has no control channel; its layers come from the publisher
+    // over the signaling WebSocket. Resolving against them (instead of bailing
+    // on !controlClient) is what lets the host quality menu work on the P2P leg.
+    const tracks = qualityTracks();
+    if (tracks.length === 0) {
         pendingQualityTarget = target;
         return false;
     }
-    const value = resolveQualityValue(target);
+    const value = resolveQualityValue(target, tracks);
     if (value === null) return false;
+    if (value === 'auto' && activePlaybackPathName === 'p2p') {
+        // P2P has no Auto/ABR - only manual layer selection.
+        console.log('[UI] Auto mode is not available on P2P');
+        return false;
+    }
     if (layerSelect) layerSelect.value = value;
     return applyLayerSelection(value);
 }
@@ -5523,12 +5625,21 @@ class P2PPlaybackPath {
         this.pendingCandidates = [];
         this.stopped = false;
         this.seq = 0;
+        // Quality menu state advertised by the publisher over the same
+        // signaling channel. Each entry is {id, width, height, bitrate,
+        // label}; id is the publisher's layer index (0 = highest).
+        this.layers = [];
+        this.currentLayer = 0;
+        this.onLayers = null;
+        this.onLayerSwitched = null;
     }
 
-    start({ onNegotiated, onFailed, onSignal }) {
+    start({ onNegotiated, onFailed, onSignal, onLayers, onLayerSwitched }) {
         this.onNegotiated = onNegotiated;
         this.onFailed = onFailed;
         this.onSignal = onSignal;
+        this.onLayers = onLayers;
+        this.onLayerSwitched = onLayerSwitched;
         this.onSignal?.({ type: 'ws-connecting', url: this.session.signalUrl });
         this.ws = new this.WebSocketClass(this.session.signalUrl, [
             'ppcdn-p2p-v1', `ppcdn-token.${this.session.token}`,
@@ -5558,6 +5669,13 @@ class P2PPlaybackPath {
         } else if (message.type === 'ice' && message.sessionId === this.session.sessionId) {
             if (this.pc.remoteDescription) await this.pc.addIceCandidate(message.candidate);
             else this.pendingCandidates.push(message.candidate);
+        } else if (message.type === 'layers' && message.sessionId === this.session.sessionId &&
+                   Array.isArray(message.layers)) {
+            this.layers = message.layers;
+            this.onLayers?.(message.layers, this.currentLayer);
+        } else if (message.type === 'layer_switched' && message.sessionId === this.session.sessionId) {
+            this.currentLayer = Number(message.layer) || 0;
+            this.onLayerSwitched?.(this.currentLayer);
         } else if (message.type === 'error') {
             this.#fail(new Error(message.reason || 'P2P signaling rejected'));
         }
@@ -5667,6 +5785,17 @@ class P2PPlaybackPath {
 
     // No-op, mirroring EdgeWHEPPath (see there) - kept for main.js onSelected.
     releaseDecodeSink() {}
+
+    // Asks the publisher to feed a different H264 Simulcast layer. The
+    // publisher answers with layer_switched once it has applied the switch
+    // and reset the keyframe gate; currentLayer updates on that ack.
+    selectLayer(layer, reason = 'manual') {
+        const id = Number(layer);
+        if (!Number.isFinite(id) || id < 0) return false;
+        if (!this.ws || this.ws.readyState !== this.WebSocketClass.OPEN) return false;
+        this.#send({ type: 'select_layer', layer: id, reason });
+        return true;
+    }
 
     stop(reason = 'stopped') {
         if (this.stopped) return;

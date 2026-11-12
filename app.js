@@ -1,4 +1,4 @@
-import PPPlayer from './sdk/pplayer-sdk.js?v=20261111-2';
+import PPPlayer from './sdk/pplayer-sdk.js?v=20261113-1';
 
 const $ = (id) => document.getElementById(id);
 const ui = {
@@ -78,10 +78,17 @@ function updateRecordLabel(recording) {
     ui.record.title = recording ? 'Stop Recording' : 'Record 60s (WebM)';
 }
 
-function fillQuality(tracks, activeId) {
+function fillQuality(tracks, activeId, opts = {}) {
+    const allowAuto = opts.auto !== false;
     const videos = tracks.filter((track) => track.type === 'video').slice()
         .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    ui.quality.innerHTML = '<option value="auto">Auto (ABR)</option>';
+    ui.quality.innerHTML = '';
+    if (allowAuto) {
+        const autoOption = document.createElement('option');
+        autoOption.value = 'auto';
+        autoOption.textContent = 'Auto (ABR)';
+        ui.quality.appendChild(autoOption);
+    }
     for (const track of videos) {
         const option = document.createElement('option');
         option.value = String(track.id);
@@ -89,7 +96,8 @@ function fillQuality(tracks, activeId) {
         ui.quality.appendChild(option);
     }
     ui.quality.disabled = videos.length === 0 || !playing;
-    const desired = activeId !== undefined && activeId !== null ? String(activeId) : 'auto';
+    const desired = activeId !== undefined && activeId !== null ? String(activeId)
+        : (allowAuto ? 'auto' : (videos.length ? String(videos[0].id) : ''));
     if ([...ui.quality.options].some((option) => option.value === desired)) {
         ui.quality.value = desired;
     }
@@ -398,8 +406,8 @@ ui.stream.addEventListener('keydown', (event) => {
 try {
     player = await PPPlayer.create({
         container: '#player',
-        onTracksInfo(tracks, activeId) {
-            fillQuality(tracks, activeId);
+        onTracksInfo(tracks, activeId, meta) {
+            fillQuality(tracks, activeId, meta || {});
             if (tracks.length) setWsStatus(true);
         },
         onFrameTimestamp() {
