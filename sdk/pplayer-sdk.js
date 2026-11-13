@@ -183,12 +183,20 @@ class PPPlayer {
     this.stats = mounted.stats;
 
     window.__PPPLAYER_SDK__ = true;
+    window.pplayer = Object.assign(window.pplayer || {}, {
+      config: {
+        ...(window.pplayer?.config || {}),
+        ...(this.options.natProbe !== undefined ? { natProbe: this.options.natProbe } : {}),
+        ...(this.options.natProbeGraceMs !== undefined ? { natProbeGraceMs: this.options.natProbeGraceMs } : {}),
+        ...(this.options.tokenCache !== undefined ? { tokenCache: this.options.tokenCache } : {}),
+      },
+    });
     __require("/main.js");
     this.api = window.pplayer;
 
     if (typeof this.options.onTracksInfo === 'function') {
-      this.api.onTracksInfo = (tracks, activeId, meta) => {
-        try { this.options.onTracksInfo(tracks, activeId, meta); } catch (error) {
+      this.api.onTracksInfo = (tracks, activeId) => {
+        try { this.options.onTracksInfo(tracks, activeId); } catch (error) {
           console.warn('[pplayer] onTracksInfo callback failed:', error);
         }
       };
@@ -452,10 +460,128 @@ function prefillStreamInput() {
     }
 }
 
+const DEFAULT_NAT_PROBE_GRACE_MS = 800;
+const P2P_UNAVAILABLE_TTL_MS = 30000;
+const TOKEN_CACHE_MARGIN_MS = 30000;
+const viewerTokenCache = new Map();
+const p2pUnavailableUntil = new Map();
+let natProbeGraceMs = DEFAULT_NAT_PROBE_GRACE_MS;
+let startupStartedAt = 0;
+const startupMarks = new Map();
+
+function sdkConfig() {
+    if (typeof window === 'undefined') return {};
+    if (!window.pplayer) window.pplayer = {};
+    if (!window.pplayer.config) window.pplayer.config = {};
+    return window.pplayer.config;
+}
+
+function clampNatProbeGrace(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return DEFAULT_NAT_PROBE_GRACE_MS;
+    return Math.max(0, Math.min(5000, Math.round(n)));
+}
+
+(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const cfg = sdkConfig();
+    if (params.get('natProbe') !== null) {
+        cfg.natProbe = params.get('natProbe') !== '0' && params.get('natProbe') !== 'false';
+    }
+    if (params.get('natProbeGraceMs') !== null) {
+        cfg.natProbeGraceMs = clampNatProbeGrace(params.get('natProbeGraceMs'));
+    }
+    if (params.get('tokenCache') !== null) {
+        cfg.tokenCache = params.get('tokenCache') !== '0' && params.get('tokenCache') !== 'false';
+    }
+})();
+
+function startupBegin() {
+    startupStartedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    startupMarks.clear();
+}
+
+function startupMark(name, extra = '') {
+    if (!startupStartedAt || startupMarks.has(name)) return;
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const elapsed = now - startupStartedAt;
+    startupMarks.set(name, elapsed);
+    console.log(`[Startup] ${name} +${Math.round(elapsed)}ms${extra ? ` ${extra}` : ''}`);
+    if (name === 'first-frame') {
+        const parts = [...startupMarks.entries()].map(([key, value]) => `${key}=${Math.round(value)}ms`);
+        console.log(`[Startup] total ${Math.round(elapsed)}ms (${parts.join(', ')})`);
+    }
+}
+
+function tokenCacheKey(ppcenter, appId, streamName) {
+    return `${ppcenter}|${appId}|${streamName}`;
+}
+
+function clearViewerTokenCache(ppcenter, appId, streamName) {
+    viewerTokenCache.delete(tokenCacheKey(ppcenter, appId, streamName));
+}
+
+function p2pCacheKey(appId, streamName) {
+    return `${appId}/${streamName}`;
+}
+
+function isP2PKnownUnavailable(appId, streamName) {
+    if (!appId || !streamName) return false;
+    const key = p2pCacheKey(appId, streamName);
+    const until = p2pUnavailableUntil.get(key);
+    if (!until) return false;
+    if (Date.now() < until) return true;
+    p2pUnavailableUntil.delete(key);
+    return false;
+}
+
+function clearP2PKnownUnavailable(appId, streamName) {
+    if (!appId || !streamName) return;
+    p2pUnavailableUntil.delete(p2pCacheKey(appId, streamName));
+}
+
+function noteP2PDecision(playConfig, decision) {
+    if (!playConfig?.appId || !playConfig?.streamName || !decision) return;
+    const availability = decision.p2pAvailability;
+    if (decision.mode === 'p2p-connect' && decision.p2p) {
+        clearP2PKnownUnavailable(playConfig.appId, playConfig.streamName);
+        return;
+    }
+    if (availability?.publisherConnected === false ||
+        decision.reason === 'missing_publisher_probe') {
+        p2pUnavailableUntil.set(
+            p2pCacheKey(playConfig.appId, playConfig.streamName),
+            Date.now() + P2P_UNAVAILABLE_TTL_MS);
+    }
+}
+
+function shouldAttemptP2P(appId, streamName, codec) {
+    if (!preferP2P() || codec === 'hevc') return false;
+    if (sdkConfig().natProbe === false) return false;
+    if (isP2PKnownUnavailable(appId, streamName)) return false;
+    return true;
+}
+
 // Mints a short-lived viewer token from appId+streamName via ppcenter's open
 // POST /v1/play/link (no appSecret in the browser), so a bare/`?appId=` page
 // can go through the normal ppcenter -> P2P/edge flow.
 async function mintViewerToken(ppcenter, appId, streamName) {
+    const cacheEnabled = sdkConfig().tokenCache !== false;
+    const key = tokenCacheKey(ppcenter, appId, streamName);
+    if (cacheEnabled) {
+        const cached = viewerTokenCache.get(key);
+        if (cached && cached.expiresAtMs > Date.now() + TOKEN_CACHE_MARGIN_MS) {
+            return {
+                txTime: cached.txTime,
+                txSecret: cached.txSecret,
+                expiresAt: cached.expiresAt,
+                cached: true,
+            };
+        }
+        if (cached) viewerTokenCache.delete(key);
+    }
+
     const resp = await fetch(new URL('/v1/play/link', ppcenter).toString(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -466,7 +592,21 @@ async function mintViewerToken(ppcenter, appId, streamName) {
     if (!resp.ok || !body?.txTime || !body?.txSecret) {
         throw new Error(body?.message || `token request failed (status ${resp.status})`);
     }
-    return { txTime: body.txTime, txSecret: body.txSecret };
+
+    const expiresAt = body.expiresAt || '';
+    if (cacheEnabled) {
+        let expiresAtMs = Date.parse(expiresAt);
+        if (!Number.isFinite(expiresAtMs)) expiresAtMs = Date.now() + 5 * 60 * 1000;
+        if (expiresAtMs > Date.now() + TOKEN_CACHE_MARGIN_MS) {
+            viewerTokenCache.set(key, {
+                txTime: body.txTime,
+                txSecret: body.txSecret,
+                expiresAt,
+                expiresAtMs,
+            });
+        }
+    }
+    return { txTime: body.txTime, txSecret: body.txSecret, expiresAt, cached: false };
 }
 
 function newClientId() {
@@ -708,11 +848,6 @@ let playRequestAbortController = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
 let sdkLastPlayOptions = null;
 let pendingQualityTarget = null;
-
-// P2P playback deliberately has no Auto/ABR: a direct publisher<->viewer
-// connection exposes no usable capacity estimate to the viewer, so the quality
-// menu only offers the publisher's layers and the viewer picks one manually.
-// (Edge ABR still runs server-side from TWCC - see abr_controller.go in ppmmx.)
 
 // Loss has to be read as a RATE, not as a packet count. Audio runs at ~50
 // packets/s and video at several hundred, so the two cumulative counters the
@@ -1014,6 +1149,7 @@ function armFirstVideoFrameCallback(generation) {
         if (generation !== readerGeneration) return;
         if (firstFrameAt === null) {
             firstFrameAt = Date.now();
+            startupMark('first-frame');
             reportPlayOutcome(activePlayConfig, activePlaybackPathName || 'edge');
         }
     });
@@ -1128,13 +1264,8 @@ window.addEventListener('pagehide', () => stopPlaySession('client_stopped', { be
 const abrEngine = new ABREngine();
 
 function switchMediaTrack(trackId, reason) {
-    const p2pPath = (activePlaybackPathName === 'p2p' && activePlaybackPath &&
-        typeof activePlaybackPath.selectLayer === 'function') ? activePlaybackPath : null;
-    if (!controlClient && !p2pPath) return;
+    if (!controlClient) return;
     if (trackId === abrEngine.audioTrackId) {
-        // Audio-only selection is an Edge WHEP media-state feature; P2P
-        // always carries the publisher's Opus track and has no audio entry.
-        if (!controlClient) return;
         if (abrEngine.videoTrackIds.includes(abrEngine.currentTrackId)) lastVideoTrackId = abrEngine.currentTrackId;
         controlClient.setMediaState({ video: 'paused', audio: 'resumed' });
         abrEngine.notifyLayerSwitched(trackId);
@@ -1143,12 +1274,6 @@ function switchMediaTrack(trackId, reason) {
     }
     if (trackId === abrEngine.currentTrackId && !videoPaused) {
         console.log(`[Main] Ignore redundant layer switch: ${trackId} (${reason})`);
-        return;
-    }
-    if (p2pPath) {
-        lastVideoTrackId = trackId;
-        console.log(`[P2P] Requesting layer ${trackId} (${reason})`);
-        p2pPath.selectLayer(trackId, reason);
         return;
     }
     if (videoPaused) {
@@ -1426,11 +1551,6 @@ recordBtn.onclick = () => {
 
 function applyLayerSelection(val) {
     if (val === "auto") {
-        // P2P has no Auto/ABR: only the publisher's layers and a manual pick.
-        if (activePlaybackPathName === 'p2p') {
-            console.log('[UI] Auto mode is not available on P2P');
-            return false;
-        }
         abrEngine.setAutoMode(true);
         // Hand selection back to the server. A plain selectLayer() would
         // pin the layer again (it implies manual mode server-side), so
@@ -1444,7 +1564,7 @@ function applyLayerSelection(val) {
     } else {
         abrEngine.setAutoMode(false);
         const trackId = parseInt(val);
-        if (!isNaN(trackId)) {
+        if (!isNaN(trackId) && controlClient) {
             console.log(`[UI] Manual select track: ${trackId}`);
             // 通知引擎手动切换了，更新其内部状态
             abrEngine.notifyManualSwitch(trackId);
@@ -1639,6 +1759,7 @@ function negotiateAndConnect(generation, url, codecType) {
             applyPlayoutBuffer(reader.pc, bufferMs);
             const sessionId = reader.sessionId;
             console.log(`[Glue] WHEP Connected. SessionID: ${sessionId}`);
+            startupMark('whep-connected');
             if (window.parent) window.parent.postMessage('mmxplayer-connected', '*');
             if (sessionId) {
                 openControlClientWhenConnected(reader, url, sessionId, generation);
@@ -1737,6 +1858,7 @@ function showLinkNotice(message) {
 // ?url= parameters still in the query string. The automatic start on page open
 // passes false so a shared link keeps its precedence.
 async function startStream(forceManual = false) {
+    startupBegin();
     stopStream();
     const generation = ++readerGeneration;
     edgeAuthRefreshed = false;
@@ -1808,9 +1930,11 @@ async function startStream(forceManual = false) {
         // submission does (see submitNatProbe) - so start it before the token
         // round trip and overlap the two instead of paying them back to back.
         const natProbeStartedAt = performance.now();
-        const natGatherPromise = (preferP2P() && manual.codec !== 'hevc') ? gatherNatProbe(ppcenter) : null;
+        const natGatherPromise = shouldAttemptP2P(appId, streamName, manual.codec) ? gatherNatProbe(ppcenter) : null;
         try {
-            const { txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName);
+            const token = await mintViewerToken(ppcenter, appId, streamName);
+            const { txTime, txSecret } = token;
+            startupMark('token', token.cached ? '(cached)' : '(minted)');
             if (generation !== readerGeneration) return;
             startTimeSync(ppcenter);
             await startFromPpcenter({
@@ -1825,6 +1949,7 @@ async function startStream(forceManual = false) {
     }
 
     if (playConfig) {
+        startupMark('token', '(provided)');
         startTimeSync(playConfig.ppcenter);
         await startFromPpcenter(playConfig, generation);
         return;
@@ -1866,7 +1991,9 @@ async function startDirectWhepUrl(rawUrl, generation, ppcenter) {
     const { appId, streamName } = parseWhepStreamInfo(rawUrl);
     if (appId && streamName) {
         try {
-            const { txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName);
+            const token = await mintViewerToken(ppcenter, appId, streamName);
+            const { txTime, txSecret } = token;
+            startupMark('token', token.cached ? '(cached)' : '(minted)');
             if (generation !== readerGeneration) return;
             activePlayConfig = {
                 ppcenter, appId, streamName, txTime, txSecret,
@@ -1943,9 +2070,9 @@ function startTimeSync(ppcenter) {
 // Note the probe is gather (token-free, local) + submit (needs the token): the
 // gather half can therefore be started before the viewer token is even minted,
 // which the bare-page path does to overlap the two - see startStream.
-const NAT_PROBE_GRACE_MS = 800;
-
 async function startFromPpcenter(playConfig, generation, { natGatherPromise = null, natProbeStartedAt = 0 } = {}) {
+    const cfg = sdkConfig();
+    if (cfg.natProbeGraceMs !== undefined) natProbeGraceMs = clampNatProbeGrace(cfg.natProbeGraceMs);
     playOutcomeReported = false; // one connection report per play
     playOutcomeCondition = null;
     // Pull-stream measures: costTime is from here to the first decoded frame.
@@ -1961,8 +2088,15 @@ async function startFromPpcenter(playConfig, generation, { natGatherPromise = nu
     // console preview) must go straight to the edge instead of a doomed P2P
     // attempt - requesting without the p2p capability makes ppcenter answer
     // edge-only.
-    const wantP2P = preferP2P() && manualStream?.codec !== 'hevc';
+    const p2pKnownUnavailable = isP2PKnownUnavailable(playConfig.appId, playConfig.streamName);
+    const wantP2P = shouldAttemptP2P(playConfig.appId, playConfig.streamName, manualStream?.codec);
     let natProbeId = null;
+    if (!wantP2P) {
+        startupMark('nat-probe', p2pKnownUnavailable ? '(skipped: p2p unavailable)' : '(skipped)');
+        if (p2pKnownUnavailable) {
+            console.log('[P2P] known unavailable for this stream; requesting edge-only without NAT probe');
+        }
+    }
     if (wantP2P) {
         // PLY-002: report the NAT observation so ppcenter can judge whether a
         // direct connection is even worth attempting. Non-fatal - a failed or
@@ -2007,10 +2141,11 @@ async function startFromPpcenter(playConfig, generation, { natGatherPromise = nu
                 ? `[P2P] NAT probe resolved in ${elapsedMs}ms: ${id}`
                 : `[P2P] NAT probe found no usable candidate (${elapsedMs}ms)`);
         });
-        const grace = new Promise((resolve) => setTimeout(() => resolve(null), NAT_PROBE_GRACE_MS));
+        const grace = new Promise((resolve) => setTimeout(() => resolve(null), natProbeGraceMs));
         natProbeId = await Promise.race([probePromise, grace]);
+        startupMark('nat-probe', natProbeId ? '(ready)' : '(timeout)');
         if (!natProbeId) {
-            console.log(`[P2P] NAT probe still pending after the ${NAT_PROBE_GRACE_MS}ms grace window; requesting playback without it`);
+            console.log(`[P2P] NAT probe still pending after the ${natProbeGraceMs}ms grace window; requesting playback without it`);
         }
         if (generation !== readerGeneration) return;
     }
@@ -2042,6 +2177,8 @@ async function startFromPpcenter(playConfig, generation, { natGatherPromise = nu
             (decision.reason ? `, reason=${decision.reason}` : '') +
             (decision.publisherNat ? `, publisherNat=${decision.publisherNat}` : '') +
             (decision.playerNat ? `, playerNat=${decision.playerNat}` : ''));
+        startupMark('decision', `(mode=${decision.mode})`);
+        noteP2PDecision(playConfig, decision);
         playOutcomeCondition = {
             reason: decision.reason,
             publisherNat: decision.publisherNat,
@@ -2058,6 +2195,9 @@ async function startFromPpcenter(playConfig, generation, { natGatherPromise = nu
         });
     } catch (error) {
         if (error.name === 'AbortError' || generation !== readerGeneration) return;
+        if (/401|403|invalid_viewer_token|viewer_token_expired/i.test(error.message || '')) {
+            clearViewerTokenCache(playConfig.ppcenter, playConfig.appId, playConfig.streamName);
+        }
         console.error('Play request failed:', error);
         statsContainer.innerHTML = `<div style="color: red; text-align: center;">Error: ${error.message}</div>`;
         reportPlayOutcome(playConfig, 'edge', { isOK: false, reason: error.message });
@@ -2165,24 +2305,16 @@ function startP2PPlayback(decision, generation, playConfig) {
     playbackRace = null;
 
     let settled = false;
-    let failedOver = false;
     let verifyTimer = null;
     let handshakeTimer = null;
 
     const fallbackToEdge = (reason) => {
-        // Not gated on `settled`: once the first frame is in, a mid-playback
-        // P2P failure (ICE drop, a rejected control message) still has to fail
-        // over. The old `settled` guard made those no-ops, leaving the viewer
-        // frozen on a dead P2P leg forever. failedOver keeps it single-shot.
-        if (failedOver || generation !== readerGeneration) return;
-        failedOver = true;
+        if (settled || generation !== readerGeneration) return;
+        settled = true;
         if (verifyTimer) clearTimeout(verifyTimer);
         if (handshakeTimer) clearTimeout(handshakeTimer);
         if (statsInterval) clearInterval(statsInterval);
         console.warn('[P2P] direct P2P did not play, falling back to edge:', reason);
-        p2pSeiWatchdogTrip = null;
-        p2pSeiZeroDecodeStreak = 0;
-        layerSelect.disabled = true;
         try { path.stop('p2p_failed'); } catch { /* best-effort */ }
         activePlaybackPath = null;
         activePlaybackPathName = 'edge';
@@ -2213,46 +2345,6 @@ function startP2PPlayback(decision, generation, playConfig) {
 
     path.start({
         onSignal: (message) => logP2PSignal(message, decision.p2p.sessionId),
-        onLayers: (layers, activeId) => {
-            if (generation !== readerGeneration) return;
-            // P2P does not support Auto/ABR: the menu lists only the
-            // publisher's layers and selection is always manual.
-            if (abrEngine.isAutoMode) abrEngine.setAutoMode(false);
-            const tracks = layers.map((layer) => ({ ...layer, type: 'video' }));
-            abrEngine.setTracks(tracks, activeId, video.videoWidth);
-            layerSelect.disabled = tracks.length === 0;
-            updateLayerSelectUI(tracks, activeId, false);
-            // The host UI (app.js) builds its own quality <select> from
-            // options.onTracksInfo, which the Edge leg feeds through the control
-            // channel. The P2P leg has no control channel, so without this the
-            // host selector never learned the publisher's layers and stayed
-            // disabled. opts.auto=false tells it to omit the "Auto (ABR)" entry.
-            if (typeof window !== 'undefined' && typeof window.pplayer?.onTracksInfo === 'function') {
-                try {
-                    window.pplayer.onTracksInfo(tracks, activeId, { path: 'p2p', auto: false });
-                } catch (e) {
-                    console.warn('[pplayer] onTracksInfo callback failed:', e);
-                }
-            }
-            if (pendingQualityTarget !== null) {
-                const queued = pendingQualityTarget;
-                pendingQualityTarget = null;
-                apiSwitchQuality(queued);
-            }
-        },
-        onLayerSwitched: (layerId) => {
-            if (generation !== readerGeneration) return;
-            const tracks = (path.layers || []).map((layer) => ({ ...layer, type: 'video' }));
-            abrEngine.notifyLayerSwitched(Number(layerId));
-            updateLayerSelectUI(tracks, Number(layerId), false);
-            if (typeof window !== 'undefined' && typeof window.pplayer?.onTracksInfo === 'function') {
-                try {
-                    window.pplayer.onTracksInfo(tracks, Number(layerId), { path: 'p2p', auto: false });
-                } catch (e) {
-                    console.warn('[pplayer] onTracksInfo callback failed:', e);
-                }
-            }
-        },
         onNegotiated: ({ stream }) => {
             if (generation !== readerGeneration) return;
             if (handshakeTimer) {
@@ -2264,6 +2356,7 @@ function startP2PPlayback(decision, generation, playConfig) {
                 if (err && err.name === 'AbortError') return;
                 console.warn('[P2P] play() after srcObject failed:', err);
             });
+            startupMark('p2p-negotiated');
             applyPlayoutBuffer(path.pc, bufferMs);
             statsContainer.innerHTML = '<div style="color: #00bcd4; text-align: center;">Playing via P2P</div>';
             // Report p2p only once a frame is actually presented - a
@@ -2271,16 +2364,17 @@ function startP2PPlayback(decision, generation, playConfig) {
             // penetration metric (same rule as the old race controller).
             if (typeof video.requestVideoFrameCallback === 'function') {
                 video.requestVideoFrameCallback(() => {
-                    if (settled || failedOver || generation !== readerGeneration) return;
+                    if (settled || generation !== readerGeneration) return;
                     settled = true;
                     if (firstFrameAt === null) firstFrameAt = Date.now();
+                    startupMark('first-frame');
                     if (verifyTimer) clearTimeout(verifyTimer);
                     reportPlayOutcome(playConfig, 'p2p');
                 });
             } else {
-                if (failedOver) return;
                 settled = true;
                 if (firstFrameAt === null) firstFrameAt = Date.now();
+                startupMark('first-frame');
                 reportPlayOutcome(playConfig, 'p2p');
             }
             const graceMs = Math.max(4000, Number(decision.p2p?.connectTimeoutMs || 0) + 2000);
@@ -2399,10 +2493,6 @@ function initControlClient(whepUrl, sessionId) {
             layerSelect.disabled = true;
         },
         onTracksInfo: (tracks, activeId) => {
-            // While the P2P leg owns the media, the Edge control channel may
-            // still be alive from the race/setup phase; its track list must
-            // not overwrite the publisher's P2P layer menu.
-            if (activePlaybackPathName === 'p2p' && activePlaybackPath?.layers?.length) return;
             console.log("[UI] Received Tracks Info:", tracks);
             
             // [关键修复] 获取当前视频实际宽度，传给 ABR 引擎用于探测真实初始状态
@@ -2549,15 +2639,13 @@ function resumeVideoFromAudioOnly() {
     }
 }
 
-function updateLayerSelectUI(tracks, activeId, allowAuto = true) {
+function updateLayerSelectUI(tracks, activeId) {
     layerSelect.innerHTML = '';
-
-    if (allowAuto) {
-        const autoOption = document.createElement('option');
-        autoOption.value = 'auto';
-        autoOption.text = 'Auto (ABR)';
-        layerSelect.appendChild(autoOption);
-    }
+    
+    const autoOption = document.createElement('option');
+    autoOption.value = 'auto';
+    autoOption.text = 'Auto (ABR)';
+    layerSelect.appendChild(autoOption);
 
     const videos = tracks.filter(t => t.type === 'video');
     // UI显示：码率从高到低
@@ -2606,12 +2694,8 @@ function updateLayerSelectUI(tracks, activeId, allowAuto = true) {
         if (desired !== undefined && desired !== null &&
             tracks.some(t => String(t.id) === String(desired))) {
             layerSelect.value = desired;
-        } else if (allowAuto) {
-            layerSelect.value = 'auto';
         } else {
-            // P2P has no Auto entry; never leave the select on a value that
-            // has no matching option.
-            layerSelect.value = videos.length ? videos[0].id : '';
+            layerSelect.value = 'auto';
         }
     } else {
         layerSelect.value = 'auto';
@@ -2817,6 +2901,7 @@ async function updateStats() {
             // own requestVideoFrameCallback (the report is once-guarded).
             if (firstFrameAt === null) {
                 firstFrameAt = Date.now();
+                startupMark('first-frame');
                 reportPlayOutcome(activePlayConfig, activePlaybackPathName || 'edge');
             }
         }
@@ -3045,6 +3130,12 @@ function normalizeCodecName(value) {
 
 async function apiPlay(input = {}) {
     const opts = normalizeSdkPlayOptions(input);
+    startupBegin();
+    const cfg = sdkConfig();
+    if (opts.natProbe !== undefined) cfg.natProbe = opts.natProbe !== false;
+    if (opts.natProbeGraceMs !== undefined) cfg.natProbeGraceMs = clampNatProbeGrace(opts.natProbeGraceMs);
+    if (opts.tokenCache !== undefined) cfg.tokenCache = opts.tokenCache !== false;
+    if (cfg.natProbeGraceMs !== undefined) natProbeGraceMs = clampNatProbeGrace(cfg.natProbeGraceMs);
     const ppcenter = String(opts.ppcenter || DEFAULT_PPCENTER).trim() || DEFAULT_PPCENTER;
     let codec = normalizeCodecName(opts.codec);
 
@@ -3096,13 +3187,18 @@ async function apiPlay(input = {}) {
     ensurePlaybackCodec();
 
     const natProbeStartedAt = performance.now();
-    const natGatherPromise = (preferP2P() && codec !== 'hevc') ? gatherNatProbe(ppcenter) : null;
+    const natGatherPromise = shouldAttemptP2P(appId, streamName, codec) ? gatherNatProbe(ppcenter) : null;
 
     try {
         let { txTime, txSecret } = opts;
-        if (!(txTime && txSecret)) {
-            ({ txTime, txSecret } = await mintViewerToken(ppcenter, appId, streamName));
+        let tokenCached = false;
+        const tokenProvided = !!(txTime && txSecret);
+        if (!tokenProvided) {
+            const token = await mintViewerToken(ppcenter, appId, streamName);
+            ({ txTime, txSecret } = token);
+            tokenCached = !!token.cached;
         }
+        startupMark('token', tokenProvided ? '(provided)' : (tokenCached ? '(cached)' : '(minted)'));
         if (generation !== readerGeneration) return false;
         startTimeSync(ppcenter);
         await startFromPpcenter({
@@ -3123,27 +3219,14 @@ async function apiPlay(input = {}) {
     }
 }
 
-// Track metadata for quality resolution: the Edge control channel while that
-// leg owns the media, otherwise the layer list the publisher advertised over
-// the P2P signaling channel.
-function qualityTracks() {
-    if (controlClient && Array.isArray(controlClient.tracks) && controlClient.tracks.length) {
-        return controlClient.tracks;
-    }
-    if (activePlaybackPathName === 'p2p' && activePlaybackPath &&
-        Array.isArray(activePlaybackPath.layers)) {
-        return activePlaybackPath.layers.map((layer) => ({ ...layer, type: 'video' }));
-    }
-    return [];
-}
-
-function resolveQualityValue(target, tracks = qualityTracks()) {
+function resolveQualityValue(target) {
     if (target === undefined || target === null) return null;
     const raw = String(target).trim();
     if (!raw) return null;
     const lower = raw.toLowerCase();
     if (lower === 'auto' || lower === 'abr' || lower === '-1') return 'auto';
 
+    const tracks = (controlClient && Array.isArray(controlClient.tracks)) ? controlClient.tracks : [];
     const numeric = Number(raw);
     if (Number.isFinite(numeric) && tracks.some((t) => Number(t.id) === numeric)) {
         return String(numeric);
@@ -3164,21 +3247,12 @@ function resolveQualityValue(target, tracks = qualityTracks()) {
 }
 
 function apiSwitchQuality(target) {
-    // P2P playback has no control channel; its layers come from the publisher
-    // over the signaling WebSocket. Resolving against them (instead of bailing
-    // on !controlClient) is what lets the host quality menu work on the P2P leg.
-    const tracks = qualityTracks();
-    if (tracks.length === 0) {
+    if (!controlClient || !Array.isArray(controlClient.tracks) || controlClient.tracks.length === 0) {
         pendingQualityTarget = target;
         return false;
     }
-    const value = resolveQualityValue(target, tracks);
+    const value = resolveQualityValue(target);
     if (value === null) return false;
-    if (value === 'auto' && activePlaybackPathName === 'p2p') {
-        // P2P has no Auto/ABR - only manual layer selection.
-        console.log('[UI] Auto mode is not available on P2P');
-        return false;
-    }
     if (layerSelect) layerSelect.value = value;
     return applyLayerSelection(value);
 }
@@ -3186,6 +3260,9 @@ function apiSwitchQuality(target) {
 function apiConnectP2P(enabled = true) {
     const on = enabled !== false;
     if (p2pCheckbox) p2pCheckbox.checked = on;
+    if (on && sdkLastPlayOptions?.appId && sdkLastPlayOptions?.streamName) {
+        clearP2PKnownUnavailable(sdkLastPlayOptions.appId, sdkLastPlayOptions.streamName);
+    }
     if (sdkLastPlayOptions) {
         sdkLastPlayOptions = { ...sdkLastPlayOptions, p2p: on };
         if (reader || playbackRace || activePlaybackPath) {
@@ -5625,21 +5702,12 @@ class P2PPlaybackPath {
         this.pendingCandidates = [];
         this.stopped = false;
         this.seq = 0;
-        // Quality menu state advertised by the publisher over the same
-        // signaling channel. Each entry is {id, width, height, bitrate,
-        // label}; id is the publisher's layer index (0 = highest).
-        this.layers = [];
-        this.currentLayer = 0;
-        this.onLayers = null;
-        this.onLayerSwitched = null;
     }
 
-    start({ onNegotiated, onFailed, onSignal, onLayers, onLayerSwitched }) {
+    start({ onNegotiated, onFailed, onSignal }) {
         this.onNegotiated = onNegotiated;
         this.onFailed = onFailed;
         this.onSignal = onSignal;
-        this.onLayers = onLayers;
-        this.onLayerSwitched = onLayerSwitched;
         this.onSignal?.({ type: 'ws-connecting', url: this.session.signalUrl });
         this.ws = new this.WebSocketClass(this.session.signalUrl, [
             'ppcdn-p2p-v1', `ppcdn-token.${this.session.token}`,
@@ -5669,13 +5737,6 @@ class P2PPlaybackPath {
         } else if (message.type === 'ice' && message.sessionId === this.session.sessionId) {
             if (this.pc.remoteDescription) await this.pc.addIceCandidate(message.candidate);
             else this.pendingCandidates.push(message.candidate);
-        } else if (message.type === 'layers' && message.sessionId === this.session.sessionId &&
-                   Array.isArray(message.layers)) {
-            this.layers = message.layers;
-            this.onLayers?.(message.layers, this.currentLayer);
-        } else if (message.type === 'layer_switched' && message.sessionId === this.session.sessionId) {
-            this.currentLayer = Number(message.layer) || 0;
-            this.onLayerSwitched?.(this.currentLayer);
         } else if (message.type === 'error') {
             this.#fail(new Error(message.reason || 'P2P signaling rejected'));
         }
@@ -5785,17 +5846,6 @@ class P2PPlaybackPath {
 
     // No-op, mirroring EdgeWHEPPath (see there) - kept for main.js onSelected.
     releaseDecodeSink() {}
-
-    // Asks the publisher to feed a different H264 Simulcast layer. The
-    // publisher answers with layer_switched once it has applied the switch
-    // and reset the keyframe gate; currentLayer updates on that ack.
-    selectLayer(layer, reason = 'manual') {
-        const id = Number(layer);
-        if (!Number.isFinite(id) || id < 0) return false;
-        if (!this.ws || this.ws.readyState !== this.WebSocketClass.OPEN) return false;
-        this.#send({ type: 'select_layer', layer: id, reason });
-        return true;
-    }
 
     stop(reason = 'stopped') {
         if (this.stopped) return;

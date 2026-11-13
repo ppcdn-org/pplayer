@@ -1,7 +1,7 @@
 // Minimal browser publishing page. Wires the form to BrowserPublisher; all
 // media/session logic lives in ppwebpublish.mjs (and p2p-answerer.mjs), so
 // this file only owns the DOM.
-import { BrowserPublisher } from './sdk/pplayer-sdk.js?v=20261113-1';
+import { BrowserPublisher } from './sdk/pplayer-sdk.js?v=20261113-11';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
