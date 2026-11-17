@@ -1,4 +1,4 @@
-import PPPlayer from './sdk/pplayer-sdk.js?v=20261114-1';
+import PPPlayer from './sdk/pplayer-sdk.js?v=20261117-1';
 
 const $ = (id) => document.getElementById(id);
 const ui = {
@@ -265,8 +265,13 @@ function prefillStreamInput(appId, streamName, codec) {
 async function autoStart() {
     const directUrl = (params.get('url') || '').trim();
     if (directUrl) {
+        const options = { url: directUrl, p2p: ui.p2p.checked, ppcenter: queryPpcenter };
         try {
-            await play({ url: directUrl, p2p: ui.p2p.checked, ppcenter: queryPpcenter });
+            // Warm the WHEP ICE before the visible play, then reuse the same
+            // session. The cold handshake still costs its network latency, but
+            // it no longer lands inside the play's measured first-frame path.
+            await player.preconnect(options);
+            await play(options);
         } catch {
             // play() already surfaced the error.
         }
@@ -283,6 +288,10 @@ async function autoStart() {
     if (options) {
         prefillStreamInput(options.appId, options.streamName, options.codec);
         try {
+            // Warm the WHEP ICE before the visible play, then reuse the same
+            // session. The cold handshake still costs its network latency, but
+            // it no longer lands inside the play's measured first-frame path.
+            await player.preconnect(options);
             await play(options);
         } catch {
             // play() already surfaced the error.

@@ -224,6 +224,10 @@ class PPPlayer {
     return this._call('play', options);
   }
 
+  preconnect(options) {
+    return this._call('preconnect', options);
+  }
+
   switch_quality(target) {
     return this._call('switch_quality', target);
   }
@@ -232,8 +236,8 @@ class PPPlayer {
     return this._call('connect_p2p', enabled);
   }
 
-  exit() {
-    return this._call('exit');
+  exit(options = {}) {
+    return this._call('exit', options);
   }
 
   pause_video(paused = true) {
@@ -351,7 +355,7 @@ class PPPlayer {
   destroy() {
     if (this.destroyed) return Promise.resolve();
     this.destroyed = true;
-    return this._call('exit').catch(() => {}).then(() => {
+    return this._call('exit', { force: true }).catch(() => {}).then(() => {
       if (this.root && this.root.parentNode) this.root.parentNode.removeChild(this.root);
       if (singleton === this) singleton = null;
     });
@@ -855,6 +859,18 @@ let playRequestAbortController = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
 let sdkLastPlayOptions = null;
 let pendingQualityTarget = null;
+// Last decoded MediaStream of the active path. Kept separately from
+// video.srcObject because a parked session pauses the element but must keep
+// the receiver/decoder warm for the next play.
+let currentMediaStream = null;
+// A parked playback session: the WHEP peer connection, control WebSocket and
+// the browser's receiver stay alive after exit, so the next play() with the
+// same stream/p2p/codec can reattach without paying ICE/DTLS again. This is
+// what makes repeated start/stop on an IPv4-only client fast - a fresh WHEP
+// session's ICE is still the cold-start floor.
+let warmSession = null;
+let streamParked = false;
+const WARM_SESSION_TTL_MS = 30000;
 
 // Loss has to be read as a RATE, not as a packet count. Audio runs at ~50
 // packets/s and video at several hundred, so the two cumulative counters the
@@ -1271,13 +1287,8 @@ window.addEventListener('pagehide', () => stopPlaySession('client_stopped', { be
 const abrEngine = new ABREngine();
 
 function switchMediaTrack(trackId, reason) {
-    const p2pPath = (activePlaybackPathName === 'p2p' && activePlaybackPath &&
-        typeof activePlaybackPath.selectLayer === 'function') ? activePlaybackPath : null;
-    if (!controlClient && !p2pPath) return;
+    if (!controlClient) return;
     if (trackId === abrEngine.audioTrackId) {
-        // Audio-only selection is an Edge WHEP media-state feature; P2P
-        // always carries the publisher's Opus track and has no audio entry.
-        if (!controlClient) return;
         if (abrEngine.videoTrackIds.includes(abrEngine.currentTrackId)) lastVideoTrackId = abrEngine.currentTrackId;
         controlClient.setMediaState({ video: 'paused', audio: 'resumed' });
         abrEngine.notifyLayerSwitched(trackId);
@@ -1286,12 +1297,6 @@ function switchMediaTrack(trackId, reason) {
     }
     if (trackId === abrEngine.currentTrackId && !videoPaused) {
         console.log(`[Main] Ignore redundant layer switch: ${trackId} (${reason})`);
-        return;
-    }
-    if (p2pPath) {
-        lastVideoTrackId = trackId;
-        console.log(`[P2P] Requesting layer ${trackId} (${reason})`);
-        p2pPath.selectLayer(trackId, reason);
         return;
     }
     if (videoPaused) {
@@ -1569,11 +1574,6 @@ recordBtn.onclick = () => {
 
 function applyLayerSelection(val) {
     if (val === "auto") {
-        // P2P has no Auto/ABR: only the publisher's layers and a manual pick.
-        if (activePlaybackPathName === 'p2p') {
-            console.log('[UI] Auto mode is not available on P2P');
-            return false;
-        }
         abrEngine.setAutoMode(true);
         // Hand selection back to the server. A plain selectLayer() would
         // pin the layer again (it implies manual mode server-side), so
@@ -1587,7 +1587,7 @@ function applyLayerSelection(val) {
     } else {
         abrEngine.setAutoMode(false);
         const trackId = parseInt(val);
-        if (!isNaN(trackId)) {
+        if (!isNaN(trackId) && controlClient) {
             console.log(`[UI] Manual select track: ${trackId}`);
             // 通知引擎手动切换了，更新其内部状态
             abrEngine.notifyManualSwitch(trackId);
@@ -1701,6 +1701,7 @@ function negotiateAndConnect(generation, url, codecType) {
         onTrack: (evt) => {
             if (generation !== readerGeneration) return;
             if (evt.track.kind === 'video' || evt.track.kind === 'audio') {
+                if (evt.streams[0]) currentMediaStream = evt.streams[0];
                 if (video.srcObject !== evt.streams[0]) {
                     video.srcObject = evt.streams[0];
                 }
@@ -1819,6 +1820,7 @@ function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) 
 
 function resetSessionState() {
     previousTrackType = null;
+    currentMediaStream = null;
     firstFrameDecoded = false;
     firstFrameCallbackArmed = false;
     lastP2PDelayMs = null;
@@ -2339,7 +2341,6 @@ function startP2PPlayback(decision, generation, playConfig) {
         if (handshakeTimer) clearTimeout(handshakeTimer);
         if (statsInterval) clearInterval(statsInterval);
         console.warn('[P2P] direct P2P did not play, falling back to edge:', reason);
-        layerSelect.disabled = true;
         try { path.stop('p2p_failed'); } catch { /* best-effort */ }
         activePlaybackPath = null;
         activePlaybackPathName = 'edge';
@@ -2370,44 +2371,13 @@ function startP2PPlayback(decision, generation, playConfig) {
 
     path.start({
         onSignal: (message) => logP2PSignal(message, decision.p2p.sessionId),
-        onLayers: (layers, activeId) => {
-            if (generation !== readerGeneration) return;
-            // P2P does not support Auto/ABR: the menu lists only the
-            // publisher's layers and selection is always manual.
-            if (abrEngine.isAutoMode) abrEngine.setAutoMode(false);
-            const tracks = layers.map((layer) => ({ ...layer, type: 'video' }));
-            abrEngine.setTracks(tracks, activeId, video.videoWidth);
-            layerSelect.disabled = tracks.length === 0;
-            updateLayerSelectUI(tracks, activeId, false);
-            // The host UI (app.js) builds its own quality <select> from
-            // options.onTracksInfo, which the Edge leg feeds through the control
-            // channel. The P2P leg has no control channel, so without this the
-            // host selector never learned the publisher's layers and stayed
-            // disabled. opts.auto=false tells it to omit the "Auto (ABR)" entry.
-            if (typeof window !== 'undefined' && typeof window.pplayer?.onTracksInfo === 'function') {
-                try {
-                    window.pplayer.onTracksInfo(tracks, activeId, { path: 'p2p', auto: false });
-                } catch (e) {
-                    console.warn('[pplayer] onTracksInfo callback failed:', e);
-                }
-            }
-            if (pendingQualityTarget !== null) {
-                const queued = pendingQualityTarget;
-                pendingQualityTarget = null;
-                apiSwitchQuality(queued);
-            }
-        },
-        onLayerSwitched: (id) => {
-            if (generation !== readerGeneration) return;
-            abrEngine.notifyLayerSwitched(id);
-            if (!layerSelect.disabled) layerSelect.value = id;
-        },
         onNegotiated: ({ stream }) => {
             if (generation !== readerGeneration) return;
             if (handshakeTimer) {
                 clearTimeout(handshakeTimer);
                 handshakeTimer = null;
             }
+            currentMediaStream = stream;
             video.srcObject = stream;
             video.play().catch((err) => {
                 if (err && err.name === 'AbortError') return;
@@ -2697,15 +2667,13 @@ function resumeVideoFromAudioOnly() {
     }
 }
 
-function updateLayerSelectUI(tracks, activeId, allowAuto = true) {
+function updateLayerSelectUI(tracks, activeId) {
     layerSelect.innerHTML = '';
-
-    if (allowAuto) {
-        const autoOption = document.createElement('option');
-        autoOption.value = 'auto';
-        autoOption.text = 'Auto (ABR)';
-        layerSelect.appendChild(autoOption);
-    }
+    
+    const autoOption = document.createElement('option');
+    autoOption.value = 'auto';
+    autoOption.text = 'Auto (ABR)';
+    layerSelect.appendChild(autoOption);
 
     const videos = tracks.filter(t => t.type === 'video');
     // UI显示：码率从高到低
@@ -2754,19 +2722,16 @@ function updateLayerSelectUI(tracks, activeId, allowAuto = true) {
         if (desired !== undefined && desired !== null &&
             tracks.some(t => String(t.id) === String(desired))) {
             layerSelect.value = desired;
-        } else if (allowAuto) {
-            layerSelect.value = 'auto';
         } else {
-            // P2P has no Auto entry; never leave the select on a value that
-            // has no matching option.
-            layerSelect.value = videos.length ? videos[0].id : '';
+            layerSelect.value = 'auto';
         }
     } else {
-        layerSelect.value = allowAuto ? 'auto' : (videos.length ? videos[0].id : '');
+        layerSelect.value = 'auto';
     }
 }
 
 function stopStream() {
+    closeWarmSession();
     // Close the online viewer session before tearing down the connection, so
     // the console list updates immediately instead of after the heartbeat
     // window. Uses the config captured when the session opened.
@@ -3192,6 +3157,178 @@ function normalizeCodecName(value) {
     return (codec === 'h264' || codec === 'hevc') ? codec : '';
 }
 
+function warmPlayKey(opts) {
+    return JSON.stringify({
+        url: opts.url ? String(opts.url) : '',
+        ppcenter: String(opts.ppcenter || DEFAULT_PPCENTER).trim(),
+        appId: String(opts.appId || '').trim(),
+        streamName: String(opts.streamName || '').trim(),
+        codec: normalizeCodecName(opts.codec),
+        p2p: opts.p2p !== undefined ? opts.p2p !== false : preferP2P(),
+    });
+}
+
+function closeWarmSession() {
+    if (!warmSession) return false;
+
+    const w = warmSession;
+    warmSession = null;
+    streamParked = false;
+    if (w.timer) clearTimeout(w.timer);
+    if (w.controlClient) {
+        try { w.controlClient.close(); } catch { /* best-effort */ }
+    }
+    if (w.playbackRace) {
+        try { w.playbackRace.stop(); } catch { /* best-effort */ }
+    } else if (w.reader) {
+        try { w.reader.close(); } catch { /* best-effort */ }
+    } else if (w.activePlaybackPath && typeof w.activePlaybackPath.stop === 'function') {
+        try { w.activePlaybackPath.stop('warm_expired'); } catch { /* best-effort */ }
+    }
+    if (video.srcObject === w.stream) video.srcObject = null;
+    return true;
+}
+
+// Park the active session instead of tearing it down. Keeping the WHEP peer
+// connection, control WebSocket and the video element's srcObject alive lets
+// the next play() with the same stream reuse the already-negotiated ICE/DTLS;
+// only the cold start of a fresh WebRTC session pays the network's handshake
+// latency (roughly one second on IPv4 compared with sub-500ms on IPv6).
+function parkWarmSession() {
+    if (streamParked) return true;
+    if (!reader && !playbackRace && !activePlaybackPath) return false;
+    if (!currentMediaStream || !sdkLastPlayOptions) return false;
+
+    closeWarmSession();
+    stopPlaySession('client_stopped');
+    if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+    if (playRequestAbortController) {
+        playRequestAbortController.abort();
+        playRequestAbortController = null;
+    }
+    if (timeSync) {
+        timeSync.stop();
+        timeSync = null;
+    }
+    if (statsInterval) {
+        clearInterval(statsInterval);
+        statsInterval = null;
+    }
+    video.pause();
+    catchUpController.reset();
+    stallWatchdog.reset();
+    lagTracker.reset();
+    statsContainer.innerHTML = '<div style="color: #888; text-align: center;">Stopped</div>';
+    wsStatusDot.classList.remove('ws-connected');
+    wsStatusDot.classList.remove('ws-disconnected');
+    layerSelect.disabled = true;
+    layerSelect.innerHTML = '<option value="-1">Auto</option>';
+    abrEngine.setAutoMode(true);
+    previousTrackType = null;
+    updateActionButtonsState();
+
+    const warm = {
+        key: warmPlayKey(sdkLastPlayOptions),
+        opts: { ...sdkLastPlayOptions },
+        reader,
+        playbackRace,
+        controlClient,
+        activePlaybackPath,
+        activePlaybackPathName,
+        activeEdgeNodeName,
+        activePlayConfig,
+        manualStream,
+        stream: currentMediaStream,
+        codec: activePlaybackCodec,
+        expiresAt: Date.now() + WARM_SESSION_TTL_MS,
+        timer: null,
+    };
+    warm.timer = setTimeout(() => closeWarmSession(), WARM_SESSION_TTL_MS);
+    warmSession = warm;
+    streamParked = true;
+
+    // The video element keeps srcObject (paused) on purpose: the browser's
+    // receiver/decoder stay warm, so reattaching is immediate. Only the module
+    // globals are cleared; the warmSession above owns the objects.
+    reader = null;
+    playbackRace = null;
+    controlClient = null;
+    activePlaybackPath = null;
+    activePlaybackPathName = 'edge';
+    activeEdgeNodeName = '';
+    activePlayConfig = null;
+    manualStream = null;
+    sdkLastPlayOptions = null;
+    currentMediaStream = null;
+    return true;
+}
+
+async function waitForFirstFrame(timeoutMs = 8000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        if (firstFrameDecoded || firstFrameAt !== null) return true;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+}
+
+function tryReuseWarmSession(opts) {
+    if (!warmSession) return false;
+    if (warmSession.key !== warmPlayKey(opts)) return false;
+    if (Date.now() >= warmSession.expiresAt) {
+        closeWarmSession();
+        return false;
+    }
+    const pc = (warmSession.reader && warmSession.reader.pc) ||
+        (warmSession.activePlaybackPath && warmSession.activePlaybackPath.pc);
+    if (!pc || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        closeWarmSession();
+        return false;
+    }
+
+    const w = warmSession;
+    warmSession = null;
+    streamParked = false;
+    if (w.timer) clearTimeout(w.timer);
+
+    reader = w.reader;
+    playbackRace = w.playbackRace;
+    controlClient = w.controlClient;
+    activePlaybackPath = w.activePlaybackPath;
+    activePlaybackPathName = w.activePlaybackPathName || 'edge';
+    activeEdgeNodeName = w.activeEdgeNodeName || '';
+    activePlayConfig = w.activePlayConfig;
+    manualStream = w.manualStream;
+    sdkLastPlayOptions = { ...w.opts };
+
+    const generation = ++readerGeneration;
+    resetSessionState();
+    currentMediaStream = w.stream;
+    activePlaybackCodec = w.codec;
+    updatePlaybackCodecStatus(w.codec);
+    pendingQualityTarget = opts.quality !== undefined ? opts.quality : null;
+    playStartedAt = Date.now();
+    firstFrameAt = null;
+    playOutcomeReported = false;
+    playOutcomeCondition = null;
+    playReportIpv4 = '';
+
+    startupMark('token', '(reused)');
+    startupMark('decision', '(reused)');
+    startupMark('whep-connected', '(reused)');
+
+    if (activePlayConfig && activePlayConfig.ppcenter) startTimeSync(activePlayConfig.ppcenter);
+    video.srcObject = currentMediaStream;
+    video.play().catch((err) => {
+        if (err && err.name === 'AbortError') return;
+        console.warn('[Warm] play() after reattach failed:', err);
+    });
+    lastStats.timestamp = Date.now();
+    statsInterval = setInterval(updateStats, 1000);
+    armFirstVideoFrameCallback(generation);
+    return true;
+}
+
 async function apiPlay(input = {}) {
     const opts = normalizeSdkPlayOptions(input);
     startupBegin();
@@ -3210,6 +3347,7 @@ async function apiPlay(input = {}) {
     if (opts.url) {
         const url = String(opts.url).trim();
         if (!isWhepUrl(url)) throw new Error(WHEP_ONLY_MESSAGE);
+        if (tryReuseWarmSession({ ...opts, url, ppcenter })) return true;
         stopStream();
         const generation = ++readerGeneration;
         edgeAuthRefreshed = false;
@@ -3235,6 +3373,8 @@ async function apiPlay(input = {}) {
     if (!appId || !streamName) {
         throw new Error('play requires appId + streamName, or a WHEP url');
     }
+
+    if (tryReuseWarmSession({ ...opts, appId, streamName, codec, ppcenter })) return true;
 
     stopStream();
     const generation = ++readerGeneration;
@@ -3283,27 +3423,31 @@ async function apiPlay(input = {}) {
     }
 }
 
-// Track metadata for quality resolution: the Edge control channel while that
-// leg owns the media, otherwise the layer list the publisher advertised over
-// the P2P signaling channel.
-function qualityTracks() {
-    if (controlClient && Array.isArray(controlClient.tracks) && controlClient.tracks.length) {
-        return controlClient.tracks;
-    }
-    if (activePlaybackPathName === 'p2p' && activePlaybackPath &&
-        Array.isArray(activePlaybackPath.layers)) {
-        return activePlaybackPath.layers.map((layer) => ({ ...layer, type: 'video' }));
-    }
-    return [];
+let preconnectPromise = null;
+async function apiPreconnect(input = {}) {
+    if (warmSession || streamParked) return true;
+    if (preconnectPromise) return preconnectPromise;
+
+    const opts = normalizeSdkPlayOptions(input);
+    preconnectPromise = (async () => {
+        const ok = await apiPlay(opts);
+        if (!ok) return false;
+        await waitForFirstFrame();
+        return parkWarmSession();
+    })().finally(() => {
+        preconnectPromise = null;
+    });
+    return preconnectPromise;
 }
 
-function resolveQualityValue(target, tracks = qualityTracks()) {
+function resolveQualityValue(target) {
     if (target === undefined || target === null) return null;
     const raw = String(target).trim();
     if (!raw) return null;
     const lower = raw.toLowerCase();
     if (lower === 'auto' || lower === 'abr' || lower === '-1') return 'auto';
 
+    const tracks = (controlClient && Array.isArray(controlClient.tracks)) ? controlClient.tracks : [];
     const numeric = Number(raw);
     if (Number.isFinite(numeric) && tracks.some((t) => Number(t.id) === numeric)) {
         return String(numeric);
@@ -3324,21 +3468,12 @@ function resolveQualityValue(target, tracks = qualityTracks()) {
 }
 
 function apiSwitchQuality(target) {
-    // P2P playback has no control channel; its layers come from the publisher
-    // over the signaling WebSocket. Resolving against them (instead of bailing
-    // on !controlClient) is what lets the host quality menu work on the P2P leg.
-    const tracks = qualityTracks();
-    if (tracks.length === 0) {
+    if (!controlClient || !Array.isArray(controlClient.tracks) || controlClient.tracks.length === 0) {
         pendingQualityTarget = target;
         return false;
     }
-    const value = resolveQualityValue(target, tracks);
+    const value = resolveQualityValue(target);
     if (value === null) return false;
-    if (value === 'auto' && activePlaybackPathName === 'p2p') {
-        // P2P has no Auto/ABR - only manual layer selection.
-        console.log('[UI] Auto mode is not available on P2P');
-        return false;
-    }
     if (layerSelect) layerSelect.value = value;
     return applyLayerSelection(value);
 }
@@ -3401,7 +3536,7 @@ function apiGetTracks() {
 
 function apiGetState() {
     return {
-        playing: !!(reader || playbackRace || activePlaybackPath),
+        playing: !streamParked && !!(reader || playbackRace || activePlaybackPath),
         path: activePlaybackPathName || 'edge',
         videoPaused,
         audioPaused,
@@ -3417,10 +3552,16 @@ function apiGetState() {
 if (typeof window !== 'undefined') {
     window.pplayer = Object.assign(window.pplayer || {}, {
         play: apiPlay,
-        exit: () => {
-            sdkLastPlayOptions = null;
+        preconnect: apiPreconnect,
+        exit: (options = {}) => {
+            const force = !!(options && options.force);
             pendingQualityTarget = null;
-            stopStream();
+            const parked = !force && parkWarmSession();
+            if (!parked) {
+                closeWarmSession();
+                stopStream();
+            }
+            sdkLastPlayOptions = null;
             return true;
         },
         switch_quality: apiSwitchQuality,
@@ -5804,21 +5945,12 @@ class P2PPlaybackPath {
         this.pendingCandidates = [];
         this.stopped = false;
         this.seq = 0;
-        // Quality menu state advertised by the publisher over the same
-        // signaling channel. Each entry is {id, width, height, bitrate,
-        // label}; id is the publisher's layer index (0 = highest).
-        this.layers = [];
-        this.currentLayer = 0;
-        this.onLayers = null;
-        this.onLayerSwitched = null;
     }
 
-    start({ onNegotiated, onFailed, onSignal, onLayers, onLayerSwitched }) {
+    start({ onNegotiated, onFailed, onSignal }) {
         this.onNegotiated = onNegotiated;
         this.onFailed = onFailed;
         this.onSignal = onSignal;
-        this.onLayers = onLayers;
-        this.onLayerSwitched = onLayerSwitched;
         this.onSignal?.({ type: 'ws-connecting', url: this.session.signalUrl });
         this.ws = new this.WebSocketClass(this.session.signalUrl, [
             'ppcdn-p2p-v1', `ppcdn-token.${this.session.token}`,
@@ -5848,17 +5980,8 @@ class P2PPlaybackPath {
         } else if (message.type === 'ice' && message.sessionId === this.session.sessionId) {
             if (this.pc.remoteDescription) await this.pc.addIceCandidate(message.candidate);
             else this.pendingCandidates.push(message.candidate);
-        } else if (message.type === 'layers' && message.sessionId === this.session.sessionId &&
-                   Array.isArray(message.layers)) {
-            this.layers = message.layers;
-            this.onLayers?.(message.layers, this.currentLayer);
-            // Keep the fixed-budget auto pick (there is no server-side ABR on
-            // the direct leg) while still exposing the ladder to the quality
-            // menu above.
+        } else if (message.type === 'layers' && message.sessionId === this.session.sessionId) {
             this.#selectLayerForBudget(message.layers);
-        } else if (message.type === 'layer_switched' && message.sessionId === this.session.sessionId) {
-            this.currentLayer = Number(message.layer) || 0;
-            this.onLayerSwitched?.(this.currentLayer);
         } else if (message.type === 'error') {
             this.#fail(new Error(message.reason || 'P2P signaling rejected'));
         }
@@ -5987,17 +6110,6 @@ class P2PPlaybackPath {
 
     #fail(error) {
         if (!this.stopped) this.onFailed?.(error);
-    }
-
-    // Asks the publisher to feed a different H264 Simulcast layer. The
-    // publisher answers with layer_switched once it has applied the switch
-    // and reset the keyframe gate; currentLayer updates on that ack.
-    selectLayer(layer, reason = 'manual') {
-        const id = Number(layer);
-        if (!Number.isFinite(id) || id < 0) return false;
-        if (!this.ws || this.ws.readyState !== this.WebSocketClass.OPEN) return false;
-        this.#send({ type: 'select_layer', layer: id, reason });
-        return true;
     }
 
     // No-op, mirroring EdgeWHEPPath (see there) - kept for main.js onSelected.
