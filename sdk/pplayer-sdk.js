@@ -389,6 +389,13 @@ const { CatchUpController, DEFAULT_TARGET_MS } = __require("/catchup-controller.
 const { StallWatchdog } = __require("/stall-watchdog.mjs");
 const { LagTracker } = __require("/lag-tracker.mjs");
 
+// Edge SDP budget: the 1440p publish's top H264 layer is 5000 kbps now, so
+// the old fixed 2500 no longer described the stream.
+const EDGE_MAX_BITRATE_KBPS = 5000;
+// P2P has no server-side ABR. Cap the directly-pulled Simulcast layer so a
+// constrained direct link doesn't stay on the 5000 kbps top layer forever.
+const P2P_MAX_BITRATE_KBPS = 3000;
+
 const video = document.getElementById('player-container-id') || document.getElementById('video');
 const statsContainer = document.querySelector('#local-video .stat ul') || document.getElementById('stats');
 const layerSelect = document.getElementById('quality-select') || document.getElementById('layerSelect');
@@ -1264,8 +1271,13 @@ window.addEventListener('pagehide', () => stopPlaySession('client_stopped', { be
 const abrEngine = new ABREngine();
 
 function switchMediaTrack(trackId, reason) {
-    if (!controlClient) return;
+    const p2pPath = (activePlaybackPathName === 'p2p' && activePlaybackPath &&
+        typeof activePlaybackPath.selectLayer === 'function') ? activePlaybackPath : null;
+    if (!controlClient && !p2pPath) return;
     if (trackId === abrEngine.audioTrackId) {
+        // Audio-only selection is an Edge WHEP media-state feature; P2P
+        // always carries the publisher's Opus track and has no audio entry.
+        if (!controlClient) return;
         if (abrEngine.videoTrackIds.includes(abrEngine.currentTrackId)) lastVideoTrackId = abrEngine.currentTrackId;
         controlClient.setMediaState({ video: 'paused', audio: 'resumed' });
         abrEngine.notifyLayerSwitched(trackId);
@@ -1274,6 +1286,12 @@ function switchMediaTrack(trackId, reason) {
     }
     if (trackId === abrEngine.currentTrackId && !videoPaused) {
         console.log(`[Main] Ignore redundant layer switch: ${trackId} (${reason})`);
+        return;
+    }
+    if (p2pPath) {
+        lastVideoTrackId = trackId;
+        console.log(`[P2P] Requesting layer ${trackId} (${reason})`);
+        p2pPath.selectLayer(trackId, reason);
         return;
     }
     if (videoPaused) {
@@ -1551,6 +1569,11 @@ recordBtn.onclick = () => {
 
 function applyLayerSelection(val) {
     if (val === "auto") {
+        // P2P has no Auto/ABR: only the publisher's layers and a manual pick.
+        if (activePlaybackPathName === 'p2p') {
+            console.log('[UI] Auto mode is not available on P2P');
+            return false;
+        }
         abrEngine.setAutoMode(true);
         // Hand selection back to the server. A plain selectLayer() would
         // pin the layer again (it implies manual mode server-side), so
@@ -1564,7 +1587,7 @@ function applyLayerSelection(val) {
     } else {
         abrEngine.setAutoMode(false);
         const trackId = parseInt(val);
-        if (!isNaN(trackId) && controlClient) {
+        if (!isNaN(trackId)) {
             console.log(`[UI] Manual select track: ${trackId}`);
             // 通知引擎手动切换了，更新其内部状态
             abrEngine.notifyManualSwitch(trackId);
@@ -1669,7 +1692,7 @@ function negotiateAndConnect(generation, url, codecType) {
     reader = new MediaMTXWebRTCReader({
         url: url,
         videoCodec: codecType,
-        maxBitrate: 2500, // 初始带宽限制
+        maxBitrate: EDGE_MAX_BITRATE_KBPS, // 初始带宽限制
         // The direct path reads the OBS abs-timestamp SEI out of the encoded
         // bitstream (attachSeiTimestampReader below), which needs the encoded
         // transform - and it DOES consume it, so enabling it here is safe. See
@@ -2290,6 +2313,7 @@ function startP2PPlayback(decision, generation, playConfig) {
         bufferMs,
         WebSocketClass: WebSocket,
         PeerConnectionClass: RTCPeerConnection,
+        maxBitrateKbps: P2P_MAX_BITRATE_KBPS,
         insertableStreams: p2pSeiEnabled,
         onVideoReceiver: p2pSeiEnabled ? (receiver) => {
             if (p2pSeiReaderAttached) return;
@@ -2315,6 +2339,7 @@ function startP2PPlayback(decision, generation, playConfig) {
         if (handshakeTimer) clearTimeout(handshakeTimer);
         if (statsInterval) clearInterval(statsInterval);
         console.warn('[P2P] direct P2P did not play, falling back to edge:', reason);
+        layerSelect.disabled = true;
         try { path.stop('p2p_failed'); } catch { /* best-effort */ }
         activePlaybackPath = null;
         activePlaybackPathName = 'edge';
@@ -2345,6 +2370,38 @@ function startP2PPlayback(decision, generation, playConfig) {
 
     path.start({
         onSignal: (message) => logP2PSignal(message, decision.p2p.sessionId),
+        onLayers: (layers, activeId) => {
+            if (generation !== readerGeneration) return;
+            // P2P does not support Auto/ABR: the menu lists only the
+            // publisher's layers and selection is always manual.
+            if (abrEngine.isAutoMode) abrEngine.setAutoMode(false);
+            const tracks = layers.map((layer) => ({ ...layer, type: 'video' }));
+            abrEngine.setTracks(tracks, activeId, video.videoWidth);
+            layerSelect.disabled = tracks.length === 0;
+            updateLayerSelectUI(tracks, activeId, false);
+            // The host UI (app.js) builds its own quality <select> from
+            // options.onTracksInfo, which the Edge leg feeds through the control
+            // channel. The P2P leg has no control channel, so without this the
+            // host selector never learned the publisher's layers and stayed
+            // disabled. opts.auto=false tells it to omit the "Auto (ABR)" entry.
+            if (typeof window !== 'undefined' && typeof window.pplayer?.onTracksInfo === 'function') {
+                try {
+                    window.pplayer.onTracksInfo(tracks, activeId, { path: 'p2p', auto: false });
+                } catch (e) {
+                    console.warn('[pplayer] onTracksInfo callback failed:', e);
+                }
+            }
+            if (pendingQualityTarget !== null) {
+                const queued = pendingQualityTarget;
+                pendingQualityTarget = null;
+                apiSwitchQuality(queued);
+            }
+        },
+        onLayerSwitched: (id) => {
+            if (generation !== readerGeneration) return;
+            abrEngine.notifyLayerSwitched(id);
+            if (!layerSelect.disabled) layerSelect.value = id;
+        },
         onNegotiated: ({ stream }) => {
             if (generation !== readerGeneration) return;
             if (handshakeTimer) {
@@ -2393,6 +2450,7 @@ function startRacedPlayback(decision, generation, playConfig) {
 
     const playback = createPlaybackRace(decision, {
         bufferMs,
+        maxBitrateKbps: P2P_MAX_BITRATE_KBPS,
         ReaderClass: MediaMTXWebRTCReader,
         // The on-screen P2P trial is off by default: a P2P leg that cannot
         // decode blanks the viewer for p2pVerifyMs then reverts (a visible
@@ -2639,13 +2697,15 @@ function resumeVideoFromAudioOnly() {
     }
 }
 
-function updateLayerSelectUI(tracks, activeId) {
+function updateLayerSelectUI(tracks, activeId, allowAuto = true) {
     layerSelect.innerHTML = '';
-    
-    const autoOption = document.createElement('option');
-    autoOption.value = 'auto';
-    autoOption.text = 'Auto (ABR)';
-    layerSelect.appendChild(autoOption);
+
+    if (allowAuto) {
+        const autoOption = document.createElement('option');
+        autoOption.value = 'auto';
+        autoOption.text = 'Auto (ABR)';
+        layerSelect.appendChild(autoOption);
+    }
 
     const videos = tracks.filter(t => t.type === 'video');
     // UI显示：码率从高到低
@@ -2694,11 +2754,15 @@ function updateLayerSelectUI(tracks, activeId) {
         if (desired !== undefined && desired !== null &&
             tracks.some(t => String(t.id) === String(desired))) {
             layerSelect.value = desired;
-        } else {
+        } else if (allowAuto) {
             layerSelect.value = 'auto';
+        } else {
+            // P2P has no Auto entry; never leave the select on a value that
+            // has no matching option.
+            layerSelect.value = videos.length ? videos[0].id : '';
         }
     } else {
-        layerSelect.value = 'auto';
+        layerSelect.value = allowAuto ? 'auto' : (videos.length ? videos[0].id : '');
     }
 }
 
@@ -3219,14 +3283,27 @@ async function apiPlay(input = {}) {
     }
 }
 
-function resolveQualityValue(target) {
+// Track metadata for quality resolution: the Edge control channel while that
+// leg owns the media, otherwise the layer list the publisher advertised over
+// the P2P signaling channel.
+function qualityTracks() {
+    if (controlClient && Array.isArray(controlClient.tracks) && controlClient.tracks.length) {
+        return controlClient.tracks;
+    }
+    if (activePlaybackPathName === 'p2p' && activePlaybackPath &&
+        Array.isArray(activePlaybackPath.layers)) {
+        return activePlaybackPath.layers.map((layer) => ({ ...layer, type: 'video' }));
+    }
+    return [];
+}
+
+function resolveQualityValue(target, tracks = qualityTracks()) {
     if (target === undefined || target === null) return null;
     const raw = String(target).trim();
     if (!raw) return null;
     const lower = raw.toLowerCase();
     if (lower === 'auto' || lower === 'abr' || lower === '-1') return 'auto';
 
-    const tracks = (controlClient && Array.isArray(controlClient.tracks)) ? controlClient.tracks : [];
     const numeric = Number(raw);
     if (Number.isFinite(numeric) && tracks.some((t) => Number(t.id) === numeric)) {
         return String(numeric);
@@ -3247,12 +3324,21 @@ function resolveQualityValue(target) {
 }
 
 function apiSwitchQuality(target) {
-    if (!controlClient || !Array.isArray(controlClient.tracks) || controlClient.tracks.length === 0) {
+    // P2P playback has no control channel; its layers come from the publisher
+    // over the signaling WebSocket. Resolving against them (instead of bailing
+    // on !controlClient) is what lets the host quality menu work on the P2P leg.
+    const tracks = qualityTracks();
+    if (tracks.length === 0) {
         pendingQualityTarget = target;
         return false;
     }
-    const value = resolveQualityValue(target);
+    const value = resolveQualityValue(target, tracks);
     if (value === null) return false;
+    if (value === 'auto' && activePlaybackPathName === 'p2p') {
+        // P2P has no Auto/ABR - only manual layer selection.
+        console.log('[UI] Auto mode is not available on P2P');
+        return false;
+    }
     if (layerSelect) layerSelect.value = value;
     return applyLayerSelection(value);
 }
@@ -5091,6 +5177,7 @@ function createPlaybackRace(decision, {
     PeerConnectionClass,
     bufferMs = null,
     enableVisibleTrial = true,
+    maxBitrateKbps = 0,
     ControllerClass = PlaybackRaceController,
 } = {}) {
     if (decision?.mode !== 'p2p-connect' || !decision.p2p) {
@@ -5104,7 +5191,13 @@ function createPlaybackRace(decision, {
     // decision's raceWindowMs/connectTimeoutMs described the old symmetric race
     // and no longer apply - the controller uses its own edge-primary timings.
     const edgePath = new EdgeWHEPPath({ url: getEdgeStreamUrl(decision), ReaderClass, bufferMs });
-    const p2pPath = new P2PPlaybackPath({ session: decision.p2p, WebSocketClass, PeerConnectionClass, bufferMs });
+    const p2pPath = new P2PPlaybackPath({
+        session: decision.p2p,
+        WebSocketClass,
+        PeerConnectionClass,
+        bufferMs,
+        maxBitrateKbps,
+    });
     const controller = new ControllerClass({
         edgePath,
         p2pPath,
@@ -5127,6 +5220,7 @@ function createDirectP2PPlayback(decision, {
     bufferMs = null,
     insertableStreams = false,
     onVideoReceiver = null,
+    maxBitrateKbps = 0,
 } = {}) {
     if (decision?.mode !== 'p2p-connect' || !decision.p2p) {
         throw new Error('play decision is not a P2P decision');
@@ -5138,6 +5232,7 @@ function createDirectP2PPlayback(decision, {
         bufferMs,
         insertableStreams,
         onVideoReceiver,
+        maxBitrateKbps,
     });
 }
 
@@ -5639,7 +5734,7 @@ class EdgeWHEPPath {
     start({ onReady, onFailed }) {
         this.reader = new this.ReaderClass({
             url: this.url,
-            maxBitrate: 2500,
+            maxBitrate: 5000,
             // Deliberately no insertableStreams: the race path does not read the
             // SEI, so it must NOT enable the encoded transform - enabling it
             // without consuming it freezes decode (framesDecoded stays 0, black
@@ -5677,11 +5772,18 @@ class EdgeWHEPPath {
 }
 
 class P2PPlaybackPath {
-    constructor({ session, WebSocketClass = globalThis.WebSocket, PeerConnectionClass = globalThis.RTCPeerConnection, bufferMs = null, insertableStreams = false, onVideoReceiver = null }) {
+    constructor({ session, WebSocketClass = globalThis.WebSocket, PeerConnectionClass = globalThis.RTCPeerConnection, bufferMs = null, insertableStreams = false, onVideoReceiver = null, maxBitrateKbps = 0 }) {
         this.session = session;
         this.WebSocketClass = WebSocketClass;
         this.PeerConnectionClass = PeerConnectionClass;
         this.bufferMs = bufferMs;
+        // The publisher advertises every H264 Simulcast layer over the
+        // signaling channel, but the P2P peer default is layer 0 (the full
+        // 5000 kbps layer). There is no server-side ABR on the P2P leg, so a
+        // constrained direct link would carry the top layer forever. Pick the
+        // best layer within this budget when the layer list arrives.
+        this.maxBitrateKbps = maxBitrateKbps;
+        this.selectedLayerId = null;
         // Opt-in encoded transform. The P2P leg carries the same OBS
         // abs-timestamp SEI the edge path reads: ppobs stamps it into every
         // encoded packet before obs-webrtc's Data() forwards packet->data
@@ -5702,12 +5804,21 @@ class P2PPlaybackPath {
         this.pendingCandidates = [];
         this.stopped = false;
         this.seq = 0;
+        // Quality menu state advertised by the publisher over the same
+        // signaling channel. Each entry is {id, width, height, bitrate,
+        // label}; id is the publisher's layer index (0 = highest).
+        this.layers = [];
+        this.currentLayer = 0;
+        this.onLayers = null;
+        this.onLayerSwitched = null;
     }
 
-    start({ onNegotiated, onFailed, onSignal }) {
+    start({ onNegotiated, onFailed, onSignal, onLayers, onLayerSwitched }) {
         this.onNegotiated = onNegotiated;
         this.onFailed = onFailed;
         this.onSignal = onSignal;
+        this.onLayers = onLayers;
+        this.onLayerSwitched = onLayerSwitched;
         this.onSignal?.({ type: 'ws-connecting', url: this.session.signalUrl });
         this.ws = new this.WebSocketClass(this.session.signalUrl, [
             'ppcdn-p2p-v1', `ppcdn-token.${this.session.token}`,
@@ -5737,9 +5848,43 @@ class P2PPlaybackPath {
         } else if (message.type === 'ice' && message.sessionId === this.session.sessionId) {
             if (this.pc.remoteDescription) await this.pc.addIceCandidate(message.candidate);
             else this.pendingCandidates.push(message.candidate);
+        } else if (message.type === 'layers' && message.sessionId === this.session.sessionId &&
+                   Array.isArray(message.layers)) {
+            this.layers = message.layers;
+            this.onLayers?.(message.layers, this.currentLayer);
+            // Keep the fixed-budget auto pick (there is no server-side ABR on
+            // the direct leg) while still exposing the ladder to the quality
+            // menu above.
+            this.#selectLayerForBudget(message.layers);
+        } else if (message.type === 'layer_switched' && message.sessionId === this.session.sessionId) {
+            this.currentLayer = Number(message.layer) || 0;
+            this.onLayerSwitched?.(this.currentLayer);
         } else if (message.type === 'error') {
             this.#fail(new Error(message.reason || 'P2P signaling rejected'));
         }
+    }
+
+    // The publisher's P2P peer starts on layer 0 (the full-resolution layer)
+    // and only changes when the viewer asks. The edge leg has a server-side
+    // ABR controller; this direct leg does not, so select a layer that fits a
+    // fixed budget once the publisher advertises the ladder.
+    #selectLayerForBudget(layers) {
+        const videos = (Array.isArray(layers) ? layers : [])
+            .filter((layer) => layer && Number.isFinite(Number(layer.bitrate)));
+        if (videos.length === 0) return;
+
+        const sorted = videos.slice().sort((a, b) => Number(a.bitrate) - Number(b.bitrate));
+        const budgetBps = Number(this.maxBitrateKbps) > 0 ? Number(this.maxBitrateKbps) * 1000 : 0;
+        let target = budgetBps > 0 ? sorted.filter((layer) => Number(layer.bitrate) <= budgetBps).pop() : null;
+        // Every advertised layer is above the budget: take the lowest rather
+        // than falling back to the top layer and reproducing the congestion.
+        if (!target) target = budgetBps > 0 ? sorted[0] : sorted[sorted.length - 1];
+        if (!target || target.id === undefined || target.id === null) return;
+        if (this.selectedLayerId === target.id) return;
+
+        this.selectedLayerId = target.id;
+        console.log(`[P2P] selecting layer ${target.id} (${Math.round(Number(target.bitrate) / 1000)} kbps, ${target.width}x${target.height}) for budget ${this.maxBitrateKbps || 'none'} kbps`);
+        this.#send({ type: 'select_layer', layer: Number(target.id) });
     }
 
     async #createOffer() {
@@ -5842,6 +5987,17 @@ class P2PPlaybackPath {
 
     #fail(error) {
         if (!this.stopped) this.onFailed?.(error);
+    }
+
+    // Asks the publisher to feed a different H264 Simulcast layer. The
+    // publisher answers with layer_switched once it has applied the switch
+    // and reset the keyframe gate; currentLayer updates on that ack.
+    selectLayer(layer, reason = 'manual') {
+        const id = Number(layer);
+        if (!Number.isFinite(id) || id < 0) return false;
+        if (!this.ws || this.ws.readyState !== this.WebSocketClass.OPEN) return false;
+        this.#send({ type: 'select_layer', layer: id, reason });
+        return true;
     }
 
     // No-op, mirroring EdgeWHEPPath (see there) - kept for main.js onSelected.
