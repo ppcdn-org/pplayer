@@ -857,6 +857,19 @@ let activeEdgeNodeName = '';
 let playbackRace = null;
 let playRequestAbortController = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
+// Client-side FPS guard: the server ABR is driven by loss/RTT, but a device
+// can fail to decode a layer that the network carries fine. When decoded FPS
+// stays below 20 for a few consecutive 1s samples, ask the server to move one
+// quality step down. This deliberately leaves ABR auto mode (reason
+// "client_fps_low"), so the server does not immediately push the same layer
+// back up; if the lower layer is still below 20 the guard keeps stepping down
+// on its cooldown. The user can re-select Auto from the quality selector.
+const FPS_DOWNGRADE_THRESHOLD = 20;
+const FPS_DOWNGRADE_CONFIRMATIONS = 3;
+const FPS_DOWNGRADE_COOLDOWN_MS = 10000;
+const FPS_DOWNGRADE_MIN_AFTER_FIRST_FRAME_MS = 5000;
+let lowFpsSamples = 0;
+let lastFpsDowngradeAt = 0;
 let sdkLastPlayOptions = null;
 let pendingQualityTarget = null;
 // Last decoded MediaStream of the active path. Kept separately from
@@ -1321,6 +1334,40 @@ function switchMediaTrack(trackId, reason) {
         lastVideoTrackId = trackId;
     }
     controlClient.selectLayer(trackId, reason);
+}
+
+function maybeSwitchQualityForLowFps(fps, isVideoActive) {
+    if (!isVideoActive || !firstFrameDecoded || !abrEngine) {
+        lowFpsSamples = 0;
+        return;
+    }
+    // Give the decoder a few seconds after the first frame; startup frames and
+    // the first keyframe often make the 1Hz sample read low.
+    if (firstFrameAt && Date.now() - firstFrameAt < FPS_DOWNGRADE_MIN_AFTER_FIRST_FRAME_MS) {
+        lowFpsSamples = 0;
+        return;
+    }
+    // fps=0 is a decode stall, handled by StallWatchdog, not a quality choice.
+    if (!(fps > 0 && fps < FPS_DOWNGRADE_THRESHOLD)) {
+        lowFpsSamples = 0;
+        return;
+    }
+    if (Date.now() - lastFpsDowngradeAt < FPS_DOWNGRADE_COOLDOWN_MS) {
+        return;
+    }
+
+    lowFpsSamples++;
+    if (lowFpsSamples < FPS_DOWNGRADE_CONFIRMATIONS) return;
+
+    lowFpsSamples = 0;
+    const ids = abrEngine.videoTrackIds || [];
+    const idx = ids.indexOf(abrEngine.currentTrackId);
+    if (idx <= 0) return; // already on the lowest layer, or unknown active track
+
+    const target = ids[idx - 1];
+    lastFpsDowngradeAt = Date.now();
+    console.log(`[ABR] Decoded FPS ${fps.toFixed(1)} < ${FPS_DOWNGRADE_THRESHOLD} for ${FPS_DOWNGRADE_CONFIRMATIONS}s, switching quality ${abrEngine.currentTrackId} -> ${target}`);
+    switchMediaTrack(target, 'client_fps_low');
 }
 
 // [修复] 视频分辨率监控：增加判重逻辑
@@ -1831,6 +1878,8 @@ function resetSessionState() {
     p2pSeiReaderAttached = false;
     p2pSeiZeroDecodeStreak = 0;
     p2pSeiWatchdogTrip = null;
+    lowFpsSamples = 0;
+    lastFpsDowngradeAt = 0;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
     codecPathFallback = false;
@@ -2934,11 +2983,15 @@ async function updateStats() {
                 reportPlayOutcome(activePlayConfig, activePlaybackPathName || 'edge');
             }
         }
-        if (firstFrameDecoded) stallWatchdog.update(videoKbps, fps, isVideoActive);
+        if (firstFrameDecoded) {
+            maybeSwitchQualityForLowFps(fps, isVideoActive);
+            stallWatchdog.update(videoKbps, fps, isVideoActive);
+        }
 
-        // No client-side ABR decision here any more: the layer is chosen
-        // server-side from the bandwidth estimate. fps/loss below are
-        // reported for statistics and drive the stall watchdog only.
+        // Network-driven layer choice remains server-side (see
+        // abr_controller.go); the only client-side decision is the low-FPS
+        // guard above. fps/loss below are reported for statistics and drive
+        // the stall watchdog too.
 
         // currentRoundTripTime is in seconds, and this is the MEDIA path: the
         // selected candidate pair's RTCP-measured round trip (viewer <-> edge
