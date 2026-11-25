@@ -483,6 +483,9 @@ const TOKEN_CACHE_MARGIN_MS = 30000;
 const viewerTokenCache = new Map();
 const p2pUnavailableUntil = new Map();
 let natProbeGraceMs = DEFAULT_NAT_PROBE_GRACE_MS;
+// Consecutive 1Hz media-RTT samples above the fallback threshold while the
+// selected pair is UDP; 2 samples are needed before re-negotiating over TCP.
+let mediaRttHighStreak = 0;
 let startupStartedAt = 0;
 const startupMarks = new Map();
 
@@ -1988,10 +1991,42 @@ function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) 
     pc.addEventListener('connectionstatechange', onState);
 }
 
+// Steady-state counterpart of the connect-time check in
+// openControlClientWhenConnected: the browser can migrate the transport to a
+// different succeeded pair after startup (e.g. off a fast TCP pair onto a
+// higher-priority but degraded UDP one), which is what made the stats area
+// report an RTT the initial ICE log never showed. Watch the selected pair's
+// RTT every stats tick; if it stays above the threshold on UDP, re-negotiate
+// once over TCP (which latches forceTcp, so a slow TCP path is accepted).
+const TCP_FALLBACK_HIGH_RTT_SAMPLES = 2;
+function maybeFallbackToTcpForMediaRtt(rttMs, protocol) {
+    const r = activePlaybackPath;
+    if (activePlaybackPathName !== 'edge' || !r || typeof r.restartWithTcp !== 'function') {
+        mediaRttHighStreak = 0;
+        return;
+    }
+    if (r.forceTcp || r.lastAnswerHasTcp !== true || protocol !== 'udp') {
+        mediaRttHighStreak = 0;
+        return;
+    }
+    const threshold = clampTcpFallbackRtt(sdkConfig().tcpFallbackRttMs);
+    if (rttMs !== null && rttMs > threshold) {
+        mediaRttHighStreak++;
+        if (mediaRttHighStreak >= TCP_FALLBACK_HIGH_RTT_SAMPLES) {
+            mediaRttHighStreak = 0;
+            console.warn(`[ICE] media RTT ${rttMs}ms > ${threshold}ms on UDP for ${TCP_FALLBACK_HIGH_RTT_SAMPLES}s; re-negotiating over TCP`);
+            r.restartWithTcp();
+        }
+    } else {
+        mediaRttHighStreak = 0;
+    }
+}
+
 function resetSessionState() {
     previousTrackType = null;
     currentMediaStream = null;
     firstFrameDecoded = false;
+    mediaRttHighStreak = 0;
     firstFrameCallbackArmed = false;
     lastP2PDelayMs = null;
     lastP2PDelayAt = 0;
@@ -3151,6 +3186,9 @@ async function updateStats() {
         // not.
         const pairRttSeconds = networkStats?.currentRoundTripTime;
         const rttMs = Number.isFinite(pairRttSeconds) && pairRttSeconds > 0 ? pairRttSeconds * 1000 : null;
+        const remoteCand = networkStats ? stats.get(networkStats.remoteCandidateId) : null;
+        const selectedProtocol = (remoteCand && remoteCand.protocol ? String(remoteCand.protocol) : '').toLowerCase();
+        maybeFallbackToTcpForMediaRtt(rttMs, selectedProtocol);
         const jitterBufferMs = videoStats?.jitterBufferDelay && videoStats?.jitterBufferEmittedCount
             ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) * 1000
             : 0;
