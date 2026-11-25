@@ -1949,7 +1949,7 @@ function negotiateAndConnect(generation, url, codecType) {
             if (generation !== readerGeneration) return;
             console.warn('[Main] stream is offline (persistent 404); stopped retrying until a new play request:', err);
             if (statsContainer) {
-                statsContainer.innerHTML = '<div style="color: #ff9800; text-align: center;">Stream offline — press Play to retry</div>';
+                statsContainer.innerHTML = '<div style="color: #ff9800; text-align: center;">Stream offline - press Play to retry</div>';
             }
         },
         onUnauthorized: (err) => {
