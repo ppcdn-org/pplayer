@@ -1390,8 +1390,15 @@ function switchMediaTrack(trackId, reason) {
     controlClient.selectLayer(trackId, reason);
 }
 
-function maybeSwitchQualityForLowFps(fps, isVideoActive) {
+function maybeSwitchQualityForLowFps(fps, sourceFps, isVideoActive) {
     if (!isVideoActive || !firstFrameDecoded || !abrEngine) {
+        lowFpsSamples = 0;
+        return;
+    }
+    // Manual layer selection is authoritative: the low-FPS guard must never
+    // override a layer the user picked by hand (it used to, which is why a
+    // manual 720p choice kept getting bounced back to 360p).
+    if (!abrEngine.isAutoMode) {
         lowFpsSamples = 0;
         return;
     }
@@ -1403,6 +1410,13 @@ function maybeSwitchQualityForLowFps(fps, isVideoActive) {
     }
     // fps=0 is a decode stall, handled by StallWatchdog, not a quality choice.
     if (!(fps > 0 && fps < FPS_DOWNGRADE_THRESHOLD)) {
+        lowFpsSamples = 0;
+        return;
+    }
+    // Only a decode shortfall is a reason to drop quality: if the incoming
+    // source itself runs below the threshold (e.g. a 15fps stream decoding at
+    // 15fps), lowering the layer cannot raise fps and must not trigger.
+    if (!(sourceFps >= FPS_DOWNGRADE_THRESHOLD)) {
         lowFpsSamples = 0;
         return;
     }
@@ -1420,7 +1434,7 @@ function maybeSwitchQualityForLowFps(fps, isVideoActive) {
 
     const target = ids[idx - 1];
     lastFpsDowngradeAt = Date.now();
-    console.log(`[ABR] Decoded FPS ${fps.toFixed(1)} < ${FPS_DOWNGRADE_THRESHOLD} for ${FPS_DOWNGRADE_CONFIRMATIONS}s, switching quality ${abrEngine.currentTrackId} -> ${target}`);
+    console.log(`[ABR] Decoded FPS ${fps.toFixed(1)} < ${FPS_DOWNGRADE_THRESHOLD} for ${FPS_DOWNGRADE_CONFIRMATIONS}s (source ${sourceFps.toFixed(1)}fps), switching quality ${abrEngine.currentTrackId} -> ${target}`);
     switchMediaTrack(target, 'client_fps_low');
 }
 
@@ -3111,6 +3125,7 @@ async function updateStats() {
         let videoKbps = 0;
         let audioKbps = 0;
         let fps = 0;
+        let sourceFps = 0;
         let currentPacketLoss = 0;
 
         let videoLoss = 0;
@@ -3119,6 +3134,15 @@ async function updateStats() {
         if (videoStats) {
             videoKbps = ((videoStats.bytesReceived - lastStats.videoBytes) * 8 / deltaTime / 1000);
             fps = videoStats.framesPerSecond || 0;
+            // Frames actually arriving from the source, per second. Used only
+            // to tell a genuine decode shortfall (source >= 20fps but we decode
+            // less) apart from a low-framerate source decoding at its own rate.
+            if (Number.isFinite(videoStats.framesReceived) &&
+                Number.isFinite(lastStats.videoFramesReceived) && deltaTime > 0) {
+                const deltaFrames = videoStats.framesReceived - lastStats.videoFramesReceived;
+                if (deltaFrames >= 0) sourceFps = deltaFrames / deltaTime;
+            }
+            lastStats.videoFramesReceived = videoStats.framesReceived;
             const vLoss = (videoStats.packetsLost || 0) - (lastStats.videoPacketsLost || 0);
             const vRecv = (videoStats.packetsReceived || 0) - (lastStats.videoPacketsReceived || 0);
             // packetsLost can go backwards (a retransmit filling a gap the
@@ -3202,7 +3226,7 @@ async function updateStats() {
             }
         }
         if (firstFrameDecoded) {
-            maybeSwitchQualityForLowFps(fps, isVideoActive);
+            maybeSwitchQualityForLowFps(fps, sourceFps, isVideoActive);
             stallWatchdog.update(videoKbps, fps, isVideoActive);
         }
 
