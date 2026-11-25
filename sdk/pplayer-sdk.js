@@ -1941,6 +1941,17 @@ function negotiateAndConnect(generation, url, codecType) {
                 pauseVideoForAudioOnly();
             }
         },
+        onStreamUnavailable: (err) => {
+            // The reader hit STREAM_GONE_MAX_404 consecutive 404s: the path no
+            // longer exists (publisher stopped), so retrying it cannot help.
+            // It has already stopped its internal loop; surface that and leave
+            // the retry to a new Play/Start request.
+            if (generation !== readerGeneration) return;
+            console.warn('[Main] stream is offline (persistent 404); stopped retrying until a new play request:', err);
+            if (statsContainer) {
+                statsContainer.innerHTML = '<div style="color: #ff9800; text-align: center;">Stream offline — press Play to retry</div>';
+            }
+        },
         onUnauthorized: (err) => {
             // The edge rejected our WHEP URL (401/403) - almost certainly the
             // playback token's txTime expired (edgeStreamUrl TTL is 8h). The
@@ -4280,6 +4291,12 @@ class MMXControlClient {
 // ==========================================
 // 2. MediaMTX WebRTC Reader (WHEP)
 // ==========================================
+// A 404 from the WHEP endpoint means the path itself no longer exists (the
+// publisher stopped). Retrying that URL forever just produces a reconnect
+// storm, so after this many consecutive 404s the reader stops and waits for a
+// new play request; a short publisher reconnect is still ridden out because a
+// successful WHEP POST resets the counter.
+const STREAM_GONE_MAX_404 = 5;
 class MediaMTXWebRTCReader {
   constructor(conf) {
     this.retryPause = 2000;
@@ -4296,6 +4313,8 @@ class MediaMTXWebRTCReader {
     // Whether the last answer advertised a TCP candidate; the RTT fallback
     // only switches when the edge actually offers TCP.
     this.lastAnswerHasTcp = false;
+    // Consecutive WHEP 404s; see STREAM_GONE_MAX_404.
+    this.notFoundAttempts = 0;
     this.nonAdvertisedCodecs = [];
     this.#getNonAdvertisedCodecs();
   }
@@ -4410,6 +4429,23 @@ class MediaMTXWebRTCReader {
         this.state = 'failed';
         this.conf.onUnauthorized(message);
         return;
+      }
+      // 404 = the path no longer exists (publisher stopped). Ride out a short
+      // reconnect for a few attempts, then stop instead of reconnecting
+      // forever; a new play request (which builds a fresh reader) starts it
+      // again. A successful WHEP POST resets notFoundAttempts in #sendOffer.
+      if (httpStatus === 404) {
+        this.notFoundAttempts++;
+        if (this.notFoundAttempts >= STREAM_GONE_MAX_404) {
+          this.state = 'failed';
+          if (this.conf.onError !== undefined) {
+            this.conf.onError(message, httpStatus);
+          }
+          if (this.conf.onStreamUnavailable !== undefined) {
+            this.conf.onStreamUnavailable(message);
+          }
+          return;
+        }
       }
       this.state = 'restarting';
       // Jittered, same reasoning as MMXControlClient's reconnect above: a
@@ -4566,6 +4602,9 @@ class MediaMTXWebRTCReader {
         err.httpStatus = res.status;
         throw err;
       });
+      // The path exists again (or still does): restart the 404 budget so a
+      // brief publisher reconnect does not count towards giving up.
+      this.notFoundAttempts = 0;
       const location = res.headers.get('location');
       if (!location) throw new Error("Missing Location header in response");
       

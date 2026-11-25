@@ -1,4 +1,4 @@
-import PPPlayer from './sdk/pplayer-sdk.js?v=20261125-10';
+import PPPlayer from './sdk/pplayer-sdk.js?v=20261125-11';
 
 const $ = (id) => document.getElementById(id);
 const ui = {
