@@ -472,6 +472,12 @@ function prefillStreamInput() {
 }
 
 const DEFAULT_NAT_PROBE_GRACE_MS = 800;
+// Edge WHEP normally runs over UDP (lower latency, no head-of-line blocking).
+// When the measured ICE RTT of the selected pair is above this, the UDP path
+// is degraded (observed: 30ms vs 370ms on the same Globe line, intermittently,
+// while the edge's TCP path stayed ~31ms). In that case we re-negotiate once
+// with UDP candidates stripped from the answer so ICE is forced onto TCP.
+const DEFAULT_TCP_FALLBACK_RTT_MS = 120;
 const P2P_UNAVAILABLE_TTL_MS = 30000;
 const TOKEN_CACHE_MARGIN_MS = 30000;
 const viewerTokenCache = new Map();
@@ -493,6 +499,12 @@ function clampNatProbeGrace(value) {
     return Math.max(0, Math.min(5000, Math.round(n)));
 }
 
+function clampTcpFallbackRtt(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return DEFAULT_TCP_FALLBACK_RTT_MS;
+    return Math.max(50, Math.min(5000, Math.round(n)));
+}
+
 (() => {
     if (typeof window === 'undefined') return;
     const params = new URLSearchParams(window.location.search);
@@ -505,6 +517,9 @@ function clampNatProbeGrace(value) {
     }
     if (params.get('tokenCache') !== null) {
         cfg.tokenCache = params.get('tokenCache') !== '0' && params.get('tokenCache') !== 'false';
+    }
+    if (params.get('tcpFallbackRttMs') !== null) {
+        cfg.tcpFallbackRttMs = clampTcpFallbackRtt(params.get('tcpFallbackRttMs'));
     }
 })();
 
@@ -1906,9 +1921,11 @@ function negotiateAndConnect(generation, url, codecType) {
 // pair actually carrying media (types, protocol, addresses, RTT). The
 // server-side log shows a host/fe80 local candidate and a ~370ms RTCP RTT,
 // which this confirms or refutes from the viewer's own stats.
+// Logs the selected ICE pair and resolves its measured RTT in milliseconds
+// (or null when it can't be read). The RTT drives the TCP fallback below.
 function logSelectedCandidatePair(pc) {
-    if (!pc || typeof pc.getStats !== 'function') return;
-    pc.getStats().then((stats) => {
+    if (!pc || typeof pc.getStats !== 'function') return Promise.resolve(null);
+    return pc.getStats().then((stats) => {
         const byId = new Map();
         stats.forEach((r) => byId.set(r.id, r));
         let pair = null;
@@ -1918,19 +1935,21 @@ function logSelectedCandidatePair(pc) {
                 pair = r;
             }
         });
-        if (!pair) return;
+        if (!pair) return null;
         const local = byId.get(pair.localCandidateId);
         const remote = byId.get(pair.remoteCandidateId);
         const label = (c) => c
             ? `${c.candidateType || '?'} ${c.protocol || '?'} ${c.address || c.ip || '?'}:${c.port || '?'}`
             : '?';
+        const rttMs = pair.currentRoundTripTime != null
+            ? Math.round(pair.currentRoundTripTime * 1000) : null;
         console.log('[ICE] selected pair:', {
             local: label(local),
             remote: label(remote),
-            currentRoundTripTimeMs: pair.currentRoundTripTime != null
-                ? Math.round(pair.currentRoundTripTime * 1000) : null,
+            currentRoundTripTimeMs: rttMs,
         });
-    }).catch(() => { /* diagnostics only */ });
+        return rttMs;
+    }).catch(() => null);
 }
 
 function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) {
@@ -1938,8 +1957,24 @@ function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) 
     const open = () => {
         if (generation !== readerGeneration || reader !== activePlaybackPath) return;
         startupMark('pc-connected');
-        logSelectedCandidatePair(pc);
-        initControlClient(whepUrl, sessionId);
+        // A degraded UDP path shows up immediately as a high RTT on the
+        // selected pair, before any media flows. Re-negotiate that session
+        // once with UDP candidates stripped from the answer, forcing ICE onto
+        // the edge's TCP listener (which stays fast when UDP is not). Only
+        // attempted once: reader.forceTcp latches, so a slow TCP path is
+        // accepted rather than looping.
+        const threshold = clampTcpFallbackRtt(sdkConfig().tcpFallbackRttMs);
+        logSelectedCandidatePair(pc).then((rttMs) => {
+            if (generation !== readerGeneration || reader !== activePlaybackPath) return;
+            if (rttMs !== null && rttMs > threshold && !reader.forceTcp &&
+                reader.lastAnswerHasTcp === true &&
+                typeof reader.restartWithTcp === 'function') {
+                console.warn(`[ICE] selected-pair RTT ${rttMs}ms > ${threshold}ms; re-negotiating this session over TCP`);
+                reader.restartWithTcp();
+                return;
+            }
+            initControlClient(whepUrl, sessionId);
+        });
     };
     if (!pc || pc.connectionState === 'connected') {
         open();
@@ -4153,6 +4188,12 @@ class MediaMTXWebRTCReader {
     this.offerData = null;
     this.sessionUrl = null;
     this.queuedCandidates = [];
+    // When true, UDP remote candidates are stripped from the answer so ICE can
+    // only select a TCP pair (see #setAnswer / restartWithTcp).
+    this.forceTcp = conf.forceTcp === true;
+    // Whether the last answer advertised a TCP candidate; the RTT fallback
+    // only switches when the edge actually offers TCP.
+    this.lastAnswerHasTcp = false;
     this.nonAdvertisedCodecs = [];
     this.#getNonAdvertisedCodecs();
   }
@@ -4446,7 +4487,77 @@ class MediaMTXWebRTCReader {
 
   #setAnswer(answer) {
     if (this.state !== 'running') throw new Error('closed');
-    return this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: answer }));
+    const lines = answer.split('\r\n');
+    const candidateLines = lines.filter((l) => l.startsWith('a=candidate:'));
+    const hasTcp = candidateLines.some((l) => {
+      const transport = (l.slice('a=candidate:'.length).split(' ')[2] || '').toLowerCase();
+      return transport === 'tcp';
+    });
+    this.lastAnswerHasTcp = hasTcp;
+
+    let sdp = answer;
+    if (this.forceTcp) {
+      if (!hasTcp) {
+        // The edge did not advertise a TCP candidate (older config): forcing
+        // TCP would leave no viable remote candidate at all and break video.
+        // Keep UDP instead; the connection stays up, just without the faster
+        // path.
+        console.warn('[ICE] TCP-only requested but the answer has no TCP candidate; keeping UDP');
+        this.forceTcp = false;
+      } else {
+        // Drop the edge's UDP candidates before ICE sees them, leaving only
+        // its TCP listener. The browser still gathers its own UDP candidates,
+        // but they cannot pair with a TCP remote, so the selected pair is TCP.
+        let dropped = 0;
+        const kept = [];
+        for (const line of lines) {
+          if (line.startsWith('a=candidate:')) {
+            const transport = (line.slice('a=candidate:'.length).split(' ')[2] || '').toLowerCase();
+            if (transport === 'udp') { dropped++; continue; }
+          }
+          kept.push(line);
+        }
+        console.warn(`[ICE] TCP-only session: discarded ${dropped} UDP remote candidate(s)`);
+        sdp = kept.join('\r\n');
+      }
+    }
+    return this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
+  }
+
+  // restartWithTcp re-negotiates this same reader over TCP only. Used when the
+  // selected UDP pair's RTT is above the fallback threshold (see main.js's
+  // openControlClientWhenConnected): the running session is torn down and a
+  // fresh WHEP session is dialed immediately with forceTcp latched, so its
+  // answer has no UDP candidates for ICE to pick. A slow TCP path is accepted
+  // rather than retried, so this can never loop.
+  restartWithTcp() {
+    if (this.state === 'closed' || this.forceTcp || this.lastAnswerHasTcp !== true) return;
+    this.forceTcp = true;
+    console.warn('[ICE] re-negotiating this WHEP session over TCP-only candidates');
+    const staleSessionUrl = this.sessionUrl;
+    if (this.pc !== null) {
+      this.pc.close();
+      this.pc = null;
+    }
+    this.offerData = null;
+    this.sessionUrl = null;
+    this._sessionUUID = null;
+    this.queuedCandidates = [];
+    if (staleSessionUrl) {
+      fetch(staleSessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
+    }
+    if (this.restartTimeout !== null) {
+      clearTimeout(this.restartTimeout);
+      this.restartTimeout = null;
+    }
+    this.state = 'restarting';
+    // No retryPause: the RTT has already been paid once on UDP; switch now.
+    this.restartTimeout = window.setTimeout(() => {
+      this.restartTimeout = null;
+      if (this.state !== 'restarting') return;
+      this.state = 'running';
+      this.#start();
+    }, 0);
   }
 
   #onLocalCandidate(evt) {
