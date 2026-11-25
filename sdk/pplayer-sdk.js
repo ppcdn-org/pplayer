@@ -510,8 +510,9 @@ function clampTcpFallbackRtt(value) {
 
 // Once an edge's UDP path has been observed slow and we forced TCP, start the
 // next session on that same edge directly in TCP-only mode instead of paying
-// the UDP handshake and the 2s watchdog window again. Session-scoped with a
-// TTL so a genuinely recovered UDP path is retried later.
+// the UDP handshake and the 2s watchdog window again. Kept in localStorage so
+// every tab on the browser shares it, with a TTL so a genuinely recovered UDP
+// path is retried later.
 const TCP_PREFERRED_TTL_MS = 30 * 60 * 1000;
 const TCP_PREFERRED_STORAGE_KEY = 'pplayer.tcpPreferred';
 function whepHost(url) {
@@ -519,8 +520,8 @@ function whepHost(url) {
 }
 function tcpPreferredMap() {
     try {
-        if (typeof sessionStorage === 'undefined') return {};
-        const raw = sessionStorage.getItem(TCP_PREFERRED_STORAGE_KEY);
+        if (typeof localStorage === 'undefined') return {};
+        const raw = localStorage.getItem(TCP_PREFERRED_STORAGE_KEY);
         const m = raw ? JSON.parse(raw) : {};
         return m && typeof m === 'object' ? m : {};
     } catch (e) {
@@ -535,10 +536,10 @@ function isTcpPreferred(host) {
 function markTcpPreferred(host) {
     if (!host) return;
     try {
-        if (typeof sessionStorage === 'undefined') return;
+        if (typeof localStorage === 'undefined') return;
         const m = tcpPreferredMap();
         m[host] = Date.now() + TCP_PREFERRED_TTL_MS;
-        sessionStorage.setItem(TCP_PREFERRED_STORAGE_KEY, JSON.stringify(m));
+        localStorage.setItem(TCP_PREFERRED_STORAGE_KEY, JSON.stringify(m));
     } catch (e) { /* best-effort */ }
 }
 
