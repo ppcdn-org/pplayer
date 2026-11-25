@@ -870,6 +870,7 @@ const FPS_DOWNGRADE_COOLDOWN_MS = 10000;
 const FPS_DOWNGRADE_MIN_AFTER_FIRST_FRAME_MS = 5000;
 let lowFpsSamples = 0;
 let lastFpsDowngradeAt = 0;
+let initialStart720Applied = false;
 let sdkLastPlayOptions = null;
 let pendingQualityTarget = null;
 // Last decoded MediaStream of the active path. Kept separately from
@@ -1368,6 +1369,60 @@ function maybeSwitchQualityForLowFps(fps, isVideoActive) {
     lastFpsDowngradeAt = Date.now();
     console.log(`[ABR] Decoded FPS ${fps.toFixed(1)} < ${FPS_DOWNGRADE_THRESHOLD} for ${FPS_DOWNGRADE_CONFIRMATIONS}s, switching quality ${abrEngine.currentTrackId} -> ${target}`);
     switchMediaTrack(target, 'client_fps_low');
+}
+
+function maybeApplyInitial720(tracks, activeId) {
+    if (initialStart720Applied || videoPaused || !controlClient || !abrEngine) return;
+    const ids = abrEngine.videoTrackIds || [];
+    if (ids.length < 2) {
+        initialStart720Applied = true;
+        return;
+    }
+    const currentId = abrEngine.currentTrackId;
+    const current = abrEngine.trackRegistry[currentId];
+    if (!current || current.type !== 'video') return;
+
+    const shortSide = (t) => {
+        const w = Number(t.width) || 0;
+        const h = Number(t.height) || 0;
+        if (w > 0 && h > 0) return Math.min(w, h);
+        return w || h;
+    };
+    const currentShort = shortSide(current);
+    if (currentShort > 0 && currentShort <= 720) {
+        // Server already started at 720p or lower; nothing to override.
+        initialStart720Applied = true;
+        return;
+    }
+
+    const currentIdx = ids.indexOf(currentId);
+    if (currentIdx < 0) return;
+
+    // Only consider layers below the current one, so this never upgrades a
+    // server decision that deliberately started lower (degrade/ceiling).
+    let targetId = null;
+    let bestDiff = Infinity;
+    for (let i = 0; i < currentIdx; i++) {
+        const candidate = abrEngine.trackRegistry[ids[i]];
+        if (!candidate || candidate.type !== 'video') continue;
+        const short = shortSide(candidate);
+        if (short <= 0) continue;
+        const diff = Math.abs(short - 720);
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            targetId = candidate.id;
+        }
+    }
+    if (targetId === null || targetId === currentId) {
+        initialStart720Applied = true;
+        return;
+    }
+
+    initialStart720Applied = true;
+    console.log(`[ABR] Initial quality target ${targetId} (closest to 720p), current=${currentId} ${currentShort || '?'}p`);
+    // auto_bandwidth keeps server-side ABR enabled; this is only the initial
+    // layer correction when the server's own SDP-based pick fell back high.
+    switchMediaTrack(targetId, 'auto_bandwidth');
 }
 
 // [修复] 视频分辨率监控：增加判重逻辑
@@ -1880,6 +1935,7 @@ function resetSessionState() {
     p2pSeiWatchdogTrip = null;
     lowFpsSamples = 0;
     lastFpsDowngradeAt = 0;
+    initialStart720Applied = false;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
     codecPathFallback = false;
@@ -2588,6 +2644,8 @@ function initControlClient(whepUrl, sessionId) {
                 const queued = pendingQualityTarget;
                 pendingQualityTarget = null;
                 apiSwitchQuality(queued);
+            } else {
+                maybeApplyInitial720(tracks, activeId);
             }
             if (typeof window !== 'undefined' && typeof window.pplayer?.onTracksInfo === 'function') {
                 try { window.pplayer.onTracksInfo(tracks, activeId); } catch (e) {
