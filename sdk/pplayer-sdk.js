@@ -2605,9 +2605,13 @@ function initControlClient(whepUrl, sessionId) {
     // A P2P trial that reverts re-selects the same, never-stopped edge leg, so
     // onSelected calls this again with the session it is already connected to.
     // Tearing that control channel down and redialing it drops the layer list
-    // and resets ABR for no reason; keep the live one instead.
-    if (controlClient && controlClient.sessionId === sessionId) return;
-    // Destroy previous client to stop stale reconnects
+    // and resets ABR for no reason; keep the live one instead - unless it gave
+    // up on a stale session, in which case a confirmed onConnected for the same
+    // id deserves a fresh attempt.
+    if (controlClient && controlClient.sessionId === sessionId && !controlClient.gaveUp) return;
+    // Destroy previous client to stop stale reconnects (and, when the WHEP
+    // reader reconnected with a new session id, make sure the old session's
+    // control retry loop is gone before dialing the new one).
     if (controlClient) {
         controlClient.close();
         controlClient = null;
@@ -2624,6 +2628,19 @@ function initControlClient(whepUrl, sessionId) {
             wsStatusDot.classList.remove('ws-connected');
             wsStatusDot.classList.add('ws-disconnected');
             layerSelect.disabled = true;
+        },
+        // The control channel used its one reconnect on a session_id mmx no
+        // longer knows (typically an edge restart). Stop dialing the dead id
+        // and let the WHEP reader re-negotiate on its own: when its onConnected
+        // fires with a changed session id, initControlClient is called again
+        // with that new id. We must NOT force a re-negotiation here - if WHEP
+        // is still healthy and only /ws/control is failing, forcing a new
+        // session every time the handshake fails would reconnect video forever.
+        onReconnectExhausted: () => {
+            wsStatusDot.classList.remove('ws-connected');
+            wsStatusDot.classList.add('ws-disconnected');
+            layerSelect.disabled = true;
+            console.warn('[WS] Control channel lost its session; waiting for WHEP to re-negotiate with a new session_id');
         },
         onTracksInfo: (tracks, activeId) => {
             console.log("[UI] Received Tracks Info:", tracks);
@@ -3741,6 +3758,23 @@ function jitteredDelay(baseMs) {
   return baseMs + Math.random() * baseMs;
 }
 
+// A control WebSocket can only attach to a live WHEP session: mmx resolves
+// session_id server-side (404 "session not found" once the session is gone -
+// edge restart, publisher offline, or the WHEP peer connection closed). The
+// browser does not expose that HTTP status to WebSocket callers, so a stale
+// session_id and a transient network blip both look like a failed handshake
+// followed by onclose 1006. Distinguish them by counting consecutive attempts
+// that never reached onopen, and allow the old session_id at most ONE
+// reconnect:
+//   - a session that was open before: the first failed reconnect ends it;
+//   - the initial dial itself: one retry before ending it.
+// When the budget is spent the client stops. The WHEP reader re-negotiates on
+// its own if the session died; its onConnected then carries the (possibly new)
+// session_id and a fresh control client attaches with it. A healthy WHEP whose
+// control channel alone is failing is left alone, not forced into a new session.
+const CONTROL_WS_FAILURES_AFTER_OPEN = 1;
+const CONTROL_WS_INITIAL_MAX_FAILURES = 2;
+
 // ==========================================
 // 1. MMX Control Client (WebSocket Protocol)
 // ==========================================
@@ -3756,6 +3790,18 @@ class MMXControlClient {
         this.isIntentionalClose = false; // 是否是用户手动关闭
         this.reconnectTimer = null;
         this.reconnectDelay = 3000; // 3秒重连
+
+        // A reconnect attempt that never reaches onopen is a failed handshake.
+        // failedConnects counts consecutive such attempts; openedOnce records
+        // that this client attached to a real session at least once, which
+        // tightens the retry budget to a single reconnect (see the constants
+        // above). gaveUp latches once the budget is spent so initControlClient
+        // can decide whether a later onConnected for the same session should
+        // retry from scratch.
+        this.attemptOpened = false;
+        this.failedConnects = 0;
+        this.openedOnce = false;
+        this.gaveUp = false;
 
         // 1. 解析 WHEP URL 以提取 host, protocol 和 path
         let pathName = '';
@@ -3798,12 +3844,16 @@ class MMXControlClient {
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 
         console.log(`[WS] Connecting...`);
+        this.attemptOpened = false;
         this.ws = new WebSocket(this.wsUrl);
 
         this.ws.onopen = () => {
             console.log('[WS] Connected');
             // 连接成功，重置主动关闭标志
             this.isIntentionalClose = false;
+            this.attemptOpened = true;
+            this.openedOnce = true;
+            this.failedConnects = 0;
             
             if (this.callbacks.onConnected) this.callbacks.onConnected();
             this.startHeartbeat(); 
@@ -3826,6 +3876,29 @@ class MMXControlClient {
 
             // [核心修复] 自动重连逻辑（加抖动，避免 Edge 大规模掉线时所有客户端同时重连）
             if (!this.isIntentionalClose) {
+                // A handshake that never opened means the session_id itself is
+                // likely gone. The old session_id gets at most one reconnect:
+                // if this client had attached before, a single failed retry
+                // ends it; the initial dial gets one retry. Either way, once
+                // that budget is spent we stop dialing the dead id and wait for
+                // the WHEP reader's own re-negotiation to supply a new one.
+                if (!this.attemptOpened) {
+                    this.failedConnects++;
+                    const limit = this.openedOnce
+                        ? CONTROL_WS_FAILURES_AFTER_OPEN
+                        : CONTROL_WS_INITIAL_MAX_FAILURES;
+                    if (this.failedConnects >= limit) {
+                        this.gaveUp = true;
+                        console.warn(
+                            `[WS] Control handshake failed ${this.failedConnects} times in a row ` +
+                            `(session ${this.sessionId} is likely gone); waiting for WHEP to re-negotiate`);
+                        if (this.callbacks.onReconnectExhausted) this.callbacks.onReconnectExhausted();
+                        return;
+                    }
+                } else {
+                    this.failedConnects = 0;
+                }
+
                 const delay = jitteredDelay(this.reconnectDelay);
                 console.warn(`[WS] Connection lost unexpectedly. Retrying in ${Math.round(delay)}ms...`);
                 this.reconnectTimer = setTimeout(() => {
@@ -4077,6 +4150,7 @@ class MediaMTXWebRTCReader {
     }
     this.sessionUrl = null;
     this.offerData = null;
+    this._sessionUUID = null;
     this.queuedCandidates = [];
     if (staleSessionUrl) {
       fetch(staleSessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
@@ -4147,6 +4221,7 @@ class MediaMTXWebRTCReader {
       }
       this.offerData = null;
       this.sessionUrl = null;
+      this._sessionUUID = null;
       this.queuedCandidates = [];
       if (staleSessionUrl) {
         fetch(staleSessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
