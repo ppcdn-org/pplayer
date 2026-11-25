@@ -512,7 +512,7 @@ function clampTcpFallbackRtt(value) {
 // next session on that same edge directly in TCP-only mode instead of paying
 // the UDP handshake and the 2s watchdog window again. Session-scoped with a
 // TTL so a genuinely recovered UDP path is retried later.
-const TCP_PREFERRED_TTL_MS = 5 * 60 * 1000;
+const TCP_PREFERRED_TTL_MS = 30 * 60 * 1000;
 const TCP_PREFERRED_STORAGE_KEY = 'pplayer.tcpPreferred';
 function whepHost(url) {
     try { return new URL(url).host || ''; } catch (e) { return ''; }
