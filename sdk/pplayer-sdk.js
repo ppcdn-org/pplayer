@@ -508,6 +508,40 @@ function clampTcpFallbackRtt(value) {
     return Math.max(50, Math.min(5000, Math.round(n)));
 }
 
+// Once an edge's UDP path has been observed slow and we forced TCP, start the
+// next session on that same edge directly in TCP-only mode instead of paying
+// the UDP handshake and the 2s watchdog window again. Session-scoped with a
+// TTL so a genuinely recovered UDP path is retried later.
+const TCP_PREFERRED_TTL_MS = 5 * 60 * 1000;
+const TCP_PREFERRED_STORAGE_KEY = 'pplayer.tcpPreferred';
+function whepHost(url) {
+    try { return new URL(url).host || ''; } catch (e) { return ''; }
+}
+function tcpPreferredMap() {
+    try {
+        if (typeof sessionStorage === 'undefined') return {};
+        const raw = sessionStorage.getItem(TCP_PREFERRED_STORAGE_KEY);
+        const m = raw ? JSON.parse(raw) : {};
+        return m && typeof m === 'object' ? m : {};
+    } catch (e) {
+        return {};
+    }
+}
+function isTcpPreferred(host) {
+    if (!host) return false;
+    const exp = tcpPreferredMap()[host];
+    return Number.isFinite(exp) && exp > Date.now();
+}
+function markTcpPreferred(host) {
+    if (!host) return;
+    try {
+        if (typeof sessionStorage === 'undefined') return;
+        const m = tcpPreferredMap();
+        m[host] = Date.now() + TCP_PREFERRED_TTL_MS;
+        sessionStorage.setItem(TCP_PREFERRED_STORAGE_KEY, JSON.stringify(m));
+    } catch (e) { /* best-effort */ }
+}
+
 (() => {
     if (typeof window === 'undefined') return;
     const params = new URLSearchParams(window.location.search);
@@ -1818,6 +1852,9 @@ function negotiateAndConnect(generation, url, codecType) {
         // transform - and it DOES consume it, so enabling it here is safe. See
         // ppplayer.mjs's encodedInsertableStreams comment.
         insertableStreams: true,
+        // A previous session on this edge already found its UDP path slow and
+        // forced TCP; start TCP-only straight away for the TTL window.
+        forceTcp: isTcpPreferred(whepHost(url)),
         onTrack: (evt) => {
             if (generation !== readerGeneration) return;
             if (evt.track.kind === 'video' || evt.track.kind === 'audio') {
@@ -1973,6 +2010,7 @@ function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) 
                 reader.lastAnswerHasTcp === true &&
                 typeof reader.restartWithTcp === 'function') {
                 console.warn(`[ICE] selected-pair RTT ${rttMs}ms > ${threshold}ms; re-negotiating this session over TCP`);
+                markTcpPreferred(whepHost(reader.conf && reader.conf.url));
                 reader.restartWithTcp();
                 return;
             }
@@ -2015,6 +2053,7 @@ function maybeFallbackToTcpForMediaRtt(rttMs, protocol) {
         if (mediaRttHighStreak >= TCP_FALLBACK_HIGH_RTT_SAMPLES) {
             mediaRttHighStreak = 0;
             console.warn(`[ICE] media RTT ${rttMs}ms > ${threshold}ms on UDP for ${TCP_FALLBACK_HIGH_RTT_SAMPLES}s; re-negotiating over TCP`);
+            markTcpPreferred(whepHost(r.conf && r.conf.url));
             r.restartWithTcp();
         }
     } else {
