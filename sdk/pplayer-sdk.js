@@ -1902,10 +1902,43 @@ function negotiateAndConnect(generation, url, codecType) {
 // costs a 5s server-side hold plus the client's 3s reconnect backoff before the
 // session is even usable. Wait for the reader's peer connection to actually
 // report 'connected' (the same event that flips mmx's abrReady), then dial once.
+// One-shot diagnostic for the remaining startup cost: log the ICE candidate
+// pair actually carrying media (types, protocol, addresses, RTT). The
+// server-side log shows a host/fe80 local candidate and a ~370ms RTCP RTT,
+// which this confirms or refutes from the viewer's own stats.
+function logSelectedCandidatePair(pc) {
+    if (!pc || typeof pc.getStats !== 'function') return;
+    pc.getStats().then((stats) => {
+        const byId = new Map();
+        stats.forEach((r) => byId.set(r.id, r));
+        let pair = null;
+        stats.forEach((r) => {
+            if (r.type === 'candidate-pair' && r.state === 'succeeded' &&
+                (r.nominated === true || r.selected === true)) {
+                pair = r;
+            }
+        });
+        if (!pair) return;
+        const local = byId.get(pair.localCandidateId);
+        const remote = byId.get(pair.remoteCandidateId);
+        const label = (c) => c
+            ? `${c.candidateType || '?'} ${c.protocol || '?'} ${c.address || c.ip || '?'}:${c.port || '?'}`
+            : '?';
+        console.log('[ICE] selected pair:', {
+            local: label(local),
+            remote: label(remote),
+            currentRoundTripTimeMs: pair.currentRoundTripTime != null
+                ? Math.round(pair.currentRoundTripTime * 1000) : null,
+        });
+    }).catch(() => { /* diagnostics only */ });
+}
+
 function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) {
     const pc = reader.pc;
     const open = () => {
         if (generation !== readerGeneration || reader !== activePlaybackPath) return;
+        startupMark('pc-connected');
+        logSelectedCandidatePair(pc);
         initControlClient(whepUrl, sessionId);
     };
     if (!pc || pc.connectionState === 'connected') {
@@ -4291,7 +4324,21 @@ class MediaMTXWebRTCReader {
     return fetch(this.conf.url, {
       method: 'OPTIONS',
       headers: { ...this.#authHeader() },
-    }).then((res) => MediaMTXWebRTCReader.#linkToIceServers(res.headers.get('Link')));
+    }).then((res) => {
+      const servers = MediaMTXWebRTCReader.#linkToIceServers(res.headers.get('Link'));
+      // Diagnostic only: ICE gathering/connectivity is the biggest remaining
+      // startup cost (see the Startup logs), and a TURN/relay candidate can
+      // add several round trips. Log what ppcenter actually returned before
+      // ICECandidate() gathering starts, so a slow connect can be attributed.
+      try {
+        const urls = servers.flatMap((s) => s.urls || []);
+        const stun = urls.filter((u) => /^stuns?:/i.test(u)).length;
+        const turn = urls.filter((u) => /^turns?:/i.test(u)).length;
+        console.log(`[ICE] servers: ${servers.length} total (${stun} stun, ${turn} turn)` +
+          (urls.length ? ` urls=${urls.join(',')}` : ' (none)'));
+      } catch (e) { /* never let diagnostics break ICE setup */ }
+      return servers;
+    });
   }
 
   #setupPeerConnection(iceServers) {
