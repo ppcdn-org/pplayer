@@ -3303,9 +3303,13 @@ async function updateStats() {
         // not.
         const pairRttSeconds = networkStats?.currentRoundTripTime;
         const rttMs = Number.isFinite(pairRttSeconds) && pairRttSeconds > 0 ? pairRttSeconds * 1000 : null;
-        const remoteCand = networkStats ? stats.get(networkStats.remoteCandidateId) : null;
-        const selectedProtocol = (remoteCand && remoteCand.protocol ? String(remoteCand.protocol) : '').toLowerCase();
-        maybeFallbackToTcpForMediaRtt(rttMs, selectedProtocol);
+        // Steady-state TCP fallback is deliberately NOT wired up. It tore down
+        // a live WHEP session and dialed a fresh one whenever the browser
+        // migrated to a high-RTT UDP pair mid-session, which the viewer sees
+        // as the video opening a second time. The connect-time check in
+        // openControlClientWhenConnected still forces TCP before any media is
+        // revealed. maybeFallbackToTcpForMediaRtt is kept for reference.
+        // maybeFallbackToTcpForMediaRtt(rttMs, selectedProtocol);
         const jitterBufferMs = videoStats?.jitterBufferDelay && videoStats?.jitterBufferEmittedCount
             ? (videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount) * 1000
             : 0;
