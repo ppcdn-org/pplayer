@@ -4906,6 +4906,10 @@ const ABR_CFG = {
     FPS_LOW_RATIO: 0.75,
     FPS_LOW_CONFIRMATIONS: 2,
 
+    // A switch is made only after this many consecutive probe samples agree
+    // on the same target rung.
+    TARGET_CONFIRMATIONS: 2,
+
     // Bound on how long a SELECT_LAYER may stay unconfirmed before the engine
     // stops waiting for LAYER_SWITCHED (e.g. the server rejected it with a
     // cooldown error), so a rejected switch cannot freeze ABR forever.
@@ -5060,6 +5064,8 @@ class ABREngine {
         this.probeLowTarget = null;
         this.upgradeConfirm = 0;
         this.fpsLowStreak = 0;
+        this.targetConfirmTarget = null;
+        this.targetConfirmCount = 0;
     }
 
     // currentVideoWidth is used only to guess the starting layer when the
@@ -5261,6 +5267,69 @@ class ABREngine {
         return reported;
     }
 
+    // Heights (short side) for the ladder, low -> high. Uses the real SPS
+    // dimensions/labels once ppmmx sends them; before that, the standard
+    // 4-rung ladder falls back to 360/720/1080/1440 by position.
+    ladderHeights() {
+        const defaults = [360, 720, 1080, 1440];
+        return this.videoTrackIds.map((id, index) => {
+            const track = this.trackRegistry[id] || {};
+            const shortSide = Math.min(Number(track.height) || 0, Number(track.width) || 0);
+            if (shortSide > 0) return shortSide;
+            const match = String(track.label || '').match(/(\d{3,4})p/);
+            if (match) return Number(match[1]);
+            return this.videoTrackIds.length === 4 ? defaults[index] : 0;
+        });
+    }
+
+    // The operator's policy, as absolute bandwidth bands (kbps):
+    //   > 800  -> 720p     < 600  -> 360p
+    //   > 1600 -> 1080p    < 1200 -> 720p
+    //   > 3200 -> 1440p    < 2400 -> 1080p
+    // The upgrade threshold picks the highest rung the link can sustain (so a
+    // low rung can jump straight to 1080/1440); the downgrade threshold picks
+    // the rung the link no longer supports. Between the two thresholds the
+    // current rung holds, which is the hysteresis that stops ping-ponging.
+    // The caller requires two agreeing samples before applying either.
+    decideProbeTarget(activeIndex, kbps) {
+        const heights = this.ladderHeights();
+        const indexForHeight = (height) => {
+            let best = -1;
+            let bestDiff = Infinity;
+            for (let i = 0; i < heights.length; i++) {
+                if (!heights[i]) continue;
+                const diff = Math.abs(heights[i] - height);
+                if (diff < bestDiff) { best = i; bestDiff = diff; }
+            }
+            if (best >= 0) return best;
+            if (this.videoTrackIds.length === 4) {
+                return { 360: 0, 720: 1, 1080: 2, 1440: 3 }[height];
+            }
+            return -1;
+        };
+
+        // Downgrade first: only when the target sits below the active rung.
+        let downIndex = -1;
+        if (kbps < 600) downIndex = indexForHeight(360);
+        else if (kbps < 1200) downIndex = indexForHeight(720);
+        else if (kbps < 2400) downIndex = indexForHeight(1080);
+        if (downIndex >= 0 && downIndex < activeIndex) {
+            return { target: this.videoTrackIds[downIndex], direction: 'downgrade' };
+        }
+
+        // Upgrade: the highest rung whose own bandwidth requirement is met.
+        const upThresholdByHeight = { 720: 800, 1080: 1600, 1440: 3200 };
+        let upIndex = -1;
+        for (let i = activeIndex + 1; i < this.videoTrackIds.length; i++) {
+            const threshold = upThresholdByHeight[heights[i]];
+            if (threshold && kbps > threshold) upIndex = i;
+        }
+        if (upIndex > activeIndex) {
+            return { target: this.videoTrackIds[upIndex], direction: 'upgrade' };
+        }
+        return null;
+    }
+
     // ── bandwidth probe ─────────────────────────────────────────────
 
     probeMedianKbps(now) {
@@ -5419,140 +5488,49 @@ class ABREngine {
         // Refresh the probe in the background; this tick uses the last one.
         this.maybeProbe();
 
-        const sourceFps = Number(s.sourceFps) || 0;
-        const fps = Number(s.fps) || 0;
-        const lowFpsNow = sourceFps >= ABR_CFG.SOURCE_FPS_MIN && fps > 0 &&
-            fps < sourceFps * ABR_CFG.FPS_LOW_RATIO;
-        this.fpsLowStreak = lowFpsNow ? this.fpsLowStreak + 1 : 0;
-        const fpsLow = this.fpsLowStreak >= ABR_CFG.FPS_LOW_CONFIRMATIONS;
-
-        const lossPct = Number(s.lossPct) || 0;
-        const congested = this.rttCongested(rttMs);
-        const severeLoss = lossPct >= ABR_CFG.LOSS_DOWNGRADE_PCT;
-
-        // Learn this layer's real cost from the bytes actually arriving. Only
-        // once the layer has settled (not right after a switch), so ramp-up
-        // and short samples do not become the baseline.
-        if (this.layerSettledAt > 0 && now - this.layerSettledAt >= ABR_CFG.LAYER_SETTLE_MS &&
-            videoKbps > 0 && this.currentTrackId !== this.audioTrackId) {
-            const previous = this.measuredKbpsByTrack[this.currentTrackId] || 0;
-            this.measuredKbpsByTrack[this.currentTrackId] = previous > 0
-                ? previous * 0.75 + videoKbps * 0.25
-                : videoKbps;
-        }
-
-        // 1) Playback signals (loss / RTT / FPS shortfall) - react immediately,
-        // one rung at a time. These describe how the current layer is actually
-        // playing, so they outrank the (noisy) probe.
-        if (fpsLow || severeLoss || congested) {
-            if (now < this.probationUntil && this.lastUpgradeFrom >= 0 &&
-                this.lastUpgradeFrom !== this.currentTrackId &&
-                this.videoTrackIds.includes(this.lastUpgradeFrom)) {
-                const target = this.lastUpgradeFrom;
-                this.probationUntil = 0;
-                this.backoffUntil = now + ABR_CFG.UPGRADE_BACKOFF_MS;
-                this.lastUpgradeFrom = -1;
-                const reason = (fpsLow ? 'fps_low' : (severeLoss ? 'loss' : 'rtt')) + '_rollback';
-                return this.issueSwitch(target, reason, now);
-            }
-
-            const target = this.stepDownTarget(activeIndex);
-            if (target === null) {
-                this.lastDecision = 'hold_at_bottom';
-                return null;
-            }
-            const reason = fpsLow ? 'fps_low' : (severeLoss ? 'loss' : 'rtt');
-            return this.issueSwitch(target, reason, now);
-        }
-
-        // 2) Post-switch cooldown and upgrade damping. lastSwitchAt === 0
-        // means "no switch yet" (performance.now() can itself be under the
-        // cooldown window early in page life), so don't treat it as a switch.
-        if (this.lastSwitchAt > 0 && now - this.lastSwitchAt < ABR_CFG.SWITCH_COOLDOWN_MS) {
-            this.lastDecision = 'cooldown';
-            return null;
-        }
-        if (now < this.backoffUntil) {
-            this.lastDecision = 'upgrade_backoff';
-            return null;
-        }
-        if (now < this.probationUntil) {
-            this.lastDecision = 'probation';
+        const probeKbps = this.freshProbeKbps(now);
+        if (!(probeKbps > 0)) {
+            this.targetConfirmTarget = null;
+            this.targetConfirmCount = 0;
+            this.lastDecision = 'no_probe';
             return null;
         }
 
-        // 3) Probe-driven changes need a clean link and are confirmed over
-        // distinct probe samples (not every 1Hz update tick).
-        if (!this.rttStable(rttMs) || lossPct > ABR_CFG.LOSS_UPGRADE_PCT) {
-            this.upgradeConfirm = 0;
-            this.probeLowConfirm = 0;
+        const wanted = this.decideProbeTarget(activeIndex, probeKbps);
+        if (!wanted) {
+            this.targetConfirmTarget = null;
+            this.targetConfirmCount = 0;
             this.lastDecision = 'hold';
+            this.lastReason = '';
             return null;
         }
 
-        const probeDownKbps = this.freshProbeKbps(now);
-        const probeUpKbps = this.freshProbeUpKbps(now);
-        if (probeDownKbps > 0 || probeUpKbps > 0) {
-            const newProbeSample = this.lastProbeSampleAt > 0 &&
-                this.lastProbeSampleAt !== this.lastProbeSampleUsedAt;
-            const currentCost = this.layerCostKbps(this.currentTrackId, activeIndex) ||
-                this.trackKbps(this.currentTrackId);
+        // Count one vote per distinct probe sample, not per 1Hz update tick.
+        const newProbeSample = this.lastProbeSampleAt > 0 &&
+            this.lastProbeSampleAt !== this.lastProbeSampleUsedAt;
+        if (!newProbeSample) {
+            this.lastDecision = 'await_probe';
+            return null;
+        }
+        this.lastProbeSampleUsedAt = this.lastProbeSampleAt;
 
-            // Probe low: only ever step one rung, and only after two
-            // consecutive low samples. A single 300kbps blip used to jump
-            // 1440 -> 720.
-            if (probeDownKbps > 0 && currentCost > 0 &&
-                probeDownKbps < currentCost * ABR_CFG.BITRATE_DOWN_FACTOR) {
-                const target = this.stepDownTarget(activeIndex);
-                if (target !== null) {
-                    if (this.probeLowTarget !== target) {
-                        this.probeLowConfirm = 0;
-                        this.probeLowTarget = target;
-                    }
-                    if (newProbeSample) {
-                        this.probeLowConfirm++;
-                        this.lastProbeSampleUsedAt = this.lastProbeSampleAt;
-                    }
-                    if (this.probeLowConfirm < ABR_CFG.PROBE_DOWNGRADE_CONFIRMATIONS) {
-                        this.lastDecision = 'downgrade_pending';
-                        this.lastReason = 'probe_low';
-                        return null;
-                    }
-                    this.probeLowConfirm = 0;
-                    this.probeLowTarget = null;
-                    return this.issueSwitch(target, 'probe_low', now);
-                }
-            }
-            this.probeLowConfirm = 0;
-            this.probeLowTarget = null;
-
-            // Upgrade: one rung, using the best of the two freshest samples.
-            // A trial that does not fit is rolled back by probation.
-            const nextIndex = activeIndex + 1;
-            if (nextIndex < this.videoTrackIds.length && probeUpKbps > 0) {
-                const nextId = this.videoTrackIds[nextIndex];
-                const nextCost = this.layerCostKbps(nextId, activeIndex);
-                if (nextCost > 0 && probeUpKbps >= nextCost * ABR_CFG.UPGRADE_HEADROOM) {
-                    if (newProbeSample) {
-                        this.upgradeConfirm++;
-                        this.lastProbeSampleUsedAt = this.lastProbeSampleAt;
-                    }
-                    if (this.upgradeConfirm >= ABR_CFG.PROBE_UPGRADE_CONFIRMATIONS) {
-                        this.upgradeConfirm = 0;
-                        this.lastUpgradeFrom = this.currentTrackId;
-                        this.probationUntil = now + ABR_CFG.UPGRADE_PROBATION_MS;
-                        return this.issueSwitch(nextId, 'bandwidth', now);
-                    }
-                    this.lastDecision = 'upgrade_pending';
-                    return null;
-                }
-            }
-            this.upgradeConfirm = 0;
+        if (this.targetConfirmTarget !== wanted.target) {
+            this.targetConfirmTarget = wanted.target;
+            this.targetConfirmCount = 0;
+        }
+        this.targetConfirmCount++;
+        this.lastDecision = wanted.direction + '_pending';
+        this.lastReason = 'probe';
+        if (this.targetConfirmCount < ABR_CFG.TARGET_CONFIRMATIONS) {
+            return null;
         }
 
-        this.lastDecision = 'hold';
-        this.lastReason = '';
-        return null;
+        this.targetConfirmTarget = null;
+        this.targetConfirmCount = 0;
+        return this.issueSwitch(
+            wanted.target,
+            wanted.direction === 'upgrade' ? 'bandwidth' : 'probe_low',
+            now);
     }
 }
 
