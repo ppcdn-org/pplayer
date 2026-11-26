@@ -1366,9 +1366,10 @@ function stopPlaySession(reason = 'client_stopped', { beacon = false } = {}) {
 // the unload beacon, so the online list doesn't linger on a closed tab.
 window.addEventListener('pagehide', () => stopPlaySession('client_stopped', { beacon: true }));
 
-// Layer bookkeeping. The layer *choice* is made server-side from the
-// bandwidth estimate (see abr_controller.go in ppmmx); this side tracks what
-// is playing and what the user has asked for. See abr-engine.mjs.
+// Client-side ABR. The layer *choice* is made here (see abr-engine.mjs):
+// loss/RTT/FPS plus a same-origin HTTP bandwidth probe, executed through the
+// ordinary SELECT_LAYER path. The ppmmx edge no longer runs a server-side ABR
+// loop; it still executes the SELECT_LAYER requests this engine produces.
 const abrEngine = new ABREngine();
 
 function switchMediaTrack(trackId, reason) {
@@ -1759,14 +1760,17 @@ recordBtn.onclick = () => {
 function applyLayerSelection(val) {
     if (val === "auto") {
         abrEngine.setAutoMode(true);
-        // Hand selection back to the server. A plain selectLayer() would
-        // pin the layer again (it implies manual mode server-side), so
-        // resuming from audio-only has to be done before this, not after.
+        // ABR decisions now live in the client, so there is no server-side
+        // auto mode to hand back to. Still resume from audio-only through the
+        // normal switch path, then give the engine a clean warmup slate.
         if (videoPaused || abrEngine.currentTrackId === abrEngine.audioTrackId) {
             const lowestVideo = abrEngine.videoTrackIds[0];
             if (lowestVideo !== undefined) switchMediaTrack(lowestVideo, 'user_resume');
         }
-        if (controlClient) controlClient.setABRMode(true);
+        // controlClient.setABRMode(true) used to tell the (now disabled)
+        // server-side ABR loop it could choose again.
+        // if (controlClient) controlClient.setABRMode(true);
+        if (typeof abrEngine.reset === 'function') abrEngine.reset();
         console.log(`[UI] Switched to AUTO mode`);
     } else {
         abrEngine.setAutoMode(false);
@@ -2924,21 +2928,12 @@ function initControlClient(whepUrl, sessionId) {
             abrEngine.notifyBandwidthEstimate(bps);
         },
         onAbrRecommend: (trackId) => {
-            // The server only ever recommends; this client is the one that
-            // actually asks mmx to switch, via the same switchMediaTrack
-            // path a manual pick uses - see ppplayer.mjs's ABR_RECOMMEND
-            // case and runABRControl's doc comment in ppmmx for why. If the
-            // user has since taken manual control, or a manual switch is
-            // still in flight, a stale recommendation must not undo it.
-            if (!abrEngine.isAutoMode) return;
-            if (abrEngine.pendingTrackId !== null) return;
-            // The user deliberately paused video (audio-only): switchMediaTrack
-            // unconditionally resumes video whenever videoPaused is true, so an
-            // automatic recommendation arriving while paused would silently
-            // undo that choice. Bandwidth recommendations resume on their own
-            // once the user un-pauses.
-            if (videoPaused) return;
-            switchMediaTrack(trackId, ABR_REASON_AUTO_BANDWIDTH);
+            // Server-side ABR is disabled: ppmmx no longer runs its
+            // runABRControl loop, so layer decisions and execution belong to
+            // this client's ABREngine (see updateStats / abr-engine.mjs).
+            // Ignore a stale recommendation rather than risk it overriding a
+            // local decision, a manual pick, or an audio-only pause.
+            console.log(`[ABR] Ignoring server ABR_RECOMMEND (${trackId}); client-side ABR is authoritative`);
         },
         onLayerSwitched: (id) => {
             console.log("[UI] Received Track switch:", id);
@@ -3134,6 +3129,7 @@ function stopStream() {
     layerSelect.innerHTML = '<option value="-1">Auto</option>';
     
     abrEngine.setAutoMode(true);
+    abrEngine.reset();
     previousTrackType = null;
     updateActionButtonsState();
 }
@@ -3188,6 +3184,9 @@ async function updateStats() {
 
         let videoLoss = 0;
         let audioLoss = 0;
+        // Per-tick video loss rate for ABR, not the cumulative session total:
+        // a transient spike must decay instead of keeping ABR downgraded.
+        let videoLossPct = 0;
 
         if (videoStats) {
             videoKbps = ((videoStats.bytesReceived - lastStats.videoBytes) * 8 / deltaTime / 1000);
@@ -3210,6 +3209,7 @@ async function updateStats() {
             if (vLoss > 0) { videoLoss = vLoss; currentPacketLoss += vLoss; }
             if (vRecv > 0) lossTotals.videoRecv += vRecv;
             lossTotals.videoLost += videoLoss;
+            if (vLoss + vRecv > 0) videoLossPct = (videoLoss / (vLoss + vRecv)) * 100;
             lastStats.videoBytes = videoStats.bytesReceived;
             lastStats.videoPacketsLost = videoStats.packetsLost || 0;
             lastStats.videoPacketsReceived = videoStats.packetsReceived || 0;
@@ -3288,11 +3288,6 @@ async function updateStats() {
             stallWatchdog.update(videoKbps, fps, isVideoActive);
         }
 
-        // Network-driven layer choice remains server-side (see
-        // abr_controller.go); the only client-side decision is the low-FPS
-        // guard above. fps/loss below are reported for statistics and drive
-        // the stall watchdog too.
-
         // currentRoundTripTime is in seconds, and this is the MEDIA path: the
         // selected candidate pair's RTCP-measured round trip (viewer <-> edge
         // node, or <-> publisher over P2P). It is NOT the ppcenter clock-sync
@@ -3324,6 +3319,30 @@ async function updateStats() {
         const playoutBufferMs = Number.isFinite(bufferMs) ? bufferMs : 0;
         const estimatedP2PDelayMs = (rttMs ?? 0) / 2 + Math.max(jitterBufferMs, playoutBufferMs) +
             P2P_DELAY_FIXED_COMPENSATION_MS;
+
+        // Client-side ABR: abr-engine.mjs owns the layer decision now (the
+        // ppmmx edge no longer runs a server-side ABR loop). It combines the
+        // video loss / RTT / FPS shortfall sampled above with its own HTTP
+        // bandwidth probe, and we execute the result through the same
+        // SELECT_LAYER path a manual pick uses.
+        if (abrEngine && typeof abrEngine.update === 'function' && controlClient &&
+            activePlaybackPathName === 'edge' &&
+            controlClient.ws && controlClient.ws.readyState === WebSocket.OPEN) {
+            const abrDecision = abrEngine.update({
+                videoKbps,
+                audioKbps,
+                fps,
+                sourceFps,
+                lossPct: videoLossPct,
+                rttMs: rttMs ?? 0,
+                isVideoActive,
+            });
+            if (abrDecision && abrDecision.targetTrackId !== undefined &&
+                abrDecision.targetTrackId !== null &&
+                abrEngine.isAutoMode && !videoPaused) {
+                switchMediaTrack(abrDecision.targetTrackId, ABR_REASON_AUTO_BANDWIDTH);
+            }
+        }
 
         // --- 渲染 UI ---
         let html = '';
@@ -3423,7 +3442,20 @@ async function updateStats() {
                     text: rttMs === null ? '—' : (rttMs < 1 ? '<1 ms' : `${rttMs.toFixed(1)} ms`),
                     title: 'Media-path RTT: the selected WebRTC candidate pair\'s round-trip (viewer <-> edge node, or <-> publisher over P2P). Not the ppcenter clock-sync RTT (TimeSync), which is a different, smaller number.',
                 },
-                'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ' (catching up)' : '')
+                'P2P Delay': p2pLabel + (catchUpController.catchingUp ? ' (catching up)' : ''),
+                // Client-side ABR: the probe is what discovers headroom the
+                // capped active layer cannot show; the state row says whether
+                // the engine is driving selection and what it last decided.
+                'Probe BW': {
+                    text: abrEngine && abrEngine.probedKbps > 0 ? `${abrEngine.probedKbps.toFixed(0)} kbps` : '—',
+                    title: 'Same-origin HTTP bandwidth probe (abr-engine.mjs). Drives upgrade decisions the received bitrate cannot reveal.',
+                },
+                'ABR': {
+                    text: abrEngine
+                        ? `${abrEngine.isAutoMode ? 'auto' : 'manual'}${abrEngine.lastDecision ? ` (${abrEngine.lastDecision}${abrEngine.lastReason ? ':' + abrEngine.lastReason : ''})` : ''}`
+                        : '-',
+                    title: 'Client-side ABR state and last decision from abr-engine.mjs.',
+                }
             };
             html += renderStatGroup('Network', netRows);
         }
@@ -3586,6 +3618,7 @@ function parkWarmSession() {
     layerSelect.disabled = true;
     layerSelect.innerHTML = '<option value="-1">Auto</option>';
     abrEngine.setAutoMode(true);
+    abrEngine.reset();
     previousTrackType = null;
     updateActionButtonsState();
 
@@ -4800,46 +4833,210 @@ exports["jitteredDelay"] = jitteredDelay;
 
 __modules["/abr-engine.mjs"] = function (module, exports, __require) {
 
-// Layer bookkeeping for the quality selector.
+// Client-side ABR engine.
 //
-// This used to be a full ABR decision engine: it sampled getStats() every
-// second and picked a layer from decoded FPS and received bitrate. Both
-// judgements now live server-side, driven by the send-side bandwidth
-// estimate GCC derives from TWCC feedback (see abr_controller.go in ppmmx),
-// which measures the link rather than inferring it from what happened to
-// arrive. Received bitrate could not tell congestion apart from a publisher
-// whose own bitrate had dropped; FPS measured the local decoder, not the
-// network, and is now reported in LATENCY_REPORT for statistics only.
+// Layer decisions used to be made by the ppmmx edge node (abr_controller.go /
+// runABRControl), with this client only executing the server's
+// ABR_RECOMMEND. That server loop is now disabled: this engine owns the
+// decision, modelled on the Tencent abrplayer reference (js/v3/abrplayer.js +
+// utils.js probeBandwidth):
 //
-// What remains here is the client's half of that arrangement: which layers
-// exist, which one is playing, and whether the user has taken manual
-// control. The server owns the choice while in auto mode and switches on
-// its own; those switches arrive as LAYER_SWITCHED exactly like the ones
-// this client asks for.
+//   * loss / RTT / decoded-vs-source FPS are the congestion triggers, sampled
+//     from the player's own getStats() once per second;
+//   * a same-origin HTTP probe measures available bandwidth, which is the
+//     only signal that can discover headroom a capped simulcast layer hides;
+//   * the executor is the ordinary SELECT_LAYER path (reason
+//     auto_bandwidth), so automatic and manual switches share one code path.
+//
+// The engine only decides; updateStats() in main.js performs the switch.
+
+const ABR_CFG = {
+    WARMUP_MS: 15000,
+    SWITCH_COOLDOWN_MS: 5000,
+    PROBE_INTERVAL_MS: 12000,
+    PROBE_TIMEOUT_MS: 5000,
+    // Stop the probe after this much data (mirrors the reference's 120KB cap);
+    // a partial read of at least 1KB still counts so a slow link reports
+    // something rather than "unavailable".
+    PROBE_TARGET_BYTES: 120 * 1024,
+    ZERO_PROBE_BACKOFF_MS: 60000,
+
+    LOSS_UPGRADE_PCT: 0.3,
+    LOSS_DOWNGRADE_PCT: 1.0,
+    BITRATE_DOWN_FACTOR: 0.6,
+
+    RTT_STABLE_FACTOR: 1.30,
+    RTT_DOWNGRADE_FACTOR: 2.00,
+    RTT_DOWNGRADE_MARGIN_MS: 120,
+    RTT_STABLE_MIN_MS: 20,
+    RTT_WINDOW_SAMPLES: 10,
+
+    UPGRADE_HEADROOM: 1.20,
+    DOWNGRADE_CONFIRMATIONS: 3,
+    SEVERE_DOWNGRADE_CONFIRMATIONS: 1,
+    UPGRADE_CONFIRMATIONS: 1,
+    UPGRADE_PROBATION_MS: 15000,
+    UPGRADE_BACKOFF_MS: 90000,
+
+    SOURCE_FPS_MIN: 24,
+    FPS_LOW_RATIO: 0.75,
+    FPS_LOW_CONFIRMATIONS: 2,
+
+    // Bound on how long a SELECT_LAYER may stay unconfirmed before the engine
+    // stops waiting for LAYER_SWITCHED (e.g. the server rejected it with a
+    // cooldown error), so a rejected switch cannot freeze ABR forever.
+    PENDING_TIMEOUT_MS: 8000,
+
+    // Same-origin static assets. The SDK bundle is large enough for a short
+    // download to be meaningful; favicon.ico is the fallback. Override with
+    // window.pplayer.config.bandwidthProbeUrls or ?bwProbe=url1,url2.
+    PROBE_URLS: ['sdk/pplayer-sdk.js', 'favicon.ico'],
+};
+
+function abrNow() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
+
+function abrTrackKbps(track) {
+    const bps = Number(track && track.bitrate) || 0;
+    return bps > 0 ? bps / 1000 : 0;
+}
+
+function abrResolveProbeUrls() {
+    let configured = null;
+    if (typeof window !== 'undefined') {
+        try {
+            const query = new URLSearchParams(window.location.search).get('bwProbe');
+            if (query) configured = query.split(',');
+        } catch (e) { /* ignore malformed URL */ }
+        if (!configured) configured = window.__pplayerBwProbeUrls || null;
+        if (!configured && window.pplayer && window.pplayer.config) {
+            configured = window.pplayer.config.bandwidthProbeUrls || null;
+        }
+    }
+    const list = (Array.isArray(configured) && configured.length)
+        ? configured
+        : ABR_CFG.PROBE_URLS;
+    const urls = [];
+    for (const value of list) {
+        if (!value) continue;
+        try {
+            const resolved = new URL(value, window.location.href).href;
+            if (!urls.includes(resolved)) urls.push(resolved);
+        } catch (e) { /* skip invalid entry */ }
+    }
+    return urls;
+}
+
+// Downloads a same-origin asset (cache-busted) and returns its observed
+// throughput in kbps. Mirrors tencent-abrplayer utils.js:probeBandwidth.
+async function abrProbeOnce(url) {
+    const started = abrNow();
+    const separator = url.includes('?') ? '&' : '?';
+    const probeUrl = `${url}${separator}_probe=${Date.now()}`;
+    let received = 0;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+        try { controller.abort(); } catch (e) {}
+    }, ABR_CFG.PROBE_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(probeUrl, {
+            method: 'GET',
+            signal: controller.signal,
+            cache: 'no-store',
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.body) throw new Error('no response body');
+
+        const reader = response.body.getReader();
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            received += value ? value.length : 0;
+            if (received >= ABR_CFG.PROBE_TARGET_BYTES) {
+                try { controller.abort(); } catch (e) {}
+                break;
+            }
+        }
+    } catch (e) {
+        if (received < 1024) {
+            clearTimeout(timeoutId);
+            return null;
+        }
+    }
+
+    clearTimeout(timeoutId);
+    const elapsed = abrNow() - started;
+    if (elapsed <= 0 || received <= 0) return null;
+    return (received * 8) / elapsed; // kbps
+}
+
 class ABREngine {
     constructor(callbacks) {
         this.callbacks = callbacks || {};
 
         this.isAutoMode = true;
         this.currentTrackId = null;
-        // Layer the user asked for but the server hasn't confirmed yet (see
-        // notifyManualSwitch). currentTrackId deliberately stays on the old
-        // layer until LAYER_SWITCHED arrives, so this is what the quality
-        // selector should display in the meantime.
+        // Layer the user (or the engine) asked for but the server hasn't
+        // confirmed yet. currentTrackId deliberately stays on the old layer
+        // until LAYER_SWITCHED arrives, so selectedTrackId() can show the
+        // target while it is in flight.
         this.pendingTrackId = null;
+        this.pendingSince = 0;
 
         this.audioTrackId = null;
         this.videoTrackIds = [];
         this.trackRegistry = {};
 
-        // Most recent server-side bandwidth estimate in bits per second, or
-        // null before the first BANDWIDTH_ESTIMATE arrives. Display only.
+        // Most recent probe result in bits per second (display + telemetry).
+        // BANDWIDTH_ESTIMATE from the (now disabled) server loop still lands
+        // here through notifyBandwidthEstimate, but is informational only.
         this.lastBandwidthEstimate = null;
+
+        this.reset();
+    }
+
+    // Clears per-session decision/probe state. Does not touch isAutoMode.
+    reset() {
+        this.pendingTrackId = null;
+        this.pendingSince = 0;
+
+        this.startedAt = 0;
+        this.lastSwitchAt = 0;
+        this.lastUpgradeFrom = -1;
+        this.probationUntil = 0;
+        this.backoffUntil = 0;
+
+        this.rttWindow = [];
+        this.rttMinMs = 0;
+        this.haveRTT = false;
+
+        this.probedKbps = 0;
+        this.lastProbeAt = 0;
+        this.lastProbeOkAt = 0;
+        this.probeInFlight = false;
+        this.zeroProbeBackoffUntil = 0;
+        this.probePromise = null;
+
+        this.lastDecision = 'idle';
+        this.lastReason = '';
+        this.resetCounters();
+    }
+
+    resetCounters() {
+        this.lossConfirm = 0;
+        this.probeLowConfirm = 0;
+        this.probeLowTarget = null;
+        this.upgradeConfirm = 0;
+        this.fpsLowStreak = 0;
     }
 
     // currentVideoWidth is used only to guess the starting layer when the
     // server hasn't told us which one is active.
     setTracks(tracks, activeId, currentVideoWidth = 0) {
+        const hadTracks = this.videoTrackIds.length > 0;
         this.trackRegistry = {};
         this.videoTrackIds = [];
         this.audioTrackId = null;
@@ -4862,7 +5059,7 @@ class ABREngine {
         // each layer's real SPS, see SetTrackDimensions in
         // track_selector.go). activeId is always the layer actually playing,
         // so adopting it here stays correct even mid manual switch - the
-        // user's not-yet-confirmed pick lives in pendingTrackId instead.
+        // not-yet-confirmed pick lives in pendingTrackId instead.
         if (activeId !== undefined && activeId !== null) {
             this.currentTrackId = activeId;
         } else if (this.currentTrackId === null && this.videoTrackIds.length > 0) {
@@ -4885,28 +5082,32 @@ class ABREngine {
             }
         }
 
+        // First time a ladder appears: start the warmup window now, not at
+        // script load, so a slow start does not count towards it.
+        if (!hadTracks && this.videoTrackIds.length > 0 && this.startedAt === 0) {
+            this.startedAt = abrNow();
+        }
+
         console.log(`[ABR] Tracks loaded. Video IDs (Low->High): ${this.videoTrackIds}, Audio ID: ${this.audioTrackId}`);
     }
 
     notifyManualSwitch(trackId) {
         this.isAutoMode = false;
         // Do NOT update currentTrackId here: it's still the *old* layer
-        // until the server confirms the switch (onLayerSwitched ->
-        // notifyLayerSwitched, once ppplayer.mjs gets a LAYER_SWITCHED
-        // message back). Setting it eagerly to the target made every
-        // manual switch's very next switchMediaTrack() call see
-        // trackId === currentTrackId and treat it as a no-op "redundant"
-        // switch, silently dropping the actual controlClient.selectLayer
-        // call - manual quality selection never took effect.
-        //
-        // Record it as pending instead, so the UI can keep showing the
-        // user's choice while the switch is in flight.
+        // until the server confirms the switch (notifyLayerSwitched). Record
+        // it as pending instead, so the UI can keep showing the user's
+        // choice while the switch is in flight.
         this.pendingTrackId = trackId;
+        this.pendingSince = abrNow();
+        this.resetCounters();
+        this.probationUntil = 0;
+        this.backoffUntil = 0;
+        this.lastUpgradeFrom = -1;
         console.log(`[ABR] Manual switch detected. Auto Mode OFF.`);
     }
 
-    // The layer the selector should display: the user's pending pick if one
-    // is outstanding, otherwise whatever is actually playing.
+    // The layer the selector should display: the pending pick if one is
+    // outstanding, otherwise whatever is actually playing.
     selectedTrackId() {
         return (this.pendingTrackId !== null) ? this.pendingTrackId : this.currentTrackId;
     }
@@ -4914,26 +5115,349 @@ class ABREngine {
     notifyLayerSwitched(trackId) {
         this.currentTrackId = trackId;
         this.pendingTrackId = null;
+        this.pendingSince = 0;
     }
 
-    // Reflects the server's view of who is driving selection (ABR_MODE).
-    // Kept separate from setAutoMode so a server-sent state can't be
-    // mistaken for a local request and echoed straight back.
+    // The ABR loop that used to drive this is gone from ppmmx, so the server's
+    // ABR_MODE is informational only. Adopt only a manual (auto=false) notice
+    // so a stale "auto" on reconnect cannot silently override a local manual
+    // pick; toggling back to auto goes through setAutoMode from the UI.
     notifyAutoMode(enabled) {
-        this.isAutoMode = enabled;
-        if (enabled) this.pendingTrackId = null;
-        console.log(`[ABR] Auto Mode (from server): ${enabled}`);
+        if (!enabled && this.isAutoMode) {
+            this.isAutoMode = false;
+            console.log('[ABR] Auto Mode OFF (server reported manual)');
+        } else {
+            console.log(`[ABR] Auto Mode (from server): ${enabled} (local=${this.isAutoMode})`);
+        }
     }
 
     setAutoMode(enabled) {
         this.isAutoMode = enabled;
-        // Going back to auto abandons any outstanding manual pick.
-        if (enabled) this.pendingTrackId = null;
+        if (enabled) {
+            // Fresh warmup and no outstanding manual pick when returning to
+            // automatic control.
+            this.pendingTrackId = null;
+            this.pendingSince = 0;
+            this.startedAt = abrNow();
+            this.resetCounters();
+            this.probationUntil = 0;
+            this.backoffUntil = 0;
+            this.lastUpgradeFrom = -1;
+        }
         console.log(`[ABR] Auto Mode: ${enabled}`);
     }
 
     notifyBandwidthEstimate(bitsPerSecond) {
         this.lastBandwidthEstimate = bitsPerSecond;
+    }
+
+    // ── link signals ────────────────────────────────────────────────
+
+    observeRTT(rttMs) {
+        if (!(rttMs > 0)) return;
+        this.rttWindow.push(rttMs);
+        if (this.rttWindow.length > ABR_CFG.RTT_WINDOW_SAMPLES) {
+            this.rttWindow = this.rttWindow.slice(this.rttWindow.length - ABR_CFG.RTT_WINDOW_SAMPLES);
+        }
+        this.rttMinMs = Math.min(...this.rttWindow);
+        this.haveRTT = true;
+    }
+
+    rttBaseline() {
+        return Math.max(this.rttMinMs, ABR_CFG.RTT_STABLE_MIN_MS);
+    }
+
+    rttStable(rttMs) {
+        if (!this.haveRTT || !(rttMs > 0)) return true;
+        return rttMs <= this.rttBaseline() * ABR_CFG.RTT_STABLE_FACTOR;
+    }
+
+    rttCongested(rttMs) {
+        if (!this.haveRTT || !(rttMs > 0)) return false;
+        const base = this.rttBaseline();
+        return rttMs > base * ABR_CFG.RTT_DOWNGRADE_FACTOR &&
+            rttMs > base + ABR_CFG.RTT_DOWNGRADE_MARGIN_MS;
+    }
+
+    // ── ladder helpers ──────────────────────────────────────────────
+
+    ladderIndex(trackId) {
+        return this.videoTrackIds.indexOf(trackId);
+    }
+
+    trackKbps(trackId) {
+        return abrTrackKbps(this.trackRegistry[trackId]);
+    }
+
+    // Highest layer below the active one whose configured bitrate fits the
+    // measured bandwidth; falls back to one rung down.
+    pickDowngrade(activeIndex, measuredKbps) {
+        if (activeIndex <= 0) return null;
+        if (measuredKbps > 0) {
+            for (let i = activeIndex - 1; i >= 0; i--) {
+                const kbps = this.trackKbps(this.videoTrackIds[i]);
+                if (!kbps || kbps <= measuredKbps) return this.videoTrackIds[i];
+            }
+        }
+        return this.videoTrackIds[activeIndex - 1];
+    }
+
+    // One rung up, only when the probe clears the next layer's bitrate with
+    // headroom. Upgrade discovery requires the probe: the received bitrate is
+    // capped by the active layer, so it cannot reveal unused capacity.
+    pickUpgrade(activeIndex, measuredKbps) {
+        const nextIndex = activeIndex + 1;
+        if (nextIndex >= this.videoTrackIds.length || !(measuredKbps > 0)) return null;
+        const nextKbps = this.trackKbps(this.videoTrackIds[nextIndex]);
+        if (nextKbps > 0 && nextKbps * ABR_CFG.UPGRADE_HEADROOM > measuredKbps) return null;
+        return this.videoTrackIds[nextIndex];
+    }
+
+    // ── bandwidth probe ─────────────────────────────────────────────
+
+    freshProbeKbps(now) {
+        if (!(this.probedKbps > 0)) return 0;
+        // A number from several probe intervals ago describes a different
+        // network state; stop upgrading on it.
+        if (this.lastProbeOkAt && now - this.lastProbeOkAt > ABR_CFG.PROBE_INTERVAL_MS * 4) {
+            return 0;
+        }
+        return this.probedKbps;
+    }
+
+    probeDue(now) {
+        if (!this.isAutoMode) return false;
+        if (this.probeInFlight) return false;
+        if (this.videoTrackIds.length < 2) return false;
+        if (now < this.zeroProbeBackoffUntil) return false;
+        return (now - this.lastProbeAt) >= ABR_CFG.PROBE_INTERVAL_MS;
+    }
+
+    // Fire-and-forget probe refresh. The result is consumed by later ticks.
+    maybeProbe() {
+        const now = abrNow();
+        if (!this.probeDue(now)) return this.probePromise || null;
+
+        this.lastProbeAt = now;
+        this.probeInFlight = true;
+        const urls = abrResolveProbeUrls();
+
+        this.probePromise = (async () => {
+            for (const url of urls) {
+                const kbps = await abrProbeOnce(url);
+                if (kbps && kbps > 0) {
+                    this.probedKbps = kbps;
+                    this.lastProbeOkAt = abrNow();
+                    this.zeroProbeBackoffUntil = 0;
+                    this.lastBandwidthEstimate = Math.round(kbps * 1000);
+                    console.log(`[ABR] bandwidth probe: ${kbps.toFixed(0)} kbps`);
+                    if (this.callbacks.onBandwidthProbe) {
+                        try { this.callbacks.onBandwidthProbe(kbps); } catch (e) {}
+                    }
+                    return kbps;
+                }
+            }
+            // No source answered with a usable body: hold the current layer
+            // and retry after a backoff rather than treating 0 as congested.
+            this.zeroProbeBackoffUntil = abrNow() + ABR_CFG.ZERO_PROBE_BACKOFF_MS;
+            console.warn('[ABR] bandwidth probe unavailable; keeping current layer');
+            return null;
+        })().catch((e) => {
+            console.warn('[ABR] bandwidth probe failed:', e && e.message ? e.message : e);
+            this.zeroProbeBackoffUntil = abrNow() + ABR_CFG.ZERO_PROBE_BACKOFF_MS;
+            return null;
+        }).finally(() => {
+            this.probeInFlight = false;
+        });
+
+        return this.probePromise;
+    }
+
+    // ── decision ────────────────────────────────────────────────────
+
+    issueSwitch(target, reason, now) {
+        if (target === this.currentTrackId) {
+            this.lastDecision = 'hold';
+            return null;
+        }
+        const fromIndex = this.ladderIndex(this.currentTrackId);
+        const targetIndex = this.ladderIndex(target);
+        this.pendingTrackId = target;
+        this.pendingSince = now;
+        this.lastSwitchAt = now;
+        this.fpsLowStreak = 0;
+        this.lastDecision = targetIndex > fromIndex ? 'upgrade' : 'downgrade';
+        this.lastReason = reason;
+        console.log(`[ABR] ${this.lastDecision}: ${this.currentTrackId} -> ${target} ` +
+            `reason=${reason} probe=${Math.round(this.probedKbps)}kbps`);
+        return { targetTrackId: target, reason, decision: this.lastDecision };
+    }
+
+    // Called once per second from updateStats() with the freshly sampled
+    // signals. Returns a switch instruction ({ targetTrackId, reason,
+    // decision }) when the caller should execute one, otherwise null.
+    update(signals) {
+        const s = signals || {};
+        const now = abrNow();
+        const rttMs = Number(s.rttMs) || 0;
+        this.observeRTT(rttMs);
+
+        // Give an in-flight switch a bounded time to be confirmed. Clears the
+        // pending marker after a rejected/lost SELECT_LAYER so ABR keeps
+        // running instead of waiting forever.
+        if (this.pendingTrackId !== null) {
+            if (now - this.pendingSince < ABR_CFG.PENDING_TIMEOUT_MS) {
+                this.lastDecision = 'pending';
+                return null;
+            }
+            this.pendingTrackId = null;
+            this.pendingSince = 0;
+        }
+
+        if (!this.isAutoMode || s.isVideoActive === false) {
+            this.resetCounters();
+            this.lastDecision = this.isAutoMode ? 'inactive' : 'manual';
+            return null;
+        }
+
+        if (this.videoTrackIds.length < 2) {
+            this.lastDecision = 'no_ladder';
+            return null;
+        }
+        const activeIndex = this.ladderIndex(this.currentTrackId);
+        if (activeIndex < 0) {
+            this.lastDecision = 'no_active';
+            return null;
+        }
+
+        if (this.startedAt === 0) this.startedAt = now;
+        if (now - this.startedAt < ABR_CFG.WARMUP_MS) {
+            this.lastDecision = 'warmup';
+            return null;
+        }
+
+        // Refresh the probe in the background; this tick uses the last one.
+        this.maybeProbe();
+
+        const sourceFps = Number(s.sourceFps) || 0;
+        const fps = Number(s.fps) || 0;
+        const lowFpsNow = sourceFps >= ABR_CFG.SOURCE_FPS_MIN && fps > 0 &&
+            fps < sourceFps * ABR_CFG.FPS_LOW_RATIO;
+        this.fpsLowStreak = lowFpsNow ? this.fpsLowStreak + 1 : 0;
+        const fpsLow = this.fpsLowStreak >= ABR_CFG.FPS_LOW_CONFIRMATIONS;
+
+        const lossPct = Number(s.lossPct) || 0;
+        const congested = this.rttCongested(rttMs);
+        const severeLoss = lossPct >= ABR_CFG.LOSS_DOWNGRADE_PCT;
+
+        // 1) Downgrade (or roll back a failed upgrade) - reacts immediately.
+        if (fpsLow || severeLoss || congested) {
+            if (now < this.probationUntil && this.lastUpgradeFrom >= 0 &&
+                this.lastUpgradeFrom !== this.currentTrackId &&
+                this.videoTrackIds.includes(this.lastUpgradeFrom)) {
+                const target = this.lastUpgradeFrom;
+                this.probationUntil = 0;
+                this.backoffUntil = now + ABR_CFG.UPGRADE_BACKOFF_MS;
+                this.lastUpgradeFrom = -1;
+                const reason = (fpsLow ? 'fps_low' : (severeLoss ? 'loss' : 'rtt')) + '_rollback';
+                return this.issueSwitch(target, reason, now);
+            }
+
+            const target = this.pickDowngrade(activeIndex, this.freshProbeKbps(now));
+            if (target === null) {
+                this.lastDecision = 'hold_at_bottom';
+                return null;
+            }
+            const targetIndex = this.ladderIndex(target);
+            const severe = (activeIndex - targetIndex) >= 2;
+            const confirmNeeded = severe
+                ? ABR_CFG.SEVERE_DOWNGRADE_CONFIRMATIONS
+                : ABR_CFG.DOWNGRADE_CONFIRMATIONS;
+            const reason = fpsLow ? 'fps_low' : (severeLoss ? 'loss' : 'rtt');
+
+            this.lossConfirm++;
+            // fpsLow is already confirmed across several ticks; act at once.
+            if (!fpsLow && this.lossConfirm < confirmNeeded) {
+                this.lastDecision = 'downgrade_pending';
+                this.lastReason = reason;
+                return null;
+            }
+            this.lossConfirm = 0;
+            return this.issueSwitch(target, reason, now);
+        }
+        this.lossConfirm = 0;
+
+        // 2) Post-switch cooldown and upgrade damping. lastSwitchAt === 0
+        // means "no switch yet" (performance.now() can itself be under the
+        // cooldown window early in page life), so don't treat it as a switch.
+        if (this.lastSwitchAt > 0 && now - this.lastSwitchAt < ABR_CFG.SWITCH_COOLDOWN_MS) {
+            this.lastDecision = 'cooldown';
+            return null;
+        }
+        if (now < this.backoffUntil) {
+            this.lastDecision = 'upgrade_backoff';
+            return null;
+        }
+        if (now < this.probationUntil) {
+            this.lastDecision = 'probation';
+            return null;
+        }
+
+        // 3) Upgrades require a clean link.
+        if (!this.rttStable(rttMs) || lossPct > ABR_CFG.LOSS_UPGRADE_PCT) {
+            this.upgradeConfirm = 0;
+            this.probeLowConfirm = 0;
+            this.lastDecision = 'hold';
+            return null;
+        }
+
+        const probeKbps = this.freshProbeKbps(now);
+        if (probeKbps > 0) {
+            const currentKbps = this.trackKbps(this.currentTrackId);
+            if (currentKbps > 0 && probeKbps < currentKbps * ABR_CFG.BITRATE_DOWN_FACTOR) {
+                const target = this.pickDowngrade(activeIndex, probeKbps);
+                if (target !== null) {
+                    if (this.probeLowTarget !== target) {
+                        this.probeLowConfirm = 0;
+                        this.probeLowTarget = target;
+                    }
+                    this.probeLowConfirm++;
+                    const targetIndex = this.ladderIndex(target);
+                    const severe = (activeIndex - targetIndex) >= 2;
+                    const confirmNeeded = severe
+                        ? ABR_CFG.SEVERE_DOWNGRADE_CONFIRMATIONS
+                        : ABR_CFG.DOWNGRADE_CONFIRMATIONS;
+                    if (this.probeLowConfirm < confirmNeeded) {
+                        this.lastDecision = 'downgrade_pending';
+                        this.lastReason = 'probe_low';
+                        return null;
+                    }
+                    this.probeLowConfirm = 0;
+                    this.probeLowTarget = null;
+                    return this.issueSwitch(target, 'probe_low', now);
+                }
+            }
+            this.probeLowConfirm = 0;
+            this.probeLowTarget = null;
+
+            const upgradeTarget = this.pickUpgrade(activeIndex, probeKbps);
+            if (upgradeTarget !== null) {
+                this.upgradeConfirm++;
+                if (this.upgradeConfirm >= ABR_CFG.UPGRADE_CONFIRMATIONS) {
+                    this.upgradeConfirm = 0;
+                    this.lastUpgradeFrom = this.currentTrackId;
+                    this.probationUntil = now + ABR_CFG.UPGRADE_PROBATION_MS;
+                    return this.issueSwitch(upgradeTarget, 'bandwidth', now);
+                }
+                this.lastDecision = 'upgrade_pending';
+                return null;
+            }
+            this.upgradeConfirm = 0;
+        }
+
+        this.lastDecision = 'hold';
+        this.lastReason = '';
+        return null;
     }
 }
 
