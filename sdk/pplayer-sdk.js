@@ -910,19 +910,20 @@ let activeEdgeNodeName = '';
 let playbackRace = null;
 let playRequestAbortController = null;
 let lastStats = { videoBytes: 0, audioBytes: 0, timestamp: 0 };
-// Client-side FPS guard: the server ABR is driven by loss/RTT, but a device
-// can fail to decode a layer that the network carries fine. When decoded FPS
-// stays below 20 for a few consecutive 1s samples, ask the server to move one
-// quality step down. This deliberately leaves ABR auto mode (reason
-// "client_fps_low"), so the server does not immediately push the same layer
-// back up; if the lower layer is still below 20 the guard keeps stepping down
-// on its cooldown. The user can re-select Auto from the quality selector.
-const FPS_DOWNGRADE_THRESHOLD = 20;
-const FPS_DOWNGRADE_CONFIRMATIONS = 3;
-const FPS_DOWNGRADE_COOLDOWN_MS = 10000;
-const FPS_DOWNGRADE_MIN_AFTER_FIRST_FRAME_MS = 5000;
+// Client low-FPS reporting: layer selection is server-side, but the browser is
+// the only side that sees decoded frames, so it accumulates "decoded FPS
+// stayed below the threshold" and reports a single rising edge through
+// LATENCY_REPORT.fps_low. The server ABR then decides whether to downgrade.
+// sourceFps >= threshold is required so a low-framerate source (e.g. 15fps)
+// that decodes at its own rate is never mistaken for a decode shortfall.
+const FPS_LOW_THRESHOLD = 24;
+const FPS_LOW_CONFIRMATIONS = 3;
+const FPS_LOW_RECOVER_CONFIRMATIONS = 3;
+const FPS_LOW_MIN_AFTER_FIRST_FRAME_MS = 5000;
 let lowFpsSamples = 0;
-let lastFpsDowngradeAt = 0;
+let lowFpsRecoverSamples = 0;
+let fpsLowLatched = false;
+let fpsLowReportPending = false;
 let initialStart720Applied = false;
 let sdkLastPlayOptions = null;
 let pendingQualityTarget = null;
@@ -1177,6 +1178,12 @@ let firstFrameAt = null;
 // learn about the first frame only from updateStats' 1Hz fps sample, which could
 // report a load time up to ~1s later than the actual first presented frame.
 let firstFrameCallbackArmed = false;
+// The edge path holds the media stream back until the connect-time RTT check
+// has decided whether this WHEP session stays on UDP or is re-negotiated over
+// TCP. Without this, a degraded UDP session shows a frame (and then restarts)
+// before the TCP verdict, which looks like playback opening twice.
+let edgeMediaAttachAllowed = false;
+let pendingEdgeMediaStream = null;
 let activePlayConfig = null;
 let playReportIpv4 = '';
 
@@ -1243,6 +1250,17 @@ function armFirstVideoFrameCallback(generation) {
             reportPlayOutcome(activePlayConfig, activePlaybackPathName || 'edge');
         }
     });
+}
+
+// Put the edge session on screen once the connect-time RTT check has decided
+// not to replace it with a TCP-only one. Calling this only after that verdict
+// is what makes a UDP->TCP fallback look like a single startup instead of a
+// brief first playback followed by a restart.
+function attachEdgeMedia(stream, generation) {
+    if (generation !== readerGeneration || !stream) return;
+    pendingEdgeMediaStream = null;
+    if (video.srcObject !== stream) video.srcObject = stream;
+    armFirstVideoFrameCallback(generation);
 }
 
 // ── Viewer session tracking (console "online pull" list) ──────────────────
@@ -1390,52 +1408,49 @@ function switchMediaTrack(trackId, reason) {
     controlClient.selectLayer(trackId, reason);
 }
 
-function maybeSwitchQualityForLowFps(fps, sourceFps, isVideoActive) {
-    if (!isVideoActive || !firstFrameDecoded || !abrEngine) {
+function trackClientFpsForReport(fps, sourceFps, isVideoActive) {
+    if (!abrEngine) return;
+    // Only automatic mode is server-driven; manual selection is authoritative
+    // and must never be overridden by this signal (nor reported against).
+    if (!isVideoActive || !abrEngine.isAutoMode) {
         lowFpsSamples = 0;
+        lowFpsRecoverSamples = 0;
+        fpsLowLatched = false;
+        fpsLowReportPending = false;
         return;
     }
-    // Manual layer selection is authoritative: the low-FPS guard must never
-    // override a layer the user picked by hand (it used to, which is why a
-    // manual 720p choice kept getting bounced back to 360p).
-    if (!abrEngine.isAutoMode) {
-        lowFpsSamples = 0;
-        return;
-    }
-    // Give the decoder a few seconds after the first frame; startup frames and
+    // Ignore the first few seconds after the first frame: startup frames and
     // the first keyframe often make the 1Hz sample read low.
-    if (firstFrameAt && Date.now() - firstFrameAt < FPS_DOWNGRADE_MIN_AFTER_FIRST_FRAME_MS) {
+    if (firstFrameAt && Date.now() - firstFrameAt < FPS_LOW_MIN_AFTER_FIRST_FRAME_MS) {
         lowFpsSamples = 0;
         return;
     }
-    // fps=0 is a decode stall, handled by StallWatchdog, not a quality choice.
-    if (!(fps > 0 && fps < FPS_DOWNGRADE_THRESHOLD)) {
-        lowFpsSamples = 0;
+    // Only a decode shortfall counts: the source must itself be delivering at
+    // least the threshold, otherwise (e.g. a 15fps source decoded at 15fps)
+    // lowering the layer cannot raise FPS and must not report.
+    if (fps > 0 && fps < FPS_LOW_THRESHOLD && sourceFps >= FPS_LOW_THRESHOLD) {
+        lowFpsSamples++;
+        lowFpsRecoverSamples = 0;
+        if (lowFpsSamples >= FPS_LOW_CONFIRMATIONS && !fpsLowLatched) {
+            fpsLowLatched = true;
+            fpsLowReportPending = true;
+            console.log(`[ABR] Decoded FPS ${fps.toFixed(1)} < ${FPS_LOW_THRESHOLD} for ${FPS_LOW_CONFIRMATIONS}s (source ${sourceFps.toFixed(1)}fps); reporting fps_low to server`);
+        }
         return;
     }
-    // Only a decode shortfall is a reason to drop quality: if the incoming
-    // source itself runs below the threshold (e.g. a 15fps stream decoding at
-    // 15fps), lowering the layer cannot raise fps and must not trigger.
-    if (!(sourceFps >= FPS_DOWNGRADE_THRESHOLD)) {
-        lowFpsSamples = 0;
-        return;
-    }
-    if (Date.now() - lastFpsDowngradeAt < FPS_DOWNGRADE_COOLDOWN_MS) {
-        return;
-    }
-
-    lowFpsSamples++;
-    if (lowFpsSamples < FPS_DOWNGRADE_CONFIRMATIONS) return;
-
     lowFpsSamples = 0;
-    const ids = abrEngine.videoTrackIds || [];
-    const idx = ids.indexOf(abrEngine.currentTrackId);
-    if (idx <= 0) return; // already on the lowest layer, or unknown active track
-
-    const target = ids[idx - 1];
-    lastFpsDowngradeAt = Date.now();
-    console.log(`[ABR] Decoded FPS ${fps.toFixed(1)} < ${FPS_DOWNGRADE_THRESHOLD} for ${FPS_DOWNGRADE_CONFIRMATIONS}s (source ${sourceFps.toFixed(1)}fps), switching quality ${abrEngine.currentTrackId} -> ${target}`);
-    switchMediaTrack(target, 'client_fps_low');
+    // Re-arm only after FPS has recovered for several samples; fps<=0 is a
+    // decode stall handled by StallWatchdog, not a recovery sample.
+    if (fps >= FPS_LOW_THRESHOLD) {
+        lowFpsRecoverSamples++;
+        if (lowFpsRecoverSamples >= FPS_LOW_RECOVER_CONFIRMATIONS) {
+            fpsLowLatched = false;
+            fpsLowReportPending = false;
+            lowFpsRecoverSamples = 0;
+        }
+    } else {
+        lowFpsRecoverSamples = 0;
+    }
 }
 
 function maybeApplyInitial720(tracks, activeId) {
@@ -1874,11 +1889,15 @@ function negotiateAndConnect(generation, url, codecType) {
             if (generation !== readerGeneration) return;
             if (evt.track.kind === 'video' || evt.track.kind === 'audio') {
                 if (evt.streams[0]) currentMediaStream = evt.streams[0];
-                if (video.srcObject !== evt.streams[0]) {
-                    video.srcObject = evt.streams[0];
+                const stream = evt.streams[0] || currentMediaStream;
+                if (stream) {
+                    if (edgeMediaAttachAllowed) {
+                        attachEdgeMedia(stream, generation);
+                    } else {
+                        pendingEdgeMediaStream = stream;
+                    }
                 }
             }
-            if (evt.track.kind === 'video') armFirstVideoFrameCallback(generation);
             // The reader above enables encodedInsertableStreams for the SEI
             // reader. Chrome then holds the audio receiver too until something
             // consumes its encoded stream - attach the passthrough or audio is
@@ -1970,6 +1989,9 @@ function negotiateAndConnect(generation, url, codecType) {
             if (window.parent) window.parent.postMessage('mmxplayer-connected', '*');
             if (sessionId) {
                 openControlClientWhenConnected(reader, url, sessionId, generation);
+            } else {
+                edgeMediaAttachAllowed = true;
+                if (pendingEdgeMediaStream) attachEdgeMedia(pendingEdgeMediaStream, generation);
             }
         }
     });
@@ -1987,20 +2009,46 @@ function negotiateAndConnect(generation, url, codecType) {
 // pair actually carrying media (types, protocol, addresses, RTT). The
 // server-side log shows a host/fe80 local candidate and a ~370ms RTCP RTT,
 // which this confirms or refutes from the viewer's own stats.
-// Logs the selected ICE pair and resolves its measured RTT in milliseconds
-// (or null when it can't be read). The RTT drives the TCP fallback below.
+// Resolve the candidate pair the transport is actually using, in order of
+// trust: the transport's own selectedCandidatePairId is authoritative; the
+// non-standard selected flag and then nomination are fallbacks. Both the
+// startup log/fallback and the per-second media-RTT check must use the same
+// pair, otherwise the connect-time check can accept a nominated TCP pair while
+// media runs over a degraded UDP pair and the TCP fallback fires later, as a
+// second WHEP session.
+function selectedCandidatePairOf(stats) {
+    const byId = new Map();
+    let selectedPairId = null;
+    let selectedPair = null;
+    let nominatedPair = null;
+    let anySucceededPair = null;
+
+    stats.forEach((r) => {
+        byId.set(r.id, r);
+        if (r.type === 'transport' && r.selectedCandidatePairId) {
+            selectedPairId = r.selectedCandidatePairId;
+        }
+        if (r.type === 'candidate-pair') {
+            if (r.selected === true) selectedPair = r;
+            if (r.nominated === true && r.state === 'succeeded') nominatedPair = r;
+            if (r.state === 'succeeded') anySucceededPair = r;
+        }
+    });
+
+    return {
+        pair: (selectedPairId && byId.get(selectedPairId)) ||
+            selectedPair || nominatedPair || anySucceededPair || null,
+        byId,
+    };
+}
+
+// Logs the selected ICE pair and resolves its measured RTT and protocol. The
+// RTT drives the TCP fallback below; the protocol keeps a session that is
+// already on TCP from being restarted onto TCP again.
 function logSelectedCandidatePair(pc) {
     if (!pc || typeof pc.getStats !== 'function') return Promise.resolve(null);
     return pc.getStats().then((stats) => {
-        const byId = new Map();
-        stats.forEach((r) => byId.set(r.id, r));
-        let pair = null;
-        stats.forEach((r) => {
-            if (r.type === 'candidate-pair' && r.state === 'succeeded' &&
-                (r.nominated === true || r.selected === true)) {
-                pair = r;
-            }
-        });
+        const { pair, byId } = selectedCandidatePairOf(stats);
         if (!pair) return null;
         const local = byId.get(pair.localCandidateId);
         const remote = byId.get(pair.remoteCandidateId);
@@ -2009,12 +2057,13 @@ function logSelectedCandidatePair(pc) {
             : '?';
         const rttMs = pair.currentRoundTripTime != null
             ? Math.round(pair.currentRoundTripTime * 1000) : null;
+        const protocol = String((remote && remote.protocol) || (local && local.protocol) || '').toLowerCase();
         console.log('[ICE] selected pair:', {
             local: label(local),
             remote: label(remote),
             currentRoundTripTimeMs: rttMs,
         });
-        return rttMs;
+        return { rttMs, protocol };
     }).catch(() => null);
 }
 
@@ -2030,16 +2079,25 @@ function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) 
         // attempted once: reader.forceTcp latches, so a slow TCP path is
         // accepted rather than looping.
         const threshold = clampTcpFallbackRtt(sdkConfig().tcpFallbackRttMs);
-        logSelectedCandidatePair(pc).then((rttMs) => {
+        logSelectedCandidatePair(pc).then((selected) => {
             if (generation !== readerGeneration || reader !== activePlaybackPath) return;
-            if (rttMs !== null && rttMs > threshold && !reader.forceTcp &&
+            const rttMs = selected ? selected.rttMs : null;
+            const protocol = selected ? selected.protocol : '';
+            if (rttMs !== null && rttMs > threshold && protocol === 'udp' && !reader.forceTcp &&
                 reader.lastAnswerHasTcp === true &&
                 typeof reader.restartWithTcp === 'function') {
-                console.warn(`[ICE] selected-pair RTT ${rttMs}ms > ${threshold}ms; re-negotiating this session over TCP`);
+                console.warn(`[ICE] selected-pair RTT ${rttMs}ms > ${threshold}ms on UDP; re-negotiating this session over TCP`);
                 markTcpPreferred(whepHost(reader.conf && reader.conf.url));
+                // Do not reveal this session: the TCP-only re-negotiation is
+                // about to replace it. Only the replacement reaches the screen.
+                pendingEdgeMediaStream = null;
                 reader.restartWithTcp();
                 return;
             }
+            // Keep this session: release the media that arrived while the RTT
+            // verdict was pending.
+            edgeMediaAttachAllowed = true;
+            if (pendingEdgeMediaStream) attachEdgeMedia(pendingEdgeMediaStream, generation);
             initControlClient(whepUrl, sessionId);
         });
     };
@@ -2093,6 +2151,8 @@ function resetSessionState() {
     firstFrameDecoded = false;
     mediaRttHighStreak = 0;
     firstFrameCallbackArmed = false;
+    edgeMediaAttachAllowed = false;
+    pendingEdgeMediaStream = null;
     lastP2PDelayMs = null;
     lastP2PDelayAt = 0;
     lastP2PDelaySource = null;
@@ -2102,7 +2162,9 @@ function resetSessionState() {
     p2pSeiZeroDecodeStreak = 0;
     p2pSeiWatchdogTrip = null;
     lowFpsSamples = 0;
-    lastFpsDowngradeAt = 0;
+    lowFpsRecoverSamples = 0;
+    fpsLowLatched = false;
+    fpsLowReportPending = false;
     initialStart720Applied = false;
     negotiatedCodecs = { audio: null, video: null };
     hevcFallbackUsed = false;
@@ -3102,25 +3164,11 @@ async function updateStats() {
         // Candidate pairs: a browser keeps every pair that ever reached
         // "succeeded" - e.g. the UDP media path plus a backup TCP/IPv6 one -
         // and only the pair the transport actually selected carries media.
-        // Taking the last succeeded pair reported by forEach showed that
-        // backup's RTT (a 377ms pair) instead of the ~36ms path in use.
-        // Resolve the selected pair explicitly, in order of trust.
-        let selectedPairId = null;
-        let selectedPair = null;
-        let nominatedPair = null;
-        let anySucceededPair = null;
-
+        // Resolve it exactly like the connect-time fallback does
+        // (selectedCandidatePairOf) so both read the same pair.
         stats.forEach(report => {
             if (report.type === 'inbound-rtp' && report.kind === 'video') videoStats = report;
             if (report.type === 'inbound-rtp' && report.kind === 'audio') audioStats = report;
-            if (report.type === 'transport' && report.selectedCandidatePairId) {
-                selectedPairId = report.selectedCandidatePairId;
-            }
-            if (report.type === 'candidate-pair') {
-                if (report.selected === true) selectedPair = report;
-                if (report.nominated === true && report.state === 'succeeded') nominatedPair = report;
-                if (report.state === 'succeeded') anySucceededPair = report;
-            }
             // [新增] 收集 codec 信息
             // Only present once media has flowed on that track; see
             // negotiatedCodecs above for why that isn't enough on its own.
@@ -3129,8 +3177,7 @@ async function updateStats() {
             }
         });
 
-        networkStats = (selectedPairId && stats.get(selectedPairId)) ||
-            selectedPair || nominatedPair || anySucceededPair;
+        networkStats = selectedCandidatePairOf(stats).pair;
 
         // --- 计算实时指标 ---
         let videoKbps = 0;
@@ -3237,7 +3284,7 @@ async function updateStats() {
             }
         }
         if (firstFrameDecoded) {
-            maybeSwitchQualityForLowFps(fps, sourceFps, isVideoActive);
+            trackClientFpsForReport(fps, sourceFps, isVideoActive);
             stallWatchdog.update(videoKbps, fps, isVideoActive);
         }
 
@@ -3387,6 +3434,10 @@ async function updateStats() {
         if (controlClient && controlClient.ws && controlClient.ws.readyState === WebSocket.OPEN) {
             const loss = currentPacketLoss;
             const fpsVal = videoStats?.framesPerSecond || 0;
+            // fps_low is a one-shot rising edge: the client accumulates the
+            // low-FPS condition and reports it once, then waits for recovery.
+            const fpsLowReport = fpsLowReportPending;
+            fpsLowReportPending = false;
 
             controlClient.sendLatencyReport({
                 rtt_ms: rttMs ?? 0,
@@ -3402,6 +3453,8 @@ async function updateStats() {
                 audio_loss_pct: lossRatePct(lossTotals.audioLost, lossTotals.audioRecv) ?? 0,
                 video_loss_pct: lossRatePct(lossTotals.videoLost, lossTotals.videoRecv) ?? 0,
                 fps: fpsVal,
+                source_fps: sourceFps || 0,
+                fps_low: fpsLowReport,
                 estimated_e2e_ms: estimatedP2PDelayMs
             });
         }
@@ -4252,6 +4305,8 @@ class MMXControlClient {
                 audio_loss_pct: stats.audio_loss_pct || 0,
                 video_loss_pct: stats.video_loss_pct || 0,
                 fps: stats.fps || 0,
+                source_fps: stats.source_fps || 0,
+                fps_low: stats.fps_low === true,
                 estimated_e2e_ms: stats.estimated_e2e_ms || 0
             }
         };
