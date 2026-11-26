@@ -4852,17 +4852,17 @@ __modules["/abr-engine.mjs"] = function (module, exports, __require) {
 
 const ABR_CFG = {
     WARMUP_MS: 15000,
-    // Slower than before (closer to the reference abrplayer's 50s): the probe
-    // is noisy on a real last-mile link, and switching every few seconds made
-    // the ladder visibly ping-pong 720 <-> 1080 <-> 1440.
-    SWITCH_COOLDOWN_MS: 30000,
+    // One probe interval. Long enough that a switching decision is not made
+    // on every 1Hz tick, short enough to react when the link actually changes.
+    SWITCH_COOLDOWN_MS: 12000,
     PROBE_INTERVAL_MS: 12000,
     PROBE_TIMEOUT_MS: 5000,
     // A probe sample older than this is no longer trusted for decisions.
     PROBE_STALE_MS: 45000,
-    // Rolling median over this many probe samples; one spike/dip must not
-    // move the ladder.
-    PROBE_HISTORY: 5,
+    // Rolling window for the downgrade median. Kept short (3) so a recovered
+    // link is not held down by old low samples; upgrades are even faster (see
+    // freshProbeUpKbps - the best of the last two samples).
+    PROBE_HISTORY: 3,
     // Stop the probe after this much data (mirrors the reference's 120KB cap);
     // a partial read of at least 1KB still counts so a slow link reports
     // something rather than "unavailable".
@@ -4879,18 +4879,22 @@ const ABR_CFG = {
     RTT_STABLE_MIN_MS: 20,
     RTT_WINDOW_SAMPLES: 10,
 
-    UPGRADE_HEADROOM: 1.20,
+    // Small margin: preferring a slightly higher layer that probation can roll
+    // back is better than sitting one rung low on a link that clearly fits.
+    UPGRADE_HEADROOM: 1.05,
     // Layer bitrates in TRACKS_INFO are display approximations from ppmmx
     // layerDefaults, not the publisher's real encoder rates. Once a layer has
     // been active its measured received bitrate is used instead; for a rung we
     // have not played yet, assume it costs this much more than the current
     // measured one.
-    LAYER_BITRATE_RATIO: 1.5,
+    LAYER_BITRATE_RATIO: 1.35,
     LAYER_SETTLE_MS: 5000,
     // Probe-driven changes are confirmed over probe samples (12s apart), not
-    // over 1Hz update ticks.
-    PROBE_UPGRADE_CONFIRMATIONS: 2,
-    PROBE_DOWNGRADE_CONFIRMATIONS: 3,
+    // over 1Hz update ticks. Upgrades use only the latest sample (the
+    // probation/rollback catches a bad trial); downgrades need two agreeing
+    // samples, so a single noisy dip does not cost quality.
+    PROBE_UPGRADE_CONFIRMATIONS: 1,
+    PROBE_DOWNGRADE_CONFIRMATIONS: 2,
     UPGRADE_PROBATION_MS: 15000,
     UPGRADE_BACKOFF_MS: 90000,
 
@@ -5266,11 +5270,25 @@ class ABREngine {
             : (values[mid - 1] + values[mid]) / 2;
     }
 
+    // Downgrade signal: the latest sample. Confirmations require two in a row,
+    // so a single dip cannot lower quality, while a recovered sample stops the
+    // downgrade immediately.
     freshProbeKbps(now) {
         if (!(this.probeHistory.length > 0)) return 0;
         const latest = this.probeHistory[this.probeHistory.length - 1];
         if (now - latest.at > ABR_CFG.PROBE_STALE_MS) return 0;
-        return this.probeMedianKbps(now);
+        return latest.kbps;
+    }
+
+    // Upgrade signal: the best of the two freshest samples. A link that has
+    // genuinely recovered should not wait several probe cycles for old low
+    // samples to age out; a trial that does not fit is rolled back through the
+    // probation/backoff path.
+    freshProbeUpKbps(now) {
+        const recent = this.probeHistory.filter((sample) =>
+            now - sample.at <= ABR_CFG.PROBE_STALE_MS);
+        if (recent.length === 0) return 0;
+        return Math.max(...recent.slice(-2).map((sample) => sample.kbps));
     }
 
     probeDue(now) {
@@ -5468,17 +5486,19 @@ class ABREngine {
             return null;
         }
 
-        const probeKbps = this.freshProbeKbps(now);
-        if (probeKbps > 0) {
+        const probeDownKbps = this.freshProbeKbps(now);
+        const probeUpKbps = this.freshProbeUpKbps(now);
+        if (probeDownKbps > 0 || probeUpKbps > 0) {
             const newProbeSample = this.lastProbeSampleAt > 0 &&
                 this.lastProbeSampleAt !== this.lastProbeSampleUsedAt;
             const currentCost = this.layerCostKbps(this.currentTrackId, activeIndex) ||
                 this.trackKbps(this.currentTrackId);
 
-            // Probe low: only ever step one rung, and only after several
-            // consecutive samples agree. A single 300kbps blip used to jump
+            // Probe low: only ever step one rung, and only after two
+            // consecutive low samples. A single 300kbps blip used to jump
             // 1440 -> 720.
-            if (currentCost > 0 && probeKbps < currentCost * ABR_CFG.BITRATE_DOWN_FACTOR) {
+            if (probeDownKbps > 0 && currentCost > 0 &&
+                probeDownKbps < currentCost * ABR_CFG.BITRATE_DOWN_FACTOR) {
                 const target = this.stepDownTarget(activeIndex);
                 if (target !== null) {
                     if (this.probeLowTarget !== target) {
@@ -5502,13 +5522,13 @@ class ABREngine {
             this.probeLowConfirm = 0;
             this.probeLowTarget = null;
 
-            // Upgrade: one rung, with the next rung's estimated cost (measured
-            // when known) plus headroom, confirmed over two probe samples.
+            // Upgrade: one rung, using the best of the two freshest samples.
+            // A trial that does not fit is rolled back by probation.
             const nextIndex = activeIndex + 1;
-            if (nextIndex < this.videoTrackIds.length) {
+            if (nextIndex < this.videoTrackIds.length && probeUpKbps > 0) {
                 const nextId = this.videoTrackIds[nextIndex];
                 const nextCost = this.layerCostKbps(nextId, activeIndex);
-                if (nextCost > 0 && probeKbps >= nextCost * ABR_CFG.UPGRADE_HEADROOM) {
+                if (nextCost > 0 && probeUpKbps >= nextCost * ABR_CFG.UPGRADE_HEADROOM) {
                     if (newProbeSample) {
                         this.upgradeConfirm++;
                         this.lastProbeSampleUsedAt = this.lastProbeSampleAt;
