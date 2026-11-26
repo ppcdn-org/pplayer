@@ -4852,9 +4852,17 @@ __modules["/abr-engine.mjs"] = function (module, exports, __require) {
 
 const ABR_CFG = {
     WARMUP_MS: 15000,
-    SWITCH_COOLDOWN_MS: 5000,
+    // Slower than before (closer to the reference abrplayer's 50s): the probe
+    // is noisy on a real last-mile link, and switching every few seconds made
+    // the ladder visibly ping-pong 720 <-> 1080 <-> 1440.
+    SWITCH_COOLDOWN_MS: 30000,
     PROBE_INTERVAL_MS: 12000,
     PROBE_TIMEOUT_MS: 5000,
+    // A probe sample older than this is no longer trusted for decisions.
+    PROBE_STALE_MS: 45000,
+    // Rolling median over this many probe samples; one spike/dip must not
+    // move the ladder.
+    PROBE_HISTORY: 5,
     // Stop the probe after this much data (mirrors the reference's 120KB cap);
     // a partial read of at least 1KB still counts so a slow link reports
     // something rather than "unavailable".
@@ -4872,9 +4880,17 @@ const ABR_CFG = {
     RTT_WINDOW_SAMPLES: 10,
 
     UPGRADE_HEADROOM: 1.20,
-    DOWNGRADE_CONFIRMATIONS: 3,
-    SEVERE_DOWNGRADE_CONFIRMATIONS: 1,
-    UPGRADE_CONFIRMATIONS: 1,
+    // Layer bitrates in TRACKS_INFO are display approximations from ppmmx
+    // layerDefaults, not the publisher's real encoder rates. Once a layer has
+    // been active its measured received bitrate is used instead; for a rung we
+    // have not played yet, assume it costs this much more than the current
+    // measured one.
+    LAYER_BITRATE_RATIO: 1.5,
+    LAYER_SETTLE_MS: 5000,
+    // Probe-driven changes are confirmed over probe samples (12s apart), not
+    // over 1Hz update ticks.
+    PROBE_UPGRADE_CONFIRMATIONS: 2,
+    PROBE_DOWNGRADE_CONFIRMATIONS: 3,
     UPGRADE_PROBATION_MS: 15000,
     UPGRADE_BACKOFF_MS: 90000,
 
@@ -5019,6 +5035,12 @@ class ABREngine {
         this.probeInFlight = false;
         this.zeroProbeBackoffUntil = 0;
         this.probePromise = null;
+        this.probeHistory = [];
+        this.lastProbeSampleAt = 0;
+        this.lastProbeSampleUsedAt = 0;
+        this.measuredKbpsByTrack = {};
+        this.lastLadderKey = '';
+        this.layerSettledAt = 0;
 
         this.lastDecision = 'idle';
         this.lastReason = '';
@@ -5026,7 +5048,6 @@ class ABREngine {
     }
 
     resetCounters() {
-        this.lossConfirm = 0;
         this.probeLowConfirm = 0;
         this.probeLowTarget = null;
         this.upgradeConfirm = 0;
@@ -5037,6 +5058,7 @@ class ABREngine {
     // server hasn't told us which one is active.
     setTracks(tracks, activeId, currentVideoWidth = 0) {
         const hadTracks = this.videoTrackIds.length > 0;
+        const previousActive = this.currentTrackId;
         this.trackRegistry = {};
         this.videoTrackIds = [];
         this.audioTrackId = null;
@@ -5048,6 +5070,14 @@ class ABREngine {
         this.videoTrackIds = [...videos]
             .sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0))
             .map(t => t.id);
+
+        // A changed ladder (publisher restarted with different layers) makes
+        // previously measured per-track costs meaningless.
+        const ladderKey = this.videoTrackIds.join(',');
+        if (this.lastLadderKey !== ladderKey) {
+            this.measuredKbpsByTrack = {};
+            this.lastLadderKey = ladderKey;
+        }
 
         const audioT = tracks.find(t => t.type === 'audio');
         if (audioT) {
@@ -5080,6 +5110,12 @@ class ABREngine {
                 this.currentTrackId = this.videoTrackIds[this.videoTrackIds.length - 1];
                 console.log(`[ABR] Initial track not provided, assuming Highest: ID ${this.currentTrackId}`);
             }
+        }
+
+        // Layer the reader reports as active changed: restart the settle
+        // window used to learn its real received bitrate.
+        if (this.currentTrackId !== previousActive) {
+            this.layerSettledAt = abrNow();
         }
 
         // First time a ladder appears: start the warmup window now, not at
@@ -5116,6 +5152,9 @@ class ABREngine {
         this.currentTrackId = trackId;
         this.pendingTrackId = null;
         this.pendingSince = 0;
+        this.layerSettledAt = abrNow();
+        this.probeLowConfirm = 0;
+        this.probeLowTarget = null;
     }
 
     // The ABR loop that used to drive this is gone from ppmmx, so the server's
@@ -5189,40 +5228,49 @@ class ABREngine {
         return abrTrackKbps(this.trackRegistry[trackId]);
     }
 
-    // Highest layer below the active one whose configured bitrate fits the
-    // measured bandwidth; falls back to one rung down.
-    pickDowngrade(activeIndex, measuredKbps) {
-        if (activeIndex <= 0) return null;
-        if (measuredKbps > 0) {
-            for (let i = activeIndex - 1; i >= 0; i--) {
-                const kbps = this.trackKbps(this.videoTrackIds[i]);
-                if (!kbps || kbps <= measuredKbps) return this.videoTrackIds[i];
-            }
-        }
-        return this.videoTrackIds[activeIndex - 1];
+    // One rung down, or null at the bottom. Downgrades step rather than jump
+    // to a measured target: the reported bitrates are approximations, so a
+    // multi-rung jump based on them can skip past a perfectly usable layer.
+    stepDownTarget(activeIndex) {
+        return activeIndex > 0 ? this.videoTrackIds[activeIndex - 1] : null;
     }
 
-    // One rung up, only when the probe clears the next layer's bitrate with
-    // headroom. Upgrade discovery requires the probe: the received bitrate is
-    // capped by the active layer, so it cannot reveal unused capacity.
-    pickUpgrade(activeIndex, measuredKbps) {
-        const nextIndex = activeIndex + 1;
-        if (nextIndex >= this.videoTrackIds.length || !(measuredKbps > 0)) return null;
-        const nextKbps = this.trackKbps(this.videoTrackIds[nextIndex]);
-        if (nextKbps > 0 && nextKbps * ABR_CFG.UPGRADE_HEADROOM > measuredKbps) return null;
-        return this.videoTrackIds[nextIndex];
+    // Best estimate of what a layer costs, in kbps. Measured received bitrate
+    // wins once we have played the layer; otherwise the reported (approx)
+    // value, raised for a not-yet-played rung above the current layer so the
+    // known-low layerDefaults cannot make the next rung look cheap.
+    layerCostKbps(trackId, activeIndex) {
+        const measured = this.measuredKbpsByTrack[trackId] || 0;
+        if (measured > 0) return measured;
+        const reported = this.trackKbps(trackId);
+        const targetIndex = this.ladderIndex(trackId);
+        if (targetIndex > activeIndex && activeIndex >= 0) {
+            const currentMeasured = this.measuredKbpsByTrack[this.currentTrackId] || 0;
+            if (currentMeasured > 0) {
+                return Math.max(reported, currentMeasured * ABR_CFG.LAYER_BITRATE_RATIO);
+            }
+        }
+        return reported;
     }
 
     // ── bandwidth probe ─────────────────────────────────────────────
 
+    probeMedianKbps(now) {
+        const recent = this.probeHistory.filter((sample) =>
+            now - sample.at <= ABR_CFG.PROBE_STALE_MS);
+        if (recent.length === 0) return 0;
+        const values = recent.map((sample) => sample.kbps).sort((a, b) => a - b);
+        const mid = Math.floor(values.length / 2);
+        return (values.length % 2)
+            ? values[mid]
+            : (values[mid - 1] + values[mid]) / 2;
+    }
+
     freshProbeKbps(now) {
-        if (!(this.probedKbps > 0)) return 0;
-        // A number from several probe intervals ago describes a different
-        // network state; stop upgrading on it.
-        if (this.lastProbeOkAt && now - this.lastProbeOkAt > ABR_CFG.PROBE_INTERVAL_MS * 4) {
-            return 0;
-        }
-        return this.probedKbps;
+        if (!(this.probeHistory.length > 0)) return 0;
+        const latest = this.probeHistory[this.probeHistory.length - 1];
+        if (now - latest.at > ABR_CFG.PROBE_STALE_MS) return 0;
+        return this.probeMedianKbps(now);
     }
 
     probeDue(now) {
@@ -5246,11 +5294,20 @@ class ABREngine {
             for (const url of urls) {
                 const kbps = await abrProbeOnce(url);
                 if (kbps && kbps > 0) {
+                    const at = abrNow();
                     this.probedKbps = kbps;
-                    this.lastProbeOkAt = abrNow();
+                    this.lastProbeOkAt = at;
+                    this.lastProbeSampleAt = at;
+                    this.probeHistory.push({ kbps, at });
+                    if (this.probeHistory.length > ABR_CFG.PROBE_HISTORY) {
+                        this.probeHistory = this.probeHistory.slice(
+                            this.probeHistory.length - ABR_CFG.PROBE_HISTORY);
+                    }
                     this.zeroProbeBackoffUntil = 0;
                     this.lastBandwidthEstimate = Math.round(kbps * 1000);
-                    console.log(`[ABR] bandwidth probe: ${kbps.toFixed(0)} kbps`);
+                    const median = this.probeMedianKbps(at);
+                    console.log(`[ABR] bandwidth probe: ${kbps.toFixed(0)} kbps ` +
+                        `(median ${median.toFixed(0)} kbps over ${this.probeHistory.length} samples)`);
                     if (this.callbacks.onBandwidthProbe) {
                         try { this.callbacks.onBandwidthProbe(kbps); } catch (e) {}
                     }
@@ -5300,6 +5357,7 @@ class ABREngine {
         const s = signals || {};
         const now = abrNow();
         const rttMs = Number(s.rttMs) || 0;
+        const videoKbps = Number(s.videoKbps) || 0;
         this.observeRTT(rttMs);
 
         // Give an in-flight switch a bounded time to be confirmed. Clears the
@@ -5350,7 +5408,20 @@ class ABREngine {
         const congested = this.rttCongested(rttMs);
         const severeLoss = lossPct >= ABR_CFG.LOSS_DOWNGRADE_PCT;
 
-        // 1) Downgrade (or roll back a failed upgrade) - reacts immediately.
+        // Learn this layer's real cost from the bytes actually arriving. Only
+        // once the layer has settled (not right after a switch), so ramp-up
+        // and short samples do not become the baseline.
+        if (this.layerSettledAt > 0 && now - this.layerSettledAt >= ABR_CFG.LAYER_SETTLE_MS &&
+            videoKbps > 0 && this.currentTrackId !== this.audioTrackId) {
+            const previous = this.measuredKbpsByTrack[this.currentTrackId] || 0;
+            this.measuredKbpsByTrack[this.currentTrackId] = previous > 0
+                ? previous * 0.75 + videoKbps * 0.25
+                : videoKbps;
+        }
+
+        // 1) Playback signals (loss / RTT / FPS shortfall) - react immediately,
+        // one rung at a time. These describe how the current layer is actually
+        // playing, so they outrank the (noisy) probe.
         if (fpsLow || severeLoss || congested) {
             if (now < this.probationUntil && this.lastUpgradeFrom >= 0 &&
                 this.lastUpgradeFrom !== this.currentTrackId &&
@@ -5363,29 +5434,14 @@ class ABREngine {
                 return this.issueSwitch(target, reason, now);
             }
 
-            const target = this.pickDowngrade(activeIndex, this.freshProbeKbps(now));
+            const target = this.stepDownTarget(activeIndex);
             if (target === null) {
                 this.lastDecision = 'hold_at_bottom';
                 return null;
             }
-            const targetIndex = this.ladderIndex(target);
-            const severe = (activeIndex - targetIndex) >= 2;
-            const confirmNeeded = severe
-                ? ABR_CFG.SEVERE_DOWNGRADE_CONFIRMATIONS
-                : ABR_CFG.DOWNGRADE_CONFIRMATIONS;
             const reason = fpsLow ? 'fps_low' : (severeLoss ? 'loss' : 'rtt');
-
-            this.lossConfirm++;
-            // fpsLow is already confirmed across several ticks; act at once.
-            if (!fpsLow && this.lossConfirm < confirmNeeded) {
-                this.lastDecision = 'downgrade_pending';
-                this.lastReason = reason;
-                return null;
-            }
-            this.lossConfirm = 0;
             return this.issueSwitch(target, reason, now);
         }
-        this.lossConfirm = 0;
 
         // 2) Post-switch cooldown and upgrade damping. lastSwitchAt === 0
         // means "no switch yet" (performance.now() can itself be under the
@@ -5403,7 +5459,8 @@ class ABREngine {
             return null;
         }
 
-        // 3) Upgrades require a clean link.
+        // 3) Probe-driven changes need a clean link and are confirmed over
+        // distinct probe samples (not every 1Hz update tick).
         if (!this.rttStable(rttMs) || lossPct > ABR_CFG.LOSS_UPGRADE_PCT) {
             this.upgradeConfirm = 0;
             this.probeLowConfirm = 0;
@@ -5413,21 +5470,26 @@ class ABREngine {
 
         const probeKbps = this.freshProbeKbps(now);
         if (probeKbps > 0) {
-            const currentKbps = this.trackKbps(this.currentTrackId);
-            if (currentKbps > 0 && probeKbps < currentKbps * ABR_CFG.BITRATE_DOWN_FACTOR) {
-                const target = this.pickDowngrade(activeIndex, probeKbps);
+            const newProbeSample = this.lastProbeSampleAt > 0 &&
+                this.lastProbeSampleAt !== this.lastProbeSampleUsedAt;
+            const currentCost = this.layerCostKbps(this.currentTrackId, activeIndex) ||
+                this.trackKbps(this.currentTrackId);
+
+            // Probe low: only ever step one rung, and only after several
+            // consecutive samples agree. A single 300kbps blip used to jump
+            // 1440 -> 720.
+            if (currentCost > 0 && probeKbps < currentCost * ABR_CFG.BITRATE_DOWN_FACTOR) {
+                const target = this.stepDownTarget(activeIndex);
                 if (target !== null) {
                     if (this.probeLowTarget !== target) {
                         this.probeLowConfirm = 0;
                         this.probeLowTarget = target;
                     }
-                    this.probeLowConfirm++;
-                    const targetIndex = this.ladderIndex(target);
-                    const severe = (activeIndex - targetIndex) >= 2;
-                    const confirmNeeded = severe
-                        ? ABR_CFG.SEVERE_DOWNGRADE_CONFIRMATIONS
-                        : ABR_CFG.DOWNGRADE_CONFIRMATIONS;
-                    if (this.probeLowConfirm < confirmNeeded) {
+                    if (newProbeSample) {
+                        this.probeLowConfirm++;
+                        this.lastProbeSampleUsedAt = this.lastProbeSampleAt;
+                    }
+                    if (this.probeLowConfirm < ABR_CFG.PROBE_DOWNGRADE_CONFIRMATIONS) {
                         this.lastDecision = 'downgrade_pending';
                         this.lastReason = 'probe_low';
                         return null;
@@ -5440,17 +5502,26 @@ class ABREngine {
             this.probeLowConfirm = 0;
             this.probeLowTarget = null;
 
-            const upgradeTarget = this.pickUpgrade(activeIndex, probeKbps);
-            if (upgradeTarget !== null) {
-                this.upgradeConfirm++;
-                if (this.upgradeConfirm >= ABR_CFG.UPGRADE_CONFIRMATIONS) {
-                    this.upgradeConfirm = 0;
-                    this.lastUpgradeFrom = this.currentTrackId;
-                    this.probationUntil = now + ABR_CFG.UPGRADE_PROBATION_MS;
-                    return this.issueSwitch(upgradeTarget, 'bandwidth', now);
+            // Upgrade: one rung, with the next rung's estimated cost (measured
+            // when known) plus headroom, confirmed over two probe samples.
+            const nextIndex = activeIndex + 1;
+            if (nextIndex < this.videoTrackIds.length) {
+                const nextId = this.videoTrackIds[nextIndex];
+                const nextCost = this.layerCostKbps(nextId, activeIndex);
+                if (nextCost > 0 && probeKbps >= nextCost * ABR_CFG.UPGRADE_HEADROOM) {
+                    if (newProbeSample) {
+                        this.upgradeConfirm++;
+                        this.lastProbeSampleUsedAt = this.lastProbeSampleAt;
+                    }
+                    if (this.upgradeConfirm >= ABR_CFG.PROBE_UPGRADE_CONFIRMATIONS) {
+                        this.upgradeConfirm = 0;
+                        this.lastUpgradeFrom = this.currentTrackId;
+                        this.probationUntil = now + ABR_CFG.UPGRADE_PROBATION_MS;
+                        return this.issueSwitch(nextId, 'bandwidth', now);
+                    }
+                    this.lastDecision = 'upgrade_pending';
+                    return null;
                 }
-                this.lastDecision = 'upgrade_pending';
-                return null;
             }
             this.upgradeConfirm = 0;
         }
