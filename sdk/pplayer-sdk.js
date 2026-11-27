@@ -966,6 +966,9 @@ function lossRatePct(lost, received) {
 let previousTrackType = null; // Track if we were in audio-only mode
 let firstFrameDecoded = false; // Set when fps>0 is first seen; only then does the stall watchdog start monitoring
 let lastVideoTrackId = null;
+// Set when SELECT_LAYER is issued; the next video resize reports how long the
+// actual media switch took, which is the part users perceive as "slow".
+let lastLayerSwitchAt = 0;
 // Which codec path (see insertCodecTypeSegment above) the active session is
 // using - drives the status display and tells attachSeiTimestampReader
 // which NAL framing to parse (see sei-timestamp.js).
@@ -1522,7 +1525,11 @@ video.addEventListener('resize', () => {
     lastWidth = w;
     lastHeight = h;
 
-    const msg = `[Video] Resolution Changed: ${w}x${h}`;
+    const elapsed = lastLayerSwitchAt > 0
+        ? ` (${Math.round(performance.now() - lastLayerSwitchAt)}ms after layer switch)`
+        : '';
+    lastLayerSwitchAt = 0;
+    const msg = `[Video] Resolution Changed: ${w}x${h}${elapsed}`;
     console.log(`%c${msg}`, 'background: #222; color: #bada55; font-size: 16px; padding: 4px; border-radius: 4px;');
     // showToast(msg);
 });
@@ -2968,6 +2975,12 @@ function initControlClient(whepUrl, sessionId) {
             // Pause video on audio-only to save bandwidth
             if (id === abrEngine.audioTrackId) {
                 pauseVideoForAudioOnly();
+            } else if (isNowVideo) {
+                // Measure how long the media switch itself takes, and nudge the
+                // jitter buffer so the new keyframe is not stuck behind the old
+                // layer's late frames.
+                lastLayerSwitchAt = performance.now();
+                forceLayerRender(id);
             }
             
             if (!abrEngine.isAutoMode && !layerSelect.disabled) {
@@ -3028,6 +3041,49 @@ function resumeVideoFromAudioOnly() {
         console.log('[Main] Resuming video from audio-only mode');
         video.play().catch(err => console.warn('[Main] Video resume failed:', err));
     }
+}
+
+// A layer switch only becomes visible when the browser decodes the target
+// layer's keyframe. On a saturated link the receiver's jitter buffer can still
+// be holding the old layer's late frames, so the new keyframe waits behind
+// them (the log shows LAYER_SWITCHED immediately but Resolution Changed tens
+// of seconds later). Drop the playout target to 0 for a short window so those
+// late frames are discarded and the new keyframe is rendered as soon as it
+// arrives, then restore the configured buffer.
+let layerSwitchNudgeTimer = null;
+function forceLayerRender(trackId) {
+    const pc = (activePlaybackPath && activePlaybackPath.pc) || (reader && reader.pc);
+    if (!pc || typeof pc.getReceivers !== 'function') return;
+    const track = abrEngine.trackRegistry[trackId];
+    const targetW = Number(track && track.width) || 0;
+    const targetH = Number(track && track.height) || 0;
+    if (!targetW || !targetH) return;
+    if (video.videoWidth === targetW && video.videoHeight === targetH) return;
+
+    let applied = false;
+    for (const receiver of pc.getReceivers()) {
+        // Audio-only receivers keep their buffer; this is about the video
+        // layer's late frames.
+        if (!receiver || !receiver.track || receiver.track.kind !== 'video') continue;
+        try {
+            if ('jitterBufferTarget' in receiver) {
+                receiver.jitterBufferTarget = 0;
+                applied = true;
+            } else if ('playoutDelayHint' in receiver) {
+                receiver.playoutDelayHint = 0;
+                applied = true;
+            }
+        } catch (e) { /* browser may reject the write; ignore */ }
+    }
+    if (!applied) return;
+
+    console.log(`[ABR] Layer switch nudge: playout buffer -> 0 for ` +
+        `${targetW}x${targetH} (was ${video.videoWidth}x${video.videoHeight})`);
+    if (layerSwitchNudgeTimer) clearTimeout(layerSwitchNudgeTimer);
+    layerSwitchNudgeTimer = setTimeout(() => {
+        layerSwitchNudgeTimer = null;
+        try { applyPlayoutBuffer(pc, bufferMs); } catch (e) { /* ignore */ }
+    }, 3000);
 }
 
 function updateLayerSelectUI(tracks, activeId) {
