@@ -5383,7 +5383,7 @@ class ABREngine {
     }
 
     // Thresholds (kbps):
-    //   360 -> 720   when probe > 600;   720 -> 360   when probe < 500
+    //   360 -> 720   when probe > 500;   720 -> 360   when probe < 400
     //   720 -> 1080  when probe > 1600;  1080 -> 720  when probe < 1200
     //   1080 -> 1440 when probe > 3200;  1440 -> 1080 when probe < 2400
     //
@@ -5395,8 +5395,8 @@ class ABREngine {
     // rung at a time. Upgrades always move one rung.
     decideProbeTarget(activeIndex, kbps) {
         const height = this.ladderHeights()[activeIndex] || 0;
-        const downThreshold = { 720: 500, 1080: 1200, 1440: 2400 }[height];
-        const upThreshold = { 360: 600, 720: 1600, 1080: 3200 }[height];
+        const downThreshold = { 720: 400, 1080: 1200, 1440: 2400 }[height];
+        const upThreshold = { 360: 500, 720: 1600, 1080: 3200 }[height];
 
         if (downThreshold && kbps < downThreshold) {
             const urgent = kbps < downThreshold * ABR_CFG.URGENT_DOWNGRADE_RATIO;
@@ -5426,7 +5426,7 @@ class ABREngine {
     // target. Bands mirror the down thresholds above.
     indexOfKbpsBand(kbps) {
         let height = 1440;
-        if (kbps < 500) height = 360;
+        if (kbps < 400) height = 360;
         else if (kbps < 1200) height = 720;
         else if (kbps < 2400) height = 1080;
 
