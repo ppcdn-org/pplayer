@@ -5310,50 +5310,24 @@ class ABREngine {
         });
     }
 
-    // The operator's policy, as absolute bandwidth bands (kbps):
-    //   > 800  -> 720p     < 600  -> 360p
-    //   > 1600 -> 1080p    < 1200 -> 720p
-    //   > 3200 -> 1440p    < 2400 -> 1080p
-    // The upgrade threshold picks the highest rung the link can sustain (so a
-    // low rung can jump straight to 1080/1440); the downgrade threshold picks
-    // the rung the link no longer supports. Between the two thresholds the
-    // current rung holds, which is the hysteresis that stops ping-ponging.
-    // The caller requires two agreeing samples before applying either.
+    // The operator's policy, one rung at a time (no cross-rung jumps):
+    //   360 -> 720   when probe > 600;   720 -> 360   when probe < 500
+    //   720 -> 1080  when probe > 1600;  1080 -> 720  when probe < 1200
+    //   1080 -> 1440 when probe > 3200;  1440 -> 1080 when probe < 2400
+    // Between the two thresholds the current rung holds (hysteresis). The
+    // caller requires two agreeing samples before applying either.
     decideProbeTarget(activeIndex, kbps) {
-        const heights = this.ladderHeights();
-        const indexForHeight = (height) => {
-            let best = -1;
-            let bestDiff = Infinity;
-            for (let i = 0; i < heights.length; i++) {
-                if (!heights[i]) continue;
-                const diff = Math.abs(heights[i] - height);
-                if (diff < bestDiff) { best = i; bestDiff = diff; }
-            }
-            if (best >= 0) return best;
-            if (this.videoTrackIds.length === 4) {
-                return { 360: 0, 720: 1, 1080: 2, 1440: 3 }[height];
-            }
-            return -1;
-        };
+        const height = this.ladderHeights()[activeIndex] || 0;
+        const downThreshold = { 720: 500, 1080: 1200, 1440: 2400 }[height];
+        const upThreshold = { 360: 600, 720: 1600, 1080: 3200 }[height];
 
-        // Downgrade first: only when the target sits below the active rung.
-        let downIndex = -1;
-        if (kbps < 600) downIndex = indexForHeight(360);
-        else if (kbps < 1200) downIndex = indexForHeight(720);
-        else if (kbps < 2400) downIndex = indexForHeight(1080);
-        if (downIndex >= 0 && downIndex < activeIndex) {
-            return { target: this.videoTrackIds[downIndex], direction: 'downgrade' };
+        if (downThreshold && kbps < downThreshold) {
+            const target = this.stepDownTarget(activeIndex);
+            if (target !== null) return { target, direction: 'downgrade' };
         }
-
-        // Upgrade: the highest rung whose own bandwidth requirement is met.
-        const upThresholdByHeight = { 720: 800, 1080: 1600, 1440: 3200 };
-        let upIndex = -1;
-        for (let i = activeIndex + 1; i < this.videoTrackIds.length; i++) {
-            const threshold = upThresholdByHeight[heights[i]];
-            if (threshold && kbps > threshold) upIndex = i;
-        }
-        if (upIndex > activeIndex) {
-            return { target: this.videoTrackIds[upIndex], direction: 'upgrade' };
+        if (upThreshold && kbps > upThreshold) {
+            const next = this.videoTrackIds[activeIndex + 1];
+            if (next !== undefined) return { target: next, direction: 'upgrade' };
         }
         return null;
     }
