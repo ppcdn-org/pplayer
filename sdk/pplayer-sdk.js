@@ -2889,10 +2889,17 @@ function initControlClient(whepUrl, sessionId) {
             // [关键修复] 获取当前视频实际宽度，传给 ABR 引擎用于探测真实初始状态
             const currentVideoWidth = video.videoWidth || 0;
             abrEngine.setTracks(tracks, activeId, currentVideoWidth);
+            // Remember the layer this (possibly brand-new) session is actually
+            // showing BEFORE the temporary audio-only override below. After a
+            // reconnect, the old session's lastVideoTrackId (e.g. 360p) is
+            // stale; MEDIA_STATE's paused->resumed transition restores that
+            // value, which left ABR stuck on the wrong layer and prevented the
+            // new 720p session from ever downgrading again.
+            if (abrEngine.videoTrackIds.includes(abrEngine.currentTrackId)) {
+                lastVideoTrackId = abrEngine.currentTrackId;
+            }
             if (videoPaused && abrEngine.audioTrackId !== null) {
                 abrEngine.currentTrackId = abrEngine.audioTrackId;
-            } else if (activeId !== undefined && activeId !== null) {
-                lastVideoTrackId = activeId;
             }
             
             if (!layerSelect.disabled){
@@ -3542,6 +3549,7 @@ function updateMediaState(state) {
         if (!abrEngine.isAutoMode) layerSelect.value = abrEngine.audioTrackId;
     } else if (abrEngine.currentTrackId === abrEngine.audioTrackId && lastVideoTrackId !== null) {
         abrEngine.currentTrackId = lastVideoTrackId;
+        console.log(`[ABR] Media resumed; current layer -> ${lastVideoTrackId}`);
     }
     const audioOnly = abrEngine.currentTrackId === abrEngine.audioTrackId;
     layerSelect.disabled = videoPaused && !audioOnly;
@@ -5167,7 +5175,9 @@ class ABREngine {
             this.startedAt = abrNow();
         }
 
-        console.log(`[ABR] Tracks loaded. Video IDs (Low->High): ${this.videoTrackIds}, Audio ID: ${this.audioTrackId}`);
+        console.log(`[ABR] Tracks loaded. Video IDs (Low->High): ${this.videoTrackIds}, ` +
+            `Audio ID: ${this.audioTrackId}, active=${activeId}, videoWidth=${currentVideoWidth}, ` +
+            `current=${this.currentTrackId}`);
     }
 
     notifyManualSwitch(trackId) {
