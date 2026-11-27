@@ -1819,6 +1819,48 @@ function ensurePlaybackCodec() {
     return playbackCodecPromise;
 }
 
+// Slow-network fast start: ask the edge to begin on a smaller layer so the
+// first keyframe fits the link. The server honors ?initialHeight= (default
+// 720p); 360p is the lowest video layer in the standard ladder. Override with
+// ?initialHeight=... on the page URL for testing, or 0 to disable.
+function slowNetworkInitialHeight() {
+    try {
+        if (typeof window !== 'undefined') {
+            const override = new URLSearchParams(window.location.search).get('initialHeight');
+            if (override !== null) {
+                const h = Number(override);
+                if (Number.isFinite(h)) return h > 0 ? Math.round(h) : 0;
+            }
+        }
+        const conn = (typeof navigator !== 'undefined')
+            ? (navigator.connection || navigator.mozConnection || navigator.webkitConnection)
+            : null;
+        if (!conn) return 0;
+        const type = String(conn.effectiveType || '').toLowerCase();
+        if (type === 'slow-2g' || type === '2g' || type === '3g') return 360;
+        const downlink = Number(conn.downlink);
+        if (Number.isFinite(downlink) && downlink > 0 && downlink < 2.5) return 360;
+        const rtt = Number(conn.rtt);
+        if (Number.isFinite(rtt) && rtt > 250) return 360;
+    } catch (e) { /* Network Information API is best-effort */ }
+    return 0;
+}
+
+function withInitialHeight(url) {
+    const height = slowNetworkInitialHeight();
+    if (!height) return url;
+    try {
+        const parsed = new URL(url);
+        if (!parsed.searchParams.has('initialHeight')) {
+            parsed.searchParams.set('initialHeight', String(height));
+        }
+        console.log(`[Main] slow network: requesting initial layer ${height}p`);
+        return parsed.toString();
+    } catch (e) {
+        return url;
+    }
+}
+
 // Picks the codec from local decode capability (codec-capability.mjs) and
 // returns the full WHEP URL for the edge stream base. A codec typed in the
 // Stream box (e.g. ".../hevc") takes precedence over capability detection.
@@ -1833,7 +1875,7 @@ async function resolveEdgeWhepUrl(edgeStreamUrl) {
         console.warn('[Main] HEVC requested but this browser cannot decode HEVC; using H264');
         codecType = 'h264';
     }
-    return { url: buildEdgeWhepUrl(edgeStreamUrl, codecType), codecType };
+    return { url: withInitialHeight(buildEdgeWhepUrl(edgeStreamUrl, codecType)), codecType };
 }
 
 // One-shot recovery when the edge rejects a WHEP URL (401/403) - typically
@@ -1948,7 +1990,7 @@ function negotiateAndConnect(generation, url, codecType) {
                 hevcFallbackUsed = true;
                 console.warn('[Main] HEVC negotiation failed, falling back to H264 once:', err);
                 const fallbackUrl = stripCodecTypeSegment(url);
-                negotiateAndConnect(generation, insertCodecTypeSegment(fallbackUrl, 'h264'), 'h264');
+                negotiateAndConnect(generation, withInitialHeight(insertCodecTypeSegment(fallbackUrl, 'h264')), 'h264');
                 return;
             }
 
