@@ -4072,7 +4072,8 @@ function preferUdpSdp(sdp, label) {
         kept.push(line);
     }
     if (dropped > 0) {
-        console.warn(`[${label}] UDP-only: discarded ${dropped} non-UDP candidate(s)`);
+        console.warn(`[${label}] UDP preferred: kept ${udp} UDP candidate(s), ` +
+            `discarded ${dropped} non-UDP (TCP) candidate(s)`);
     }
     return kept.join('\r\n');
 }
@@ -7098,7 +7099,8 @@ function preferUdpSdp(sdp, label) {
         kept.push(line);
     }
     if (dropped > 0) {
-        console.warn(`[${label}] UDP-only: discarded ${dropped} non-UDP candidate(s)`);
+        console.warn(`[${label}] UDP preferred: kept ${udp} UDP candidate(s), ` +
+            `discarded ${dropped} non-UDP (TCP) candidate(s)`);
     }
     return { sdp: kept.join('\r\n'), allowTcp: false };
 }
@@ -8705,7 +8707,8 @@ function preferUdpSdp(sdp, label) {
         kept.push(line);
     }
     if (dropped > 0) {
-        console.warn(`[${label}] UDP-only: discarded ${dropped} non-UDP candidate(s)`);
+        console.warn(`[${label}] UDP preferred: kept ${udp} UDP candidate(s), ` +
+            `discarded ${dropped} non-UDP (TCP) candidate(s)`);
     }
     return { sdp: kept.join('\r\n'), allowTcp: false };
 }
