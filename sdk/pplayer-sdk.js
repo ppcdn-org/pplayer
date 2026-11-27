@@ -4914,7 +4914,8 @@ const ABR_CFG = {
     FPS_LOW_CONFIRMATIONS: 2,
 
     // A switch is made only after this many consecutive probe samples agree
-    // on the same target rung.
+    // on the same target rung. Severe downgrades (2+ rungs below the current
+    // layer) follow tencent-abrplayer and act on the first sample instead.
     TARGET_CONFIRMATIONS: 2,
 
     // Bound on how long a SELECT_LAYER may stay unconfirmed before the engine
@@ -5310,26 +5311,66 @@ class ABREngine {
         });
     }
 
-    // The operator's policy, one rung at a time (no cross-rung jumps):
+    // Thresholds (kbps):
     //   360 -> 720   when probe > 600;   720 -> 360   when probe < 500
     //   720 -> 1080  when probe > 1600;  1080 -> 720  when probe < 1200
     //   1080 -> 1440 when probe > 3200;  1440 -> 1080 when probe < 2400
-    // Between the two thresholds the current rung holds (hysteresis). The
-    // caller requires two agreeing samples before applying either.
+    //
+    // Downgrades follow tencent-abrplayer's selectDowngradeStreamForCurrent:
+    // once the current tier's threshold is breached, target the highest tier
+    // the measured bandwidth can actually sustain. A severe drop therefore
+    // steps straight to the sustainable rung (1440 -> 720) instead of first
+    // selecting a 1080 layer that the link cannot carry; mild drops step one
+    // rung at a time. Upgrades always move one rung.
     decideProbeTarget(activeIndex, kbps) {
         const height = this.ladderHeights()[activeIndex] || 0;
         const downThreshold = { 720: 500, 1080: 1200, 1440: 2400 }[height];
         const upThreshold = { 360: 600, 720: 1600, 1080: 3200 }[height];
 
         if (downThreshold && kbps < downThreshold) {
+            const targetIndex = this.indexOfKbpsBand(kbps);
+            if (targetIndex >= 0 && targetIndex < activeIndex) {
+                return {
+                    target: this.videoTrackIds[targetIndex],
+                    direction: 'downgrade',
+                    severe: (activeIndex - targetIndex) >= 2,
+                };
+            }
             const target = this.stepDownTarget(activeIndex);
-            if (target !== null) return { target, direction: 'downgrade' };
+            if (target !== null) {
+                return { target, direction: 'downgrade', severe: false };
+            }
         }
         if (upThreshold && kbps > upThreshold) {
             const next = this.videoTrackIds[activeIndex + 1];
-            if (next !== undefined) return { target: next, direction: 'upgrade' };
+            if (next !== undefined) {
+                return { target: next, direction: 'upgrade', severe: false };
+            }
         }
         return null;
+    }
+
+    // Highest rung the measured bandwidth can sustain, used for the downgrade
+    // target. Bands mirror the down thresholds above.
+    indexOfKbpsBand(kbps) {
+        let height = 1440;
+        if (kbps < 500) height = 360;
+        else if (kbps < 1200) height = 720;
+        else if (kbps < 2400) height = 1080;
+
+        const heights = this.ladderHeights();
+        let best = -1;
+        let bestDiff = Infinity;
+        for (let i = 0; i < heights.length; i++) {
+            if (!heights[i]) continue;
+            const diff = Math.abs(heights[i] - height);
+            if (diff < bestDiff) { best = i; bestDiff = diff; }
+        }
+        if (best >= 0) return best;
+        if (this.videoTrackIds.length === 4) {
+            return { 360: 0, 720: 1, 1080: 2, 1440: 3 }[height];
+        }
+        return -1;
     }
 
     // ── bandwidth probe ─────────────────────────────────────────────
@@ -5520,10 +5561,16 @@ class ABREngine {
             this.targetConfirmTarget = wanted.target;
             this.targetConfirmCount = 0;
         }
+        // Severe downgrades skip the wait, as in tencent-abrplayer's
+        // severe-downgrade confirm count (1); everything else needs two
+        // agreeing probe samples.
+        const needed = (wanted.direction === 'downgrade' && wanted.severe)
+            ? 1
+            : ABR_CFG.TARGET_CONFIRMATIONS;
         this.targetConfirmCount++;
         this.lastDecision = wanted.direction + '_pending';
         this.lastReason = 'probe';
-        if (this.targetConfirmCount < ABR_CFG.TARGET_CONFIRMATIONS) {
+        if (this.targetConfirmCount < needed) {
             return null;
         }
 
