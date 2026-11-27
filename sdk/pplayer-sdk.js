@@ -963,6 +963,10 @@ let lastVideoTrackId = null;
 // Set when SELECT_LAYER is issued; the next video resize reports how long the
 // actual media switch took, which is the part users perceive as "slow".
 let lastLayerSwitchAt = 0;
+// On a 3G/2G link video is not viable; keep audio playing and suppress video
+// across reconnects until the radio type improves.
+let networkAudioOnly = false;
+let networkAudioOnlyExitTimer = null;
 // Which codec path (see insertCodecTypeSegment above) the active session is
 // using - drives the status display and tells attachSeiTimestampReader
 // which NAL framing to parse (see sei-timestamp.js).
@@ -1819,6 +1823,26 @@ function ensurePlaybackCodec() {
     return playbackCodecPromise;
 }
 
+function networkInformation() {
+    try {
+        if (typeof navigator === 'undefined') return null;
+        return navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// A genuinely slow mobile link (3G/2G). On these, video is not viable even at
+// 360p, so recovery switches to the audio track and stays there until the
+// radio type improves. Slow 4G is NOT included: it still gets video, just
+// started on a small layer.
+function isVerySlowNetwork() {
+    const conn = networkInformation();
+    if (!conn) return false;
+    const type = String(conn.effectiveType || '').toLowerCase();
+    return type === 'slow-2g' || type === '2g' || type === '3g';
+}
+
 // Slow-network fast start: ask the edge to begin on a smaller layer so the
 // first keyframe fits the link. The server honors ?initialHeight= (default
 // 720p); 360p is the lowest video layer in the standard ladder. Override with
@@ -1832,12 +1856,9 @@ function slowNetworkInitialHeight() {
                 if (Number.isFinite(h)) return h > 0 ? Math.round(h) : 0;
             }
         }
-        const conn = (typeof navigator !== 'undefined')
-            ? (navigator.connection || navigator.mozConnection || navigator.webkitConnection)
-            : null;
+        if (isVerySlowNetwork()) return 360;
+        const conn = networkInformation();
         if (!conn) return 0;
-        const type = String(conn.effectiveType || '').toLowerCase();
-        if (type === 'slow-2g' || type === '2g' || type === '3g') return 360;
         const downlink = Number(conn.downlink);
         if (Number.isFinite(downlink) && downlink > 0 && downlink < 2.5) return 360;
         const rtt = Number(conn.rtt);
@@ -1929,6 +1950,9 @@ function negotiateAndConnect(generation, url, codecType) {
         insertableStreams: true,
         // UDP-only: never latch this session onto the edge's TCP listener.
         forceTcp: false,
+        // Longer pause between retries on a weak mobile link so retries do
+        // not saturate the link and prolong the outage.
+        retryPause: (isVerySlowNetwork() || networkAudioOnly) ? 6000 : 2000,
         onTrack: (evt) => {
             if (generation !== readerGeneration) return;
             if (evt.track.kind === 'video' || evt.track.kind === 'audio') {
@@ -1963,6 +1987,7 @@ function negotiateAndConnect(generation, url, codecType) {
         onError: (err, httpStatus) => {
             if (generation !== readerGeneration) return;
             console.error("Reader Error:", err);
+            if (isVerySlowNetwork()) enterNetworkAudioOnly('reader error');
 
             // The edge answers 404 when nothing is published on the codec path
             // we picked. A publisher that left HEVC/H264 multitrack off sits on
@@ -2860,6 +2885,14 @@ function initControlClient(whepUrl, sessionId) {
             wsStatusDot.classList.add('ws-connected');
             layerSelect.disabled = false;
             layerSelect.innerHTML = '<option value="-1">Loading...</option>';
+            // Every new session starts with video resumed by default. If we
+            // are in audio-only recovery, re-apply the pause immediately so
+            // the edge does not start forwarding video again.
+            if (networkAudioOnly) {
+                controlClient.setMediaState({ video: 'paused', audio: 'resumed' });
+                pauseVideoForAudioOnly();
+                console.log('[Recovery] re-applied audio-only media state on new session');
+            }
         },
         onDisconnected: () => {
             wsStatusDot.classList.remove('ws-connected');
@@ -3017,6 +3050,79 @@ function handleVideoResume() {
         }
     }, 500);
 }
+
+function scheduleNetworkAudioOnlyExitCheck() {
+    if (networkAudioOnlyExitTimer) {
+        clearTimeout(networkAudioOnlyExitTimer);
+        networkAudioOnlyExitTimer = null;
+    }
+    networkAudioOnlyExitTimer = setTimeout(() => {
+        networkAudioOnlyExitTimer = null;
+        if (!networkAudioOnly) return;
+        if (isVerySlowNetwork()) {
+            scheduleNetworkAudioOnlyExitCheck();
+            return;
+        }
+        exitNetworkAudioOnly('network recovered');
+    }, 30000);
+}
+
+// On 3G/2G: stop video and keep audio as the recovery carrier. The server is
+// told to pause video (MediaState), so it stops forwarding video RTP; the
+// connection then only carries the ~128kbps Opus track, which is far more
+// likely to survive a weak/transitioning mobile link. The flag is re-applied
+// on every new WHEP/control session, because each session starts with video
+// resumed by default.
+function enterNetworkAudioOnly(reason) {
+    if (networkAudioOnly) return;
+    if (!reader && !playbackRace && !activePlaybackPath) return;
+    networkAudioOnly = true;
+    console.warn(`[Recovery] very slow network (${reason}); switching to audio-only`);
+    if (reader) reader.retryPause = 6000;
+    if (controlClient && abrEngine && abrEngine.audioTrackId !== null) {
+        switchMediaTrack(abrEngine.audioTrackId, 'network_slow');
+    }
+    pauseVideoForAudioOnly();
+    scheduleNetworkAudioOnlyExitCheck();
+}
+
+function exitNetworkAudioOnly(reason) {
+    if (!networkAudioOnly) return;
+    networkAudioOnly = false;
+    console.log(`[Recovery] network improved (${reason}); resuming video`);
+    if (networkAudioOnlyExitTimer) {
+        clearTimeout(networkAudioOnlyExitTimer);
+        networkAudioOnlyExitTimer = null;
+    }
+    if (reader) reader.retryPause = 2000;
+    if (controlClient && abrEngine && abrEngine.videoTrackIds.length > 0) {
+        // Restart from the lowest video layer; ABR climbs again if the link
+        // can actually sustain it.
+        switchMediaTrack(abrEngine.videoTrackIds[0], 'network_resume');
+    }
+}
+
+function clearNetworkAudioOnlyState() {
+    networkAudioOnly = false;
+    if (networkAudioOnlyExitTimer) {
+        clearTimeout(networkAudioOnlyExitTimer);
+        networkAudioOnlyExitTimer = null;
+    }
+}
+
+function bindNetworkChangeListener() {
+    const conn = networkInformation();
+    if (!conn || typeof conn.addEventListener !== 'function') return;
+    conn.addEventListener('change', () => {
+        const type = String(conn.effectiveType || 'unknown');
+        if (isVerySlowNetwork()) {
+            enterNetworkAudioOnly(`type=${type}`);
+        } else if (networkAudioOnly) {
+            exitNetworkAudioOnly(`type=${type}`);
+        }
+    });
+}
+bindNetworkChangeListener();
 
 function pauseVideoForAudioOnly() {
     if (video && !video.paused) {
@@ -3189,6 +3295,7 @@ function stopStream() {
     
     abrEngine.setAutoMode(true);
     abrEngine.reset();
+    clearNetworkAudioOnlyState();
     previousTrackType = null;
     updateActionButtonsState();
 }
@@ -3683,6 +3790,7 @@ function parkWarmSession() {
     layerSelect.innerHTML = '<option value="-1">Auto</option>';
     abrEngine.setAutoMode(true);
     abrEngine.reset();
+    clearNetworkAudioOnlyState();
     previousTrackType = null;
     updateActionButtonsState();
 
@@ -4500,7 +4608,7 @@ class MMXControlClient {
 const STREAM_GONE_MAX_404 = 5;
 class MediaMTXWebRTCReader {
   constructor(conf) {
-    this.retryPause = 2000;
+    this.retryPause = Number(conf.retryPause) > 0 ? Number(conf.retryPause) : 2000;
     this.conf = conf;
     this.state = 'getting_codecs';
     this.restartTimeout = null;
