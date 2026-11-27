@@ -2850,6 +2850,13 @@ function initControlClient(whepUrl, sessionId) {
         controlClient.close();
         controlClient = null;
     }
+    // New WHEP session (including a reconnect after the link dropped): the
+    // previous session's active layer / pending switch no longer apply. Without
+    // this, a reconnect that starts at 720p kept the old "current = 360p"
+    // bookkeeping and ABR never issued the 720p -> 360p downgrade again.
+    if (abrEngine && typeof abrEngine.beginSession === 'function') {
+        abrEngine.beginSession();
+    }
     controlClient = new MMXControlClient(whepUrl, sessionId, {
 		onMediaState: updateMediaState,
         onConnected: () => {
@@ -5068,6 +5075,22 @@ class ABREngine {
         this.targetConfirmCount = 0;
     }
 
+    // Start of a fresh WHEP/control session. Anything tied to the previous
+    // session's active layer or in-flight switch is stale; keep auto mode, the
+    // warmup clock and probe history. The next setTracks() resyncs from the
+    // server's active track, or from the <video> element's real size when the
+    // server has not named one yet.
+    beginSession() {
+        this.pendingTrackId = null;
+        this.pendingSince = 0;
+        this.currentTrackId = null;
+        this.targetConfirmTarget = null;
+        this.targetConfirmCount = 0;
+        this.lastProbeSampleUsedAt = 0;
+        this.probeLowConfirm = 0;
+        this.probeLowTarget = null;
+    }
+
     // currentVideoWidth is used only to guess the starting layer when the
     // server hasn't told us which one is active.
     setTracks(tracks, activeId, currentVideoWidth = 0) {
@@ -5106,7 +5129,7 @@ class ABREngine {
         // not-yet-confirmed pick lives in pendingTrackId instead.
         if (activeId !== undefined && activeId !== null) {
             this.currentTrackId = activeId;
-        } else if (this.currentTrackId === null && this.videoTrackIds.length > 0) {
+        } else if (this.videoTrackIds.length > 0) {
 
             let matchedId = null;
             // 尝试通过当前 video 标签的真实宽度来匹配 Track
@@ -5117,9 +5140,14 @@ class ABREngine {
             }
 
             if (matchedId !== null) {
+                // Adopt the size actually on screen even when currentTrackId is
+                // non-null: after a WHEP reconnect the server may not send an
+                // active id yet, and keeping the previous session's id left ABR
+                // believing it was already on the low layer (so it never
+                // downgraded a restarted 720p stream to 360p on 3G).
                 this.currentTrackId = matchedId;
                 console.log(`[ABR] Initial track detected by real resolution: ID ${this.currentTrackId}`);
-            } else {
+            } else if (this.currentTrackId === null) {
                 // 兜底方案：取排序后数组的最后一个元素 (High)
                 this.currentTrackId = this.videoTrackIds[this.videoTrackIds.length - 1];
                 console.log(`[ABR] Initial track not provided, assuming Highest: ID ${this.currentTrackId}`);
