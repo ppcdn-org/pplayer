@@ -4929,6 +4929,16 @@ const ABR_CFG = {
     // cooldown error), so a rejected switch cannot freeze ABR forever.
     PENDING_TIMEOUT_MS: 8000,
 
+    // On a very slow link the probe itself is a meaningful share of the
+    // bandwidth and competes with the target layer's keyframe. Below this
+    // measured rate, use a smaller/shorter probe, probe less often, and pause
+    // probing briefly after every layer switch.
+    LOW_BANDWIDTH_KBPS: 400,
+    LOW_BANDWIDTH_PROBE_INTERVAL_MS: 30000,
+    LOW_BANDWIDTH_PROBE_BYTES: 48 * 1024,
+    LOW_BANDWIDTH_PROBE_TIMEOUT_MS: 3000,
+    POST_SWITCH_PROBE_PAUSE_MS: 15000,
+
     // Same-origin static asset used for the bandwidth probe, mirroring
     // tencent-abrplayer's NIOES8001.jpeg. A JPEG is used deliberately instead
     // of the SDK/JS/CSS bundle: probe traffic should not share the code cache
@@ -4974,7 +4984,10 @@ function abrResolveProbeUrls() {
 
 // Downloads a same-origin asset (cache-busted) and returns its observed
 // throughput in kbps. Mirrors tencent-abrplayer utils.js:probeBandwidth.
-async function abrProbeOnce(url) {
+async function abrProbeOnce(
+    url,
+    targetBytes = ABR_CFG.PROBE_TARGET_BYTES,
+    timeoutMs = ABR_CFG.PROBE_TIMEOUT_MS) {
     const started = abrNow();
     const separator = url.includes('?') ? '&' : '?';
     const probeUrl = `${url}${separator}_probe=${Date.now()}`;
@@ -4983,7 +4996,7 @@ async function abrProbeOnce(url) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
         try { controller.abort(); } catch (e) {}
-    }, ABR_CFG.PROBE_TIMEOUT_MS);
+    }, timeoutMs);
 
     try {
         const response = await fetch(probeUrl, {
@@ -4999,7 +5012,7 @@ async function abrProbeOnce(url) {
             const { done, value } = await reader.read();
             if (done) break;
             received += value ? value.length : 0;
-            if (received >= ABR_CFG.PROBE_TARGET_BYTES) {
+            if (received >= targetBytes) {
                 try { controller.abort(); } catch (e) {}
                 break;
             }
@@ -5062,6 +5075,7 @@ class ABREngine {
         this.lastProbeOkAt = 0;
         this.probeInFlight = false;
         this.zeroProbeBackoffUntil = 0;
+        this.probePauseUntil = 0;
         this.probePromise = null;
         this.probeHistory = [];
         this.lastProbeSampleAt = 0;
@@ -5208,6 +5222,8 @@ class ABREngine {
         this.layerSettledAt = abrNow();
         this.probeLowConfirm = 0;
         this.probeLowTarget = null;
+        // Let the new layer's keyframe arrive before probing again.
+        this.probePauseUntil = abrNow() + ABR_CFG.POST_SWITCH_PROBE_PAUSE_MS;
     }
 
     // The ABR loop that used to drive this is gone from ppmmx, so the server's
@@ -5423,7 +5439,14 @@ class ABREngine {
         if (this.probeInFlight) return false;
         if (this.videoTrackIds.length < 2) return false;
         if (now < this.zeroProbeBackoffUntil) return false;
-        return (now - this.lastProbeAt) >= ABR_CFG.PROBE_INTERVAL_MS;
+        // Give a newly selected layer time to get its keyframe on screen
+        // before spending the (possibly tiny) link on another probe.
+        if (now < this.probePauseUntil) return false;
+        const low = this.probedKbps > 0 && this.probedKbps < ABR_CFG.LOW_BANDWIDTH_KBPS;
+        const interval = low
+            ? ABR_CFG.LOW_BANDWIDTH_PROBE_INTERVAL_MS
+            : ABR_CFG.PROBE_INTERVAL_MS;
+        return (now - this.lastProbeAt) >= interval;
     }
 
     // Fire-and-forget probe refresh. The result is consumed by later ticks.
@@ -5434,10 +5457,17 @@ class ABREngine {
         this.lastProbeAt = now;
         this.probeInFlight = true;
         const urls = abrResolveProbeUrls();
+        const low = this.probedKbps > 0 && this.probedKbps < ABR_CFG.LOW_BANDWIDTH_KBPS;
+        const targetBytes = low
+            ? ABR_CFG.LOW_BANDWIDTH_PROBE_BYTES
+            : ABR_CFG.PROBE_TARGET_BYTES;
+        const timeoutMs = low
+            ? ABR_CFG.LOW_BANDWIDTH_PROBE_TIMEOUT_MS
+            : ABR_CFG.PROBE_TIMEOUT_MS;
 
         this.probePromise = (async () => {
             for (const url of urls) {
-                const kbps = await abrProbeOnce(url);
+                const kbps = await abrProbeOnce(url, targetBytes, timeoutMs);
                 if (kbps && kbps > 0) {
                     const at = abrNow();
                     this.probedKbps = kbps;
@@ -5487,6 +5517,7 @@ class ABREngine {
         this.pendingTrackId = target;
         this.pendingSince = now;
         this.lastSwitchAt = now;
+        this.probePauseUntil = now + ABR_CFG.POST_SWITCH_PROBE_PAUSE_MS;
         this.fpsLowStreak = 0;
         this.lastDecision = targetIndex > fromIndex ? 'upgrade' : 'downgrade';
         this.lastReason = reason;
