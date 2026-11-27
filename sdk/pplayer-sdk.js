@@ -4923,8 +4923,11 @@ const ABR_CFG = {
 
     // A switch is made only after this many consecutive probe samples agree
     // on the same target rung. Severe downgrades (2+ rungs below the current
-    // layer) follow tencent-abrplayer and act on the first sample instead.
+    // layer) follow tencent-abrplayer and act on the first sample instead, as
+    // does a probe that falls this far below the current tier's threshold -
+    // waiting a second 12s sample there leaves the viewer frozen.
     TARGET_CONFIRMATIONS: 2,
+    URGENT_DOWNGRADE_RATIO: 0.6,
 
     // Bound on how long a SELECT_LAYER may stay unconfirmed before the engine
     // stops waiting for LAYER_SWITCHED (e.g. the server rejected it with a
@@ -5338,17 +5341,18 @@ class ABREngine {
         const upThreshold = { 360: 600, 720: 1600, 1080: 3200 }[height];
 
         if (downThreshold && kbps < downThreshold) {
+            const urgent = kbps < downThreshold * ABR_CFG.URGENT_DOWNGRADE_RATIO;
             const targetIndex = this.indexOfKbpsBand(kbps);
             if (targetIndex >= 0 && targetIndex < activeIndex) {
                 return {
                     target: this.videoTrackIds[targetIndex],
                     direction: 'downgrade',
-                    severe: (activeIndex - targetIndex) >= 2,
+                    severe: urgent || (activeIndex - targetIndex) >= 2,
                 };
             }
             const target = this.stepDownTarget(activeIndex);
             if (target !== null) {
-                return { target, direction: 'downgrade', severe: false };
+                return { target, direction: 'downgrade', severe: urgent };
             }
         }
         if (upThreshold && kbps > upThreshold) {
@@ -5571,7 +5575,7 @@ class ABREngine {
             this.targetConfirmTarget = wanted.target;
             this.targetConfirmCount = 0;
         }
-        // Severe downgrades skip the wait, as in tencent-abrplayer's
+        // Severe/urgent downgrades skip the wait, as in tencent-abrplayer's
         // severe-downgrade confirm count (1); everything else needs two
         // agreeing probe samples.
         const needed = (wanted.direction === 'downgrade' && wanted.severe)
