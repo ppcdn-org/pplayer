@@ -4041,8 +4041,27 @@ function iceCandidateTransport(value) {
     return (rest.split(' ')[2] || '').toLowerCase();
 }
 
-function udpOnlySdp(sdp, label) {
-    const lines = String(sdp || '').split('\r\n');
+function preferUdpSdp(sdp, label) {
+    const text = String(sdp || '');
+    const lines = text.split('\r\n');
+    let udp = 0;
+    let tcp = 0;
+    for (const line of lines) {
+        if (!line.startsWith('a=candidate:')) continue;
+        const transport = iceCandidateTransport(line);
+        if (transport === 'udp') udp++;
+        else if (transport === 'tcp') tcp++;
+    }
+    if (udp === 0 && tcp > 0) {
+        // The edge could not offer UDP at all: fall back to TCP rather than
+        // failing the session.
+        console.warn(`[${label}] No UDP candidate in the answer; falling back to TCP (${tcp} TCP candidate(s))`);
+        return text;
+    }
+    if (udp === 0) {
+        console.warn(`[${label}] No UDP or TCP candidates in the answer`);
+        return text;
+    }
     let dropped = 0;
     const kept = [];
     for (const line of lines) {
@@ -4698,7 +4717,7 @@ class MediaMTXWebRTCReader {
           !l.toLowerCase().startsWith('a=rid:') && 
           !l.toLowerCase().startsWith('a=simulcast:')
         );
-        sdp = udpOnlySdp(lines.join('\r\n'), 'ICE offer');
+        sdp = lines.join('\r\n');
 
         this.offerData = MediaMTXWebRTCReader.#parseOffer(sdp);
         const modifiedOffer = new RTCSessionDescription({ type: 'offer', sdp: sdp });
@@ -4767,33 +4786,26 @@ class MediaMTXWebRTCReader {
 
   #setAnswer(answer) {
     if (this.state !== 'running') throw new Error('closed');
-    // UDP-only: strip the edge's TCP candidates so ICE can never pair over
-    // TCP. If the answer has no UDP candidate, the connection fails rather
-    // than silently falling back to TCP.
-    const sdp = udpOnlySdp(answer, 'ICE');
-    const udpCount = sdp.split('\r\n').filter((l) =>
-      l.startsWith('a=candidate:') && iceCandidateTransport(l) === 'udp').length;
-    if (udpCount === 0) {
-      console.warn('[ICE] UDP-only session: answer has no UDP remote candidate');
-    }
+    // Prefer UDP: strip TCP candidates whenever the edge offers any UDP. If
+    // the answer has NO UDP candidate at all, keep its TCP candidates so ICE
+    // can fall back to TCP instead of failing.
+    const sdp = preferUdpSdp(answer, 'ICE');
     this.forceTcp = false;
     this.lastAnswerHasTcp = false;
     return this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
   }
 
-  // UDP-only by policy: TCP fallback is disabled. Kept as a no-op so any
-  // stale caller cannot tear down a live UDP session.
+  // Manual TCP re-negotiation is no longer used. TCP is only selected when
+  // the edge's answer contains no UDP candidate at all (see #setAnswer).
   restartWithTcp() {
-    console.warn('[ICE] TCP fallback is disabled (UDP-only)');
+    console.warn('[ICE] manual TCP fallback is disabled; UDP is preferred');
   }
 
   #onLocalCandidate(evt) {
     if (this.state !== 'running') return;
     if (evt.candidate !== null) {
-      if (iceCandidateTransport(evt.candidate.candidate) !== 'udp') {
-        console.log(`[ICE] UDP-only: dropping local ${iceCandidateTransport(evt.candidate.candidate) || 'unknown'} candidate`);
-        return;
-      }
+      // Local TCP candidates are still sent: they are only pairable when the
+      // answer had no UDP candidate and its TCP candidates were kept.
       if (this.sessionUrl === null) {
         this.queuedCandidates.push(evt.candidate);
       } else {
@@ -7026,8 +7038,25 @@ function iceCandidateTransport(value) {
     return (rest.split(' ')[2] || '').toLowerCase();
 }
 
-function udpOnlySdp(sdp, label) {
-    const lines = String(sdp || '').split('\r\n');
+function preferUdpSdp(sdp, label) {
+    const text = String(sdp || '');
+    const lines = text.split('\r\n');
+    let udp = 0;
+    let tcp = 0;
+    for (const line of lines) {
+        if (!line.startsWith('a=candidate:')) continue;
+        const transport = iceCandidateTransport(line);
+        if (transport === 'udp') udp++;
+        else if (transport === 'tcp') tcp++;
+    }
+    if (udp === 0) {
+        // No UDP at all (or no candidates in this SDP): keep TCP and allow
+        // non-UDP trickle so the session can still connect.
+        if (tcp > 0) {
+            console.warn(`[${label}] No UDP candidate; falling back to TCP (${tcp} TCP candidate(s))`);
+        }
+        return { sdp: text, allowTcp: true };
+    }
     let dropped = 0;
     const kept = [];
     for (const line of lines) {
@@ -7040,7 +7069,7 @@ function udpOnlySdp(sdp, label) {
     if (dropped > 0) {
         console.warn(`[${label}] UDP-only: discarded ${dropped} non-UDP candidate(s)`);
     }
-    return kept.join('\r\n');
+    return { sdp: kept.join('\r\n'), allowTcp: false };
 }
 
 function preferH264(transceiver) {
@@ -7154,6 +7183,8 @@ class P2PPlaybackPath {
         this.onSignal = null;
         this.negotiated = false;
         this.pendingCandidates = [];
+        // TCP is accepted only when the remote answer had no UDP candidate.
+        this.allowTcpRemoteCandidates = false;
         this.stopped = false;
         this.seq = 0;
     }
@@ -7183,16 +7214,24 @@ class P2PPlaybackPath {
         } else if (message.type === 'answer' && message.sessionId === this.session.sessionId) {
             // TEMPORARY (2026-09-30): dump the P2P answer SDP for the
             // "connects but 0 frames" diagnosis - remove once understood.
-            const answerSdp = udpOnlySdp(message.sdp, 'P2P ICE');
-            if (PP_DEBUG) console.log('[P2P-SDP] remote answer:\n' + answerSdp);
-            await this.pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+            const answer = preferUdpSdp(message.sdp, 'P2P ICE');
+            this.allowTcpRemoteCandidates = answer.allowTcp;
+            if (PP_DEBUG) console.log('[P2P-SDP] remote answer:\n' + answer.sdp);
+            await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
             this.onSignal?.({ type: 'remote-description-set' });
-            for (const candidate of this.pendingCandidates) await this.pc.addIceCandidate(candidate);
+            for (const candidate of this.pendingCandidates) {
+                if (this.allowTcpRemoteCandidates ||
+                    iceCandidateTransport(candidate.candidate) === 'udp') {
+                    await this.pc.addIceCandidate(candidate);
+                }
+            }
             this.pendingCandidates = [];
         } else if (message.type === 'ice' && message.sessionId === this.session.sessionId) {
-            if (!message.candidate ||
+            if (!message.candidate) return;
+            if (this.pc.remoteDescription &&
+                !this.allowTcpRemoteCandidates &&
                 iceCandidateTransport(message.candidate.candidate) !== 'udp') {
-                console.log('[P2P ICE] UDP-only: ignoring non-UDP remote candidate');
+                console.log('[P2P ICE] UDP preferred: ignoring non-UDP remote candidate');
                 return;
             }
             if (this.pc.remoteDescription) await this.pc.addIceCandidate(message.candidate);
@@ -7283,10 +7322,8 @@ class P2PPlaybackPath {
         };
         this.pc.onicecandidate = (event) => {
             if (event.candidate) {
-                if (iceCandidateTransport(event.candidate.candidate) !== 'udp') {
-                    console.log('[P2P ICE] UDP-only: dropping local non-UDP candidate');
-                    return;
-                }
+                // TCP candidates are kept: they are only usable when the
+                // remote answer had no UDP candidate (see preferUdpSdp).
                 this.onSignal?.({ type: 'local-candidate', candidate: event.candidate.candidate });
                 this.#send({ type: 'ice', candidate: event.candidate.toJSON() });
             } else {
@@ -7302,7 +7339,9 @@ class P2PPlaybackPath {
         };
         const offer = await this.pc.createOffer();
         await this.pc.setLocalDescription(offer);
-        const offerSdp = udpOnlySdp(offer.sdp, 'P2P ICE offer');
+        // Send every local candidate; the answerer applies the same
+        // UDP-preferred policy. If its answer has no UDP, TCP is used.
+        const offerSdp = offer.sdp;
         // TEMPORARY (2026-09-30): dump the P2P offer SDP for the
         // "connects but 0 frames" diagnosis - remove once understood.
         if (PP_DEBUG) console.log('[P2P-SDP] local offer:\n' + offerSdp);
@@ -8608,8 +8647,23 @@ function iceCandidateTransport(value) {
     return (rest.split(' ')[2] || '').toLowerCase();
 }
 
-function udpOnlySdp(sdp, label) {
-    const lines = String(sdp || '').split('\r\n');
+function preferUdpSdp(sdp, label) {
+    const text = String(sdp || '');
+    const lines = text.split('\r\n');
+    let udp = 0;
+    let tcp = 0;
+    for (const line of lines) {
+        if (!line.startsWith('a=candidate:')) continue;
+        const transport = iceCandidateTransport(line);
+        if (transport === 'udp') udp++;
+        else if (transport === 'tcp') tcp++;
+    }
+    if (udp === 0) {
+        if (tcp > 0) {
+            console.warn(`[${label}] No UDP candidate; falling back to TCP (${tcp} TCP candidate(s))`);
+        }
+        return { sdp: text, allowTcp: true };
+    }
     let dropped = 0;
     const kept = [];
     for (const line of lines) {
@@ -8622,7 +8676,7 @@ function udpOnlySdp(sdp, label) {
     if (dropped > 0) {
         console.warn(`[${label}] UDP-only: discarded ${dropped} non-UDP candidate(s)`);
     }
-    return kept.join('\r\n');
+    return { sdp: kept.join('\r\n'), allowTcp: false };
 }
 
 class P2PAnswerer {
@@ -8698,10 +8752,8 @@ class P2PAnswerer {
 
         pc.onicecandidate = (event) => {
             if (!event.candidate) return;
-            if (iceCandidateTransport(event.candidate.candidate) !== 'udp') {
-                console.log('[P2P ICE] UDP-only: dropping local non-UDP candidate');
-                return;
-            }
+            // Sent unconditionally: the viewer applies the same UDP-preferred
+            // policy based on the answer SDP it receives.
             this.#send({ type: 'ice', sessionId, candidate: event.candidate.toJSON() });
         };
         pc.onconnectionstatechange = () => {
@@ -8720,8 +8772,15 @@ class P2PAnswerer {
         // instead would leave the offered m-lines unanswered (recvonly) and the
         // viewer would receive no media - the answer arrives but the player
         // gets no track and falls back to edge.
-        await pc.setRemoteDescription({ type: 'offer', sdp: udpOnlySdp(message.sdp, 'P2P ICE offer') });
-        for (const candidate of entry.pendingCandidates) await pc.addIceCandidate(candidate);
+        const offer = preferUdpSdp(message.sdp, 'P2P ICE offer');
+        entry.allowTcpRemote = offer.allowTcp;
+        await pc.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
+        for (const candidate of entry.pendingCandidates) {
+            if (entry.allowTcpRemote ||
+                iceCandidateTransport(candidate.candidate) === 'udp') {
+                await pc.addIceCandidate(candidate);
+            }
+        }
         entry.pendingCandidates = [];
 
         const tracks = this.mediaStream.getTracks();
@@ -8738,14 +8797,18 @@ class P2PAnswerer {
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        this.#send({ type: 'answer', sessionId, sdp: udpOnlySdp(answer.sdp, 'P2P ICE answer') });
+        // Send every local candidate; the viewer decides UDP vs TCP from the
+        // answer SDP (TCP only when no UDP candidate is present).
+        this.#send({ type: 'answer', sessionId, sdp: answer.sdp });
     }
 
     async #onIce(message) {
         const entry = this.peers.get(message.sessionId);
         if (!entry || !message.candidate) return;
-        if (iceCandidateTransport(message.candidate.candidate) !== 'udp') {
-            console.log('[P2P ICE] UDP-only: ignoring non-UDP remote candidate');
+        if (entry.pc.remoteDescription &&
+            !entry.allowTcpRemote &&
+            iceCandidateTransport(message.candidate.candidate) !== 'udp') {
+            console.log('[P2P ICE] UDP preferred: ignoring non-UDP remote candidate');
             return;
         }
         if (entry.pc.remoteDescription) {
