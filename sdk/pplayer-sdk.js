@@ -472,19 +472,16 @@ function prefillStreamInput() {
 }
 
 const DEFAULT_NAT_PROBE_GRACE_MS = 800;
-// Edge WHEP normally runs over UDP (lower latency, no head-of-line blocking).
-// When the measured ICE RTT of the selected pair is above this, the UDP path
-// is degraded (observed: 30ms vs 370ms on the same Globe line, intermittently,
-// while the edge's TCP path stayed ~31ms). In that case we re-negotiate once
-// with UDP candidates stripped from the answer so ICE is forced onto TCP.
+// pplayer is UDP-only: ICE over TCP is never used for playback. The old
+// RTT-driven TCP fallback constants below are kept only for compatibility;
+// candidates are filtered to UDP in ppplayer.mjs and playback-paths.mjs.
 const DEFAULT_TCP_FALLBACK_RTT_MS = 120;
 const P2P_UNAVAILABLE_TTL_MS = 30000;
 const TOKEN_CACHE_MARGIN_MS = 30000;
 const viewerTokenCache = new Map();
 const p2pUnavailableUntil = new Map();
 let natProbeGraceMs = DEFAULT_NAT_PROBE_GRACE_MS;
-// Consecutive 1Hz media-RTT samples above the fallback threshold while the
-// selected pair is UDP; 2 samples are needed before re-negotiating over TCP.
+// Legacy TCP-fallback counter; kept at 0 now that playback is UDP-only.
 let mediaRttHighStreak = 0;
 let startupStartedAt = 0;
 const startupMarks = new Map();
@@ -508,11 +505,8 @@ function clampTcpFallbackRtt(value) {
     return Math.max(50, Math.min(5000, Math.round(n)));
 }
 
-// Once an edge's UDP path has been observed slow and we forced TCP, start the
-// next session on that same edge directly in TCP-only mode instead of paying
-// the UDP handshake and the 2s watchdog window again. Kept in localStorage so
-// every tab on the browser shares it, with a TTL so a genuinely recovered UDP
-// path is retried later.
+// Legacy TCP-preferred cache. pplayer is UDP-only now; these helpers are kept
+// for compatibility but the reader no longer consults them.
 const TCP_PREFERRED_TTL_MS = 30 * 60 * 1000;
 const TCP_PREFERRED_STORAGE_KEY = 'pplayer.tcpPreferred';
 function whepHost(url) {
@@ -1255,10 +1249,8 @@ function armFirstVideoFrameCallback(generation) {
     });
 }
 
-// Put the edge session on screen once the connect-time RTT check has decided
-// not to replace it with a TCP-only one. Calling this only after that verdict
-// is what makes a UDP->TCP fallback look like a single startup instead of a
-// brief first playback followed by a restart.
+// Put the edge session on screen once the connect-time RTT diagnostic has
+// completed. There is no TCP-only replacement any more (UDP-only policy).
 function attachEdgeMedia(stream, generation) {
     if (generation !== readerGeneration || !stream) return;
     pendingEdgeMediaStream = null;
@@ -1893,9 +1885,8 @@ function negotiateAndConnect(generation, url, codecType) {
         // transform - and it DOES consume it, so enabling it here is safe. See
         // ppplayer.mjs's encodedInsertableStreams comment.
         insertableStreams: true,
-        // A previous session on this edge already found its UDP path slow and
-        // forced TCP; start TCP-only straight away for the TTL window.
-        forceTcp: isTcpPreferred(whepHost(url)),
+        // UDP-only: never latch this session onto the edge's TCP listener.
+        forceTcp: false,
         onTrack: (evt) => {
             if (generation !== readerGeneration) return;
             if (evt.track.kind === 'video' || evt.track.kind === 'audio') {
@@ -2025,8 +2016,8 @@ function negotiateAndConnect(generation, url, codecType) {
 // non-standard selected flag and then nomination are fallbacks. Both the
 // startup log/fallback and the per-second media-RTT check must use the same
 // pair, otherwise the connect-time check can accept a nominated TCP pair while
-// media runs over a degraded UDP pair and the TCP fallback fires later, as a
-// second WHEP session.
+// media runs over a degraded pair. (pplayer is UDP-only, so there is no TCP
+// fallback any more; both checks still use the same pair for stats.)
 function selectedCandidatePairOf(stats) {
     const byId = new Map();
     let selectedPairId = null;
@@ -2053,9 +2044,8 @@ function selectedCandidatePairOf(stats) {
     };
 }
 
-// Logs the selected ICE pair and resolves its measured RTT and protocol. The
-// RTT drives the TCP fallback below; the protocol keeps a session that is
-// already on TCP from being restarted onto TCP again.
+// Logs the selected ICE pair and resolves its measured RTT and protocol for
+// diagnostics. There is no TCP fallback: playback is UDP-only.
 function logSelectedCandidatePair(pc) {
     if (!pc || typeof pc.getStats !== 'function') return Promise.resolve(null);
     return pc.getStats().then((stats) => {
@@ -2083,30 +2073,11 @@ function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) 
     const open = () => {
         if (generation !== readerGeneration || reader !== activePlaybackPath) return;
         startupMark('pc-connected');
-        // A degraded UDP path shows up immediately as a high RTT on the
-        // selected pair, before any media flows. Re-negotiate that session
-        // once with UDP candidates stripped from the answer, forcing ICE onto
-        // the edge's TCP listener (which stays fast when UDP is not). Only
-        // attempted once: reader.forceTcp latches, so a slow TCP path is
-        // accepted rather than looping.
-        const threshold = clampTcpFallbackRtt(sdkConfig().tcpFallbackRttMs);
-        logSelectedCandidatePair(pc).then((selected) => {
+        // UDP-only: log the selected pair for diagnostics, but never replace
+        // the session with a TCP-only re-negotiation. If UDP cannot connect,
+        // the reader fails instead of silently falling back to ICE over TCP.
+        logSelectedCandidatePair(pc).then(() => {
             if (generation !== readerGeneration || reader !== activePlaybackPath) return;
-            const rttMs = selected ? selected.rttMs : null;
-            const protocol = selected ? selected.protocol : '';
-            if (rttMs !== null && rttMs > threshold && protocol === 'udp' && !reader.forceTcp &&
-                reader.lastAnswerHasTcp === true &&
-                typeof reader.restartWithTcp === 'function') {
-                console.warn(`[ICE] selected-pair RTT ${rttMs}ms > ${threshold}ms on UDP; re-negotiating this session over TCP`);
-                markTcpPreferred(whepHost(reader.conf && reader.conf.url));
-                // Do not reveal this session: the TCP-only re-negotiation is
-                // about to replace it. Only the replacement reaches the screen.
-                pendingEdgeMediaStream = null;
-                reader.restartWithTcp();
-                return;
-            }
-            // Keep this session: release the media that arrived while the RTT
-            // verdict was pending.
             edgeMediaAttachAllowed = true;
             if (pendingEdgeMediaStream) attachEdgeMedia(pendingEdgeMediaStream, generation);
             initControlClient(whepUrl, sessionId);
@@ -2125,35 +2096,11 @@ function openControlClientWhenConnected(reader, whepUrl, sessionId, generation) 
 }
 
 // Steady-state counterpart of the connect-time check in
-// openControlClientWhenConnected: the browser can migrate the transport to a
-// different succeeded pair after startup (e.g. off a fast TCP pair onto a
-// higher-priority but degraded UDP one), which is what made the stats area
-// report an RTT the initial ICE log never showed. Watch the selected pair's
-// RTT every stats tick; if it stays above the threshold on UDP, re-negotiate
-// once over TCP (which latches forceTcp, so a slow TCP path is accepted).
-const TCP_FALLBACK_HIGH_RTT_SAMPLES = 2;
-function maybeFallbackToTcpForMediaRtt(rttMs, protocol) {
-    const r = activePlaybackPath;
-    if (activePlaybackPathName !== 'edge' || !r || typeof r.restartWithTcp !== 'function') {
-        mediaRttHighStreak = 0;
-        return;
-    }
-    if (r.forceTcp || r.lastAnswerHasTcp !== true || protocol !== 'udp') {
-        mediaRttHighStreak = 0;
-        return;
-    }
-    const threshold = clampTcpFallbackRtt(sdkConfig().tcpFallbackRttMs);
-    if (rttMs !== null && rttMs > threshold) {
-        mediaRttHighStreak++;
-        if (mediaRttHighStreak >= TCP_FALLBACK_HIGH_RTT_SAMPLES) {
-            mediaRttHighStreak = 0;
-            console.warn(`[ICE] media RTT ${rttMs}ms > ${threshold}ms on UDP for ${TCP_FALLBACK_HIGH_RTT_SAMPLES}s; re-negotiating over TCP`);
-            markTcpPreferred(whepHost(r.conf && r.conf.url));
-            r.restartWithTcp();
-        }
-    } else {
-        mediaRttHighStreak = 0;
-    }
+// Steady-state TCP fallback is disabled: pplayer is UDP-only. Candidate
+// filtering in ppplayer.mjs / playback-paths.mjs is what actually keeps ICE
+// off TCP. Kept as a no-op so any stale call site cannot undo that policy.
+function maybeFallbackToTcpForMediaRtt() {
+    mediaRttHighStreak = 0;
 }
 
 function resetSessionState() {
@@ -4082,6 +4029,35 @@ if (typeof crypto !== "undefined" && !crypto.randomUUID) {
     };
 }
 
+// pplayer is UDP-only: never fall back to ICE over TCP. Browsers cannot set
+// an "udp only" iceTransportPolicy, so candidates are filtered on both sides:
+// TCP candidates are stripped from the local offer/answer SDP and from the
+// trickled remote candidates, and local TCP candidates are never sent.
+function iceCandidateTransport(value) {
+    const text = String(value || '');
+    const rest = text.startsWith('a=candidate:')
+        ? text.slice('a=candidate:'.length)
+        : text;
+    return (rest.split(' ')[2] || '').toLowerCase();
+}
+
+function udpOnlySdp(sdp, label) {
+    const lines = String(sdp || '').split('\r\n');
+    let dropped = 0;
+    const kept = [];
+    for (const line of lines) {
+        if (line.startsWith('a=candidate:') && iceCandidateTransport(line) !== 'udp') {
+            dropped++;
+            continue;
+        }
+        kept.push(line);
+    }
+    if (dropped > 0) {
+        console.warn(`[${label}] UDP-only: discarded ${dropped} non-UDP candidate(s)`);
+    }
+    return kept.join('\r\n');
+}
+
 // SELECT_LAYER reason that tells mmx this switch is the client carrying out
 // its own ABR_RECOMMEND, not a user's manual pick - must match
 // abrReasonAutoBandwidth in ppmmx's abr_ws_handler.go exactly, since the
@@ -4470,9 +4446,9 @@ class MediaMTXWebRTCReader {
     this.offerData = null;
     this.sessionUrl = null;
     this.queuedCandidates = [];
-    // When true, UDP remote candidates are stripped from the answer so ICE can
-    // only select a TCP pair (see #setAnswer / restartWithTcp).
-    this.forceTcp = conf.forceTcp === true;
+    // Always false: pplayer is UDP-only and #setAnswer strips TCP candidates.
+    // Retained only for compatibility with old callers.
+    this.forceTcp = false;
     // Whether the last answer advertised a TCP candidate; the RTT fallback
     // only switches when the edge actually offers TCP.
     this.lastAnswerHasTcp = false;
@@ -4722,7 +4698,7 @@ class MediaMTXWebRTCReader {
           !l.toLowerCase().startsWith('a=rid:') && 
           !l.toLowerCase().startsWith('a=simulcast:')
         );
-        sdp = lines.join('\r\n');
+        sdp = udpOnlySdp(lines.join('\r\n'), 'ICE offer');
 
         this.offerData = MediaMTXWebRTCReader.#parseOffer(sdp);
         const modifiedOffer = new RTCSessionDescription({ type: 'offer', sdp: sdp });
@@ -4791,82 +4767,33 @@ class MediaMTXWebRTCReader {
 
   #setAnswer(answer) {
     if (this.state !== 'running') throw new Error('closed');
-    const lines = answer.split('\r\n');
-    const candidateLines = lines.filter((l) => l.startsWith('a=candidate:'));
-    const hasTcp = candidateLines.some((l) => {
-      const transport = (l.slice('a=candidate:'.length).split(' ')[2] || '').toLowerCase();
-      return transport === 'tcp';
-    });
-    this.lastAnswerHasTcp = hasTcp;
-
-    let sdp = answer;
-    if (this.forceTcp) {
-      if (!hasTcp) {
-        // The edge did not advertise a TCP candidate (older config): forcing
-        // TCP would leave no viable remote candidate at all and break video.
-        // Keep UDP instead; the connection stays up, just without the faster
-        // path.
-        console.warn('[ICE] TCP-only requested but the answer has no TCP candidate; keeping UDP');
-        this.forceTcp = false;
-      } else {
-        // Drop the edge's UDP candidates before ICE sees them, leaving only
-        // its TCP listener. The browser still gathers its own UDP candidates,
-        // but they cannot pair with a TCP remote, so the selected pair is TCP.
-        let dropped = 0;
-        const kept = [];
-        for (const line of lines) {
-          if (line.startsWith('a=candidate:')) {
-            const transport = (line.slice('a=candidate:'.length).split(' ')[2] || '').toLowerCase();
-            if (transport === 'udp') { dropped++; continue; }
-          }
-          kept.push(line);
-        }
-        console.warn(`[ICE] TCP-only session: discarded ${dropped} UDP remote candidate(s)`);
-        sdp = kept.join('\r\n');
-      }
+    // UDP-only: strip the edge's TCP candidates so ICE can never pair over
+    // TCP. If the answer has no UDP candidate, the connection fails rather
+    // than silently falling back to TCP.
+    const sdp = udpOnlySdp(answer, 'ICE');
+    const udpCount = sdp.split('\r\n').filter((l) =>
+      l.startsWith('a=candidate:') && iceCandidateTransport(l) === 'udp').length;
+    if (udpCount === 0) {
+      console.warn('[ICE] UDP-only session: answer has no UDP remote candidate');
     }
+    this.forceTcp = false;
+    this.lastAnswerHasTcp = false;
     return this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp }));
   }
 
-  // restartWithTcp re-negotiates this same reader over TCP only. Used when the
-  // selected UDP pair's RTT is above the fallback threshold (see main.js's
-  // openControlClientWhenConnected): the running session is torn down and a
-  // fresh WHEP session is dialed immediately with forceTcp latched, so its
-  // answer has no UDP candidates for ICE to pick. A slow TCP path is accepted
-  // rather than retried, so this can never loop.
+  // UDP-only by policy: TCP fallback is disabled. Kept as a no-op so any
+  // stale caller cannot tear down a live UDP session.
   restartWithTcp() {
-    if (this.state === 'closed' || this.forceTcp || this.lastAnswerHasTcp !== true) return;
-    this.forceTcp = true;
-    console.warn('[ICE] re-negotiating this WHEP session over TCP-only candidates');
-    const staleSessionUrl = this.sessionUrl;
-    if (this.pc !== null) {
-      this.pc.close();
-      this.pc = null;
-    }
-    this.offerData = null;
-    this.sessionUrl = null;
-    this._sessionUUID = null;
-    this.queuedCandidates = [];
-    if (staleSessionUrl) {
-      fetch(staleSessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
-    }
-    if (this.restartTimeout !== null) {
-      clearTimeout(this.restartTimeout);
-      this.restartTimeout = null;
-    }
-    this.state = 'restarting';
-    // No retryPause: the RTT has already been paid once on UDP; switch now.
-    this.restartTimeout = window.setTimeout(() => {
-      this.restartTimeout = null;
-      if (this.state !== 'restarting') return;
-      this.state = 'running';
-      this.#start();
-    }, 0);
+    console.warn('[ICE] TCP fallback is disabled (UDP-only)');
   }
 
   #onLocalCandidate(evt) {
     if (this.state !== 'running') return;
     if (evt.candidate !== null) {
+      if (iceCandidateTransport(evt.candidate.candidate) !== 'udp') {
+        console.log(`[ICE] UDP-only: dropping local ${iceCandidateTransport(evt.candidate.candidate) || 'unknown'} candidate`);
+        return;
+      }
       if (this.sessionUrl === null) {
         this.queuedCandidates.push(evt.candidate);
       } else {
@@ -7090,6 +7017,32 @@ const { applyPlayoutBuffer } = __require("/buffer-config.mjs");
 const { MediaMTXWebRTCReader } = __require("/ppplayer.mjs");
 const { attachPassthroughTransform } = __require("/sei-timestamp.mjs");
 
+// UDP-only ICE for the P2P playback leg; see the same helpers in ppplayer.mjs.
+function iceCandidateTransport(value) {
+    const text = String(value || '');
+    const rest = text.startsWith('a=candidate:')
+        ? text.slice('a=candidate:'.length)
+        : text;
+    return (rest.split(' ')[2] || '').toLowerCase();
+}
+
+function udpOnlySdp(sdp, label) {
+    const lines = String(sdp || '').split('\r\n');
+    let dropped = 0;
+    const kept = [];
+    for (const line of lines) {
+        if (line.startsWith('a=candidate:') && iceCandidateTransport(line) !== 'udp') {
+            dropped++;
+            continue;
+        }
+        kept.push(line);
+    }
+    if (dropped > 0) {
+        console.warn(`[${label}] UDP-only: discarded ${dropped} non-UDP candidate(s)`);
+    }
+    return kept.join('\r\n');
+}
+
 function preferH264(transceiver) {
     if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
     const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities?.('video')) ||
@@ -7230,12 +7183,18 @@ class P2PPlaybackPath {
         } else if (message.type === 'answer' && message.sessionId === this.session.sessionId) {
             // TEMPORARY (2026-09-30): dump the P2P answer SDP for the
             // "connects but 0 frames" diagnosis - remove once understood.
-            if (PP_DEBUG) console.log('[P2P-SDP] remote answer:\n' + message.sdp);
-            await this.pc.setRemoteDescription({ type: 'answer', sdp: message.sdp });
+            const answerSdp = udpOnlySdp(message.sdp, 'P2P ICE');
+            if (PP_DEBUG) console.log('[P2P-SDP] remote answer:\n' + answerSdp);
+            await this.pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
             this.onSignal?.({ type: 'remote-description-set' });
             for (const candidate of this.pendingCandidates) await this.pc.addIceCandidate(candidate);
             this.pendingCandidates = [];
         } else if (message.type === 'ice' && message.sessionId === this.session.sessionId) {
+            if (!message.candidate ||
+                iceCandidateTransport(message.candidate.candidate) !== 'udp') {
+                console.log('[P2P ICE] UDP-only: ignoring non-UDP remote candidate');
+                return;
+            }
             if (this.pc.remoteDescription) await this.pc.addIceCandidate(message.candidate);
             else this.pendingCandidates.push(message.candidate);
         } else if (message.type === 'layers' && message.sessionId === this.session.sessionId) {
@@ -7324,6 +7283,10 @@ class P2PPlaybackPath {
         };
         this.pc.onicecandidate = (event) => {
             if (event.candidate) {
+                if (iceCandidateTransport(event.candidate.candidate) !== 'udp') {
+                    console.log('[P2P ICE] UDP-only: dropping local non-UDP candidate');
+                    return;
+                }
                 this.onSignal?.({ type: 'local-candidate', candidate: event.candidate.candidate });
                 this.#send({ type: 'ice', candidate: event.candidate.toJSON() });
             } else {
@@ -7339,11 +7302,12 @@ class P2PPlaybackPath {
         };
         const offer = await this.pc.createOffer();
         await this.pc.setLocalDescription(offer);
+        const offerSdp = udpOnlySdp(offer.sdp, 'P2P ICE offer');
         // TEMPORARY (2026-09-30): dump the P2P offer SDP for the
         // "connects but 0 frames" diagnosis - remove once understood.
-        if (PP_DEBUG) console.log('[P2P-SDP] local offer:\n' + offer.sdp);
-        this.onSignal?.({ type: 'offer-created', sdpLength: offer.sdp?.length ?? 0 });
-        this.#send({ type: 'offer', sdp: offer.sdp });
+        if (PP_DEBUG) console.log('[P2P-SDP] local offer:\n' + offerSdp);
+        this.onSignal?.({ type: 'offer-created', sdpLength: offerSdp.length });
+        this.#send({ type: 'offer', sdp: offerSdp });
     }
 
     // ppcenter's own STUN address (models.STUNConfig.URLs() server-side) rides
@@ -8634,6 +8598,33 @@ __modules["/p2p-answerer.mjs"] = function (module, exports, __require) {
 //
 // Only H264 is supported (P2P is H264-only server-side); the caller must not
 // provision this when publishing VP8.
+
+// UDP-only ICE for the P2P leg too: pplayer never falls back to ICE over TCP.
+function iceCandidateTransport(value) {
+    const text = String(value || '');
+    const rest = text.startsWith('a=candidate:')
+        ? text.slice('a=candidate:'.length)
+        : text;
+    return (rest.split(' ')[2] || '').toLowerCase();
+}
+
+function udpOnlySdp(sdp, label) {
+    const lines = String(sdp || '').split('\r\n');
+    let dropped = 0;
+    const kept = [];
+    for (const line of lines) {
+        if (line.startsWith('a=candidate:') && iceCandidateTransport(line) !== 'udp') {
+            dropped++;
+            continue;
+        }
+        kept.push(line);
+    }
+    if (dropped > 0) {
+        console.warn(`[${label}] UDP-only: discarded ${dropped} non-UDP candidate(s)`);
+    }
+    return kept.join('\r\n');
+}
+
 class P2PAnswerer {
     constructor({
         session,               // { signalUrl, token, stunServers?, maxPeers? }
@@ -8706,7 +8697,12 @@ class P2PAnswerer {
         this.onSignal({ type: 'peer-created', sessionId });
 
         pc.onicecandidate = (event) => {
-            if (event.candidate) this.#send({ type: 'ice', sessionId, candidate: event.candidate.toJSON() });
+            if (!event.candidate) return;
+            if (iceCandidateTransport(event.candidate.candidate) !== 'udp') {
+                console.log('[P2P ICE] UDP-only: dropping local non-UDP candidate');
+                return;
+            }
+            this.#send({ type: 'ice', sessionId, candidate: event.candidate.toJSON() });
         };
         pc.onconnectionstatechange = () => {
             this.onSignal({ type: 'peer-connection', sessionId, value: pc.connectionState });
@@ -8724,7 +8720,7 @@ class P2PAnswerer {
         // instead would leave the offered m-lines unanswered (recvonly) and the
         // viewer would receive no media - the answer arrives but the player
         // gets no track and falls back to edge.
-        await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+        await pc.setRemoteDescription({ type: 'offer', sdp: udpOnlySdp(message.sdp, 'P2P ICE offer') });
         for (const candidate of entry.pendingCandidates) await pc.addIceCandidate(candidate);
         entry.pendingCandidates = [];
 
@@ -8742,12 +8738,16 @@ class P2PAnswerer {
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        this.#send({ type: 'answer', sessionId, sdp: answer.sdp });
+        this.#send({ type: 'answer', sessionId, sdp: udpOnlySdp(answer.sdp, 'P2P ICE answer') });
     }
 
     async #onIce(message) {
         const entry = this.peers.get(message.sessionId);
         if (!entry || !message.candidate) return;
+        if (iceCandidateTransport(message.candidate.candidate) !== 'udp') {
+            console.log('[P2P ICE] UDP-only: ignoring non-UDP remote candidate');
+            return;
+        }
         if (entry.pc.remoteDescription) {
             await entry.pc.addIceCandidate(message.candidate);
         } else {
