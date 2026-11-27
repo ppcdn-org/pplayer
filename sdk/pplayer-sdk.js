@@ -4990,10 +4990,12 @@ const ABR_CFG = {
     // cooldown error), so a rejected switch cannot freeze ABR forever.
     PENDING_TIMEOUT_MS: 8000,
 
-    // Same-origin static assets. The SDK bundle is large enough for a short
-    // download to be meaningful; favicon.ico is the fallback. Override with
-    // window.pplayer.config.bandwidthProbeUrls or ?bwProbe=url1,url2.
-    PROBE_URLS: ['sdk/pplayer-sdk.js', 'favicon.ico'],
+    // Same-origin static asset used for the bandwidth probe, mirroring
+    // tencent-abrplayer's NIOES8001.jpeg. A JPEG is used deliberately instead
+    // of the SDK/JS/CSS bundle: probe traffic should not share the code cache
+    // or compressor path, and the image is larger than PROBE_TARGET_BYTES.
+    // Override with window.pplayer.config.bandwidthProbeUrls or ?bwProbe=url1,url2.
+    PROBE_URLS: ['NIOES8001.jpeg'],
 };
 
 function abrNow() {
